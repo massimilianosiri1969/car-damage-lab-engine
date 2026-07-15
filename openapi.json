@@ -1,0 +1,104 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Car Damage Lab API",
+    "version": "0.1.0",
+    "description": "Modifica sperimentale di gravità e superficie di un danno automotive."
+  },
+  "servers": [
+    {
+      "url": "https://SOSTITUISCI-CON-IL-TUO-BACKEND"
+    }
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "operationId": "healthCheck",
+        "summary": "Verifica disponibilità del motore",
+        "responses": {
+          "200": {
+            "description": "Servizio disponibile"
+          }
+        }
+      }
+    },
+    "/v1/damage/edit": {
+      "post": {
+        "operationId": "editVehicleDamage",
+        "summary": "Modifica gravità e superficie del danno",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "image",
+                  "mask",
+                  "severity_percent",
+                  "area_percent"
+                ],
+                "properties": {
+                  "image": {
+                    "type": "string",
+                    "format": "binary"
+                  },
+                  "mask": {
+                    "type": "string",
+                    "format": "binary"
+                  },
+                  "severity_percent": {
+                    "type": "integer",
+                    "minimum": -100,
+                    "maximum": 100
+                  },
+                  "area_percent": {
+                    "type": "integer",
+                    "minimum": -100,
+                    "maximum": 100
+                  },
+                  "output_quality": {
+                    "type": "string",
+                    "enum": [
+                      "low",
+                      "medium",
+                      "high",
+                      "auto"
+                    ],
+                    "default": "medium"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Immagine elaborata",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "job_id": {
+                      "type": "string"
+                    },
+                    "status": {
+                      "type": "string"
+                    },
+                    "result_base64": {
+                      "type": "string"
+                    },
+                    "mime_type": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

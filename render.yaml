@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: car-damage-lab-api
+    runtime: docker
+    plan: starter
+    autoDeploy: true
+    healthCheckPath: /health
+    envVars:
+      - key: MOCK_MODE
+        value: "true"
+      - key: OPENAI_IMAGE_MODEL
+        value: gpt-image-2
+      - key: ALLOWED_ORIGINS
+        value: "*"
+      - key: OPENAI_API_KEY
+        sync: false
