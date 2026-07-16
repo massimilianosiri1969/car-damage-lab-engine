@@ -163,25 +163,16 @@ def validate_manual_mask(mask: Image.Image) -> dict:
     }
 
 
-def _nearest_multiple_of_16(value: int) -> int:
-    return max(16, int(round(value / 16)) * 16)
-
-
 def output_size_for(source: Image.Image) -> str:
+    """Return only sizes supported by the OpenAI Image API."""
     width, height = source.size
-    # Mantiene il rapporto originale e rispetta i requisiti di gpt-image-2.
-    target_width = _nearest_multiple_of_16(width)
-    target_height = _nearest_multiple_of_16(height)
+    ratio = width / height if height else 1.0
 
-    # Evita dimensioni sperimentali eccessive mantenendo il rapporto.
-    max_edge = 2048
-    if max(target_width, target_height) > max_edge:
-        scale = max_edge / max(target_width, target_height)
-        target_width = _nearest_multiple_of_16(int(target_width * scale))
-        target_height = _nearest_multiple_of_16(int(target_height * scale))
-
-    return f"{target_width}x{target_height}"
-
+    if ratio > 1.15:
+        return "1536x1024"
+    if ratio < 0.87:
+        return "1024x1536"
+    return "1024x1024"
 
 def severity_instruction(severity: int) -> str:
     if severity == 0:
