@@ -13,8 +13,10 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from openai import OpenAI
-from PIL import Image, ImageFilter
+from PIL import Image, ImageFile, ImageFilter
 from pydantic import BaseModel, Field
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 APP_NAME = "Car Damage Lab API"
 OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "outputs"))
@@ -211,35 +213,83 @@ def pil_to_file(image: Image.Image, name: str) -> io.BytesIO:
 
 
 def _open_image_bytes(raw: bytes, mode: str) -> Image.Image | None:
-    try:
-        image = Image.open(io.BytesIO(raw))
-        image.load()
-        return image.convert(mode)
-    except Exception:
-        pass
+    """
+    Decodifica tollerante per JPEG/PNG/WebP.
 
-    try:
-        array = np.frombuffer(raw, dtype=np.uint8)
-        decoded = cv2.imdecode(array, cv2.IMREAD_UNCHANGED)
-        if decoded is None:
-            return None
-
-        if decoded.ndim == 2:
-            pil_image = Image.fromarray(decoded, mode="L")
-        elif decoded.shape[2] == 4:
-            pil_image = Image.fromarray(
-                cv2.cvtColor(decoded, cv2.COLOR_BGRA2RGBA),
-                mode="RGBA",
-            )
-        else:
-            pil_image = Image.fromarray(
-                cv2.cvtColor(decoded, cv2.COLOR_BGR2RGB),
-                mode="RGB",
-            )
-
-        return pil_image.convert(mode)
-    except Exception:
+    Alcuni JPEG prodotti o inoltrati dal browser sono visualizzabili da Chrome
+    ma risultano formalmente troncati per Pillow/OpenCV. In quel caso:
+    - rimuove eventuali byte dopo il marker JPEG EOI;
+    - aggiunge il marker EOI se manca;
+    - usa Pillow con LOAD_TRUNCATED_IMAGES;
+    - prova infine OpenCV.
+    """
+    if not raw:
         return None
+
+    candidates: list[bytes] = [raw]
+
+    # JPEG: prova a normalizzare la terminazione del file.
+    if raw.startswith(b"\xff\xd8\xff"):
+        last_eoi = raw.rfind(b"\xff\xd9")
+
+        if last_eoi >= 0 and last_eoi + 2 < len(raw):
+            candidates.append(raw[: last_eoi + 2])
+        elif last_eoi < 0:
+            candidates.append(raw + b"\xff\xd9")
+
+    seen: set[bytes] = set()
+
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+
+        try:
+            image = Image.open(io.BytesIO(candidate))
+            image.load()
+
+            if not image.width or not image.height:
+                continue
+
+            return image.convert(mode)
+        except Exception:
+            pass
+
+        try:
+            parser = ImageFile.Parser()
+            parser.feed(candidate)
+            image = parser.close()
+
+            if image and image.width and image.height:
+                return image.convert(mode)
+        except Exception:
+            pass
+
+        try:
+            array = np.frombuffer(candidate, dtype=np.uint8)
+            decoded = cv2.imdecode(array, cv2.IMREAD_UNCHANGED)
+
+            if decoded is None:
+                continue
+
+            if decoded.ndim == 2:
+                pil_image = Image.fromarray(decoded, mode="L")
+            elif decoded.shape[2] == 4:
+                pil_image = Image.fromarray(
+                    cv2.cvtColor(decoded, cv2.COLOR_BGRA2RGBA),
+                    mode="RGBA",
+                )
+            else:
+                pil_image = Image.fromarray(
+                    cv2.cvtColor(decoded, cv2.COLOR_BGR2RGB),
+                    mode="RGB",
+                )
+
+            return pil_image.convert(mode)
+        except Exception:
+            pass
+
+    return None
 
 
 def _looks_like_hex_image(value: str) -> bool:
@@ -289,7 +339,11 @@ def decode_base64_image(value: str, label: str, mode: str) -> Image.Image:
     data = _strip_data_url(original, label)
 
     try:
-        raw = base64.b64decode(data, validate=True)
+        padded = data + ("=" * (-len(data) % 4))
+        try:
+            raw = base64.b64decode(padded, validate=True)
+        except Exception:
+            raw = base64.urlsafe_b64decode(padded)
     except Exception as exc:
         raise HTTPException(
             status_code=400,
@@ -548,7 +602,7 @@ async def edit_damage(
     prompt = build_prompt(
         severity_percent,
         area_percent,
-        payload.user_instructions,
+        "",
     )
 
     if os.getenv("MOCK_MODE", "false").lower() == "true":
@@ -614,7 +668,11 @@ def edit_damage_base64(payload: DamageEditBase64Request):
     api_mask = alter_damage_area(source_mask, area_percent)
 
     job_id = str(uuid.uuid4())
-    prompt = build_prompt(severity_percent, area_percent)
+    prompt = build_prompt(
+        severity_percent,
+        area_percent,
+        payload.user_instructions,
+    )
 
     if os.getenv("MOCK_MODE", "false").lower() == "true":
         return make_mock_result(
