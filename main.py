@@ -1,6 +1,7 @@
 import base64
 import io
 import os
+import re
 import uuid
 from pathlib import Path
 from typing import Literal
@@ -177,12 +178,44 @@ class DamageEditBase64Request(BaseModel):
 
 
 def _open_image_bytes(raw: bytes, mode: str) -> Image.Image | None:
+    # Primo tentativo: Pillow.
     try:
         image = Image.open(io.BytesIO(raw))
         image.load()
         return image.convert(mode)
     except Exception:
+        pass
+
+    # Secondo tentativo: OpenCV, più tollerante con alcuni JPEG prodotti dai browser.
+    try:
+        array = np.frombuffer(raw, dtype=np.uint8)
+        decoded = cv2.imdecode(array, cv2.IMREAD_UNCHANGED)
+        if decoded is None:
+            return None
+
+        if decoded.ndim == 2:
+            pil = Image.fromarray(decoded, mode="L")
+        elif decoded.shape[2] == 4:
+            pil = Image.fromarray(cv2.cvtColor(decoded, cv2.COLOR_BGRA2RGBA), mode="RGBA")
+        else:
+            pil = Image.fromarray(cv2.cvtColor(decoded, cv2.COLOR_BGR2RGB), mode="RGB")
+        return pil.convert(mode)
+    except Exception:
         return None
+
+
+def _looks_like_hex_image(value: str) -> bool:
+    cleaned = "".join(value.strip().lower().split())
+    return (
+        len(cleaned) >= 8
+        and len(cleaned) % 2 == 0
+        and re.fullmatch(r"[0-9a-f]+", cleaned) is not None
+        and (
+            cleaned.startswith("ffd8ff")
+            or cleaned.startswith("89504e47")
+            or cleaned.startswith("52494646")
+        )
+    )
 
 
 def _strip_data_url(value: str, label: str) -> str:
@@ -195,8 +228,20 @@ def _strip_data_url(value: str, label: str) -> str:
 
 
 def decode_base64_image(value: str, label: str, mode: str) -> Image.Image:
-    """Accetta Base64 puro, Data URL e payload accidentalmente codificati due volte."""
-    data = _strip_data_url(value, label)
+    """Accetta Data URL, Base64, Base64 doppio, HEX e immagini browser tollerate da OpenCV."""
+    original = value.strip().strip('\"').strip("'")
+
+    # Alcuni runtime serializzano direttamente i byte dell'immagine come stringa HEX.
+    if _looks_like_hex_image(original):
+        try:
+            raw = bytes.fromhex("".join(original.split()))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=f"HEX non valido: {label}") from exc
+        image = _open_image_bytes(raw, mode)
+        if image is not None:
+            return image
+
+    data = _strip_data_url(original, label)
 
     try:
         raw = base64.b64decode(data, validate=True)
