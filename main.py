@@ -50,6 +50,7 @@ class DamageEditBase64Request(BaseModel):
     severity_percent: int = Field(..., ge=-100, le=100)
     area_percent: int = Field(..., ge=-100, le=100)
     output_quality: Literal["low", "medium", "high", "auto"] = "medium"
+    user_instructions: str = Field(default="", max_length=500)
 
 
 def clamp_percentage(value: int) -> int:
@@ -159,7 +160,24 @@ def area_instruction(area: int) -> str:
     )
 
 
-def build_prompt(severity: int, area: int) -> str:
+def build_prompt(
+    severity: int,
+    area: int,
+    user_instructions: str = "",
+) -> str:
+    extra_instruction = ""
+
+    if user_instructions.strip():
+        extra_instruction = f"""
+Indicazione specifica dell'utente:
+{user_instructions.strip()}
+
+Questa indicazione deve influenzare concretamente la modifica.
+Interpretala insieme ai valori di gravità e superficie, rispettando la zona
+consentita dalla maschera. Se l'indicazione entra in conflitto con la maschera,
+la maschera ha priorità e limita l'area modificabile.
+""".strip()
+
     return f"""
 Modifica fotografica automotive realistica e documentale.
 
@@ -167,18 +185,22 @@ Obiettivo:
 - {severity_instruction(severity)}
 - {area_instruction(area)}
 
+{extra_instruction}
+
 Vincoli obbligatori:
-- conserva la stessa automobile, modello, colore, prospettiva e inquadratura;
-- conserva targa, logo, ruote, vetri, fanali non coinvolti e dettagli identificativi;
-- conserva integralmente sfondo, strada, persone, edifici e illuminazione;
-- intervieni esclusivamente nella zona indicata dalla maschera;
+- la fotografia fornita è il riferimento vincolante;
+- conserva esattamente la stessa automobile;
+- conserva modello, colore, targa, logo, ruote, vetri e fanali non coinvolti;
+- conserva prospettiva, inquadratura, sfondo, strada, edifici e illuminazione;
+- non generare un altro veicolo e non cambiare il punto di vista;
+- intervieni esclusivamente nella zona consentita dalla maschera;
 - mantieni riflessi, ombre, materiali e geometrie fisicamente plausibili;
-- non aggiungere testo, watermark, veicoli, oggetti o componenti inesistenti;
+- non aggiungere testo, watermark, persone, oggetti o componenti estranei;
 - non cambiare il rapporto d'aspetto;
 - il risultato deve sembrare una fotografia reale, non un rendering.
 
-Restituisci l'intera fotografia finale, con tutto ciò che non è interessato dal
-Danno visivamente identico all'originale.
+Restituisci l'intera fotografia finale mantenendo visivamente identico tutto ciò
+che non deve essere modificato.
 """.strip()
 
 
@@ -511,7 +533,11 @@ def edit_damage_base64(payload: DamageEditBase64Request):
     api_mask = alter_damage_area(source_mask, area_percent)
 
     job_id = str(uuid.uuid4())
-    prompt = build_prompt(severity_percent, area_percent)
+    prompt = build_prompt(
+        severity_percent,
+        area_percent,
+        payload.user_instructions,
+    )
 
     if os.getenv("MOCK_MODE", "false").lower() == "true":
         return make_mock_result(
@@ -537,5 +563,5 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v3-base64",
+        "prompt_version": "damage-v4-base64-user-instructions",
     }
