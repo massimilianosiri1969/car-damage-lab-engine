@@ -13,7 +13,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from openai import OpenAI
-from PIL import Image
+from PIL import Image, ImageFilter
 from pydantic import BaseModel, Field
 
 APP_NAME = "Car Damage Lab API"
@@ -162,6 +162,128 @@ def validate_manual_mask(mask: Image.Image) -> dict:
         "bbox": bbox,
     }
 
+
+
+def adjust_selection_mask(mask: Image.Image, area_percent: int) -> Image.Image:
+    """Return an L mask where white pixels are the editable area."""
+    gray = np.array(mask.convert("L"))
+    binary = np.where(gray >= 128, 255, 0).astype(np.uint8)
+
+    if area_percent != 0:
+        height, width = binary.shape
+        reference = max(3, round(min(width, height) * 0.10))
+        radius = max(1, round(reference * abs(area_percent) / 100))
+        kernel_size = radius * 2 + 1
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (kernel_size, kernel_size),
+        )
+        if area_percent > 0:
+            binary = cv2.dilate(binary, kernel, iterations=1)
+        else:
+            binary = cv2.erode(binary, kernel, iterations=1)
+
+    return Image.fromarray(binary, mode="L")
+
+
+def selection_bbox_with_context(
+    selection: Image.Image,
+    image_size: tuple[int, int],
+) -> tuple[int, int, int, int]:
+    """Compute a padded crop around the selected damage area."""
+    arr = np.array(selection.convert("L")) >= 128
+    ys, xs = np.where(arr)
+    if len(xs) == 0 or len(ys) == 0:
+        raise HTTPException(status_code=422, detail="La maschera manuale è vuota.")
+
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    box_w = max(1, x1 - x0)
+    box_h = max(1, y1 - y0)
+    padding = max(96, round(max(box_w, box_h) * 0.35))
+
+    full_w, full_h = image_size
+    return (
+        max(0, x0 - padding),
+        max(0, y0 - padding),
+        min(full_w, x1 + padding),
+        min(full_h, y1 + padding),
+    )
+
+
+def api_mask_from_selection(selection: Image.Image) -> Image.Image:
+    """Create the RGBA API mask: transparent editable, opaque protected."""
+    binary = np.where(np.array(selection.convert("L")) >= 128, 255, 0).astype(np.uint8)
+    rgba = np.zeros((binary.shape[0], binary.shape[1], 4), dtype=np.uint8)
+    rgba[:, :, :3] = 0
+    rgba[:, :, 3] = 255 - binary
+    return Image.fromarray(rgba, mode="RGBA")
+
+
+def composite_generated_crop(
+    source: Image.Image,
+    generated_bytes: bytes,
+    selection: Image.Image,
+    crop_box: tuple[int, int, int, int],
+) -> bytes:
+    """Paste only the selected pixels back onto the untouched original image."""
+    generated = Image.open(io.BytesIO(generated_bytes)).convert("RGB")
+    crop_w = crop_box[2] - crop_box[0]
+    crop_h = crop_box[3] - crop_box[1]
+    generated = generated.resize((crop_w, crop_h), Image.Resampling.LANCZOS)
+
+    selection_crop = selection.crop(crop_box).convert("L")
+    # Small feather avoids a visible hard seam while keeping the edit localized.
+    feather_radius = max(1.0, min(crop_w, crop_h) * 0.006)
+    blend_mask = selection_crop.filter(ImageFilter.GaussianBlur(radius=feather_radius))
+
+    output = source.copy().convert("RGB")
+    original_crop = output.crop(crop_box)
+    merged_crop = Image.composite(generated, original_crop, blend_mask)
+    output.paste(merged_crop, (crop_box[0], crop_box[1]))
+
+    buffer = io.BytesIO()
+    output.save(buffer, format="JPEG", quality=95, subsampling=0)
+    return buffer.getvalue()
+
+
+def edit_manual_region_locked(
+    source: Image.Image,
+    source_mask: Image.Image,
+    severity_percent: int,
+    area_percent: int,
+    user_instructions: str,
+    quality: Literal["low", "medium", "high", "auto"],
+) -> bytes:
+    """Edit a contextual crop and composite only the selected pixels back."""
+    selection = adjust_selection_mask(source_mask, area_percent)
+    validate_manual_mask(selection)
+    crop_box = selection_bbox_with_context(selection, source.size)
+
+    source_crop = source.crop(crop_box).convert("RGB")
+    selection_crop = selection.crop(crop_box).convert("L")
+    api_mask_crop = api_mask_from_selection(selection_crop)
+
+    prompt = build_prompt(
+        severity_percent,
+        area_percent,
+        user_instructions,
+        "manual",
+    ) + """
+
+ISTRUZIONE TECNICA VINCOLANTE:
+Stai modificando un ritaglio della fotografia originale. Mantieni identici tutti
+i dettagli visibili nel ritaglio salvo la sola deformazione coperta dalla zona
+trasparente della maschera. Non cambiare veicolo, componenti, sfondo o prospettiva.
+"""
+
+    generated_bytes = call_openai_image_edit(
+        source_crop,
+        api_mask_crop,
+        prompt,
+        quality,
+    )
+    return composite_generated_crop(source, generated_bytes, selection, crop_box)
 
 def output_size_for(source: Image.Image) -> str:
     """Return only sizes supported by the OpenAI Image API."""
@@ -671,12 +793,22 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         result["user_instructions"] = payload.user_instructions.strip()
         return result
 
-    result_bytes = call_openai_image_edit(
-        source,
-        api_mask,
-        prompt,
-        payload.output_quality,
-    )
+    if payload.selection_mode == "manual":
+        result_bytes = edit_manual_region_locked(
+            source,
+            source_mask,
+            severity_percent,
+            area_percent,
+            payload.user_instructions,
+            payload.output_quality,
+        )
+    else:
+        result_bytes = call_openai_image_edit(
+            source,
+            api_mask,
+            prompt,
+            payload.output_quality,
+        )
 
     return {
         "job_id": job_id,
@@ -688,6 +820,6 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         "user_instructions": payload.user_instructions.strip(),
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v5-descriptive-no-mask",
+        "prompt_version": "damage-v6-roi-composite-locked",
     }
 
