@@ -1,4 +1,3 @@
-
 import base64
 import io
 import os
@@ -13,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from openai import OpenAI
 from PIL import Image
+from pydantic import BaseModel, Field
 
 APP_NAME = "Car Damage Lab API"
 OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "outputs"))
@@ -167,6 +167,42 @@ def pil_to_named_bytes(image: Image.Image, name: str) -> tuple[str, io.BytesIO, 
     return (name, buffer, "image/png")
 
 
+
+class DamageEditBase64Request(BaseModel):
+    image_base64: str = Field(..., min_length=16)
+    mask_base64: str = Field(..., min_length=16)
+    severity_percent: int = Field(..., ge=-100, le=100)
+    area_percent: int = Field(..., ge=-100, le=100)
+    output_quality: Literal["low", "medium", "high", "auto"] = "medium"
+
+
+def decode_base64_image(value: str, label: str, mode: str) -> Image.Image:
+    data = value.strip()
+    if data.startswith("data:"):
+        if "," not in data:
+            raise HTTPException(status_code=400, detail=f"Data URL non valido: {label}")
+        data = data.split(",", 1)[1]
+
+    # Rimuove spazi e ritorni a capo introdotti dalla serializzazione.
+    data = "".join(data.split())
+    try:
+        raw = base64.b64decode(data, validate=True)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Base64 non valido: {label}") from exc
+
+    if not raw:
+        raise HTTPException(status_code=400, detail=f"Immagine vuota: {label}")
+
+    try:
+        image = Image.open(io.BytesIO(raw))
+        image.load()
+        return image.convert(mode)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Immagine Base64 non decodificabile: {label} ({len(raw)} byte)",
+        ) from exc
+
 @app.get("/health")
 def health():
     return {
@@ -259,4 +295,78 @@ async def edit_damage(
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
         "prompt_version": "damage-v1",
+    }
+
+
+@app.post("/v1/damage/edit-base64")
+def edit_damage_base64(payload: DamageEditBase64Request):
+    severity_percent = clamp_percentage(payload.severity_percent)
+    area_percent = clamp_percentage(payload.area_percent)
+
+    source = decode_base64_image(payload.image_base64, "image_base64", "RGB")
+    source_mask = decode_base64_image(payload.mask_base64, "mask_base64", "L")
+    source_mask = resize_mask(source_mask, source.size)
+    api_mask = alter_damage_area(source_mask, area_percent)
+
+    job_id = str(uuid.uuid4())
+    prompt = build_prompt(severity_percent, area_percent)
+
+    if os.getenv("MOCK_MODE", "false").lower() == "true":
+        preview = source.copy()
+        overlay = Image.new("RGBA", source.size, (255, 0, 0, 0))
+        editable = 255 - np.array(api_mask.getchannel("A"))
+        overlay_alpha = Image.fromarray((editable * 0.25).astype(np.uint8), mode="L")
+        overlay.putalpha(overlay_alpha)
+        preview = Image.alpha_composite(preview.convert("RGBA"), overlay).convert("RGB")
+        buffer = io.BytesIO()
+        preview.save(buffer, format="JPEG", quality=92)
+        result_bytes = buffer.getvalue()
+        return {
+            "job_id": job_id,
+            "status": "completed",
+            "mode": "mock",
+            "severity_percent": severity_percent,
+            "area_percent": area_percent,
+            "result_base64": base64.b64encode(result_bytes).decode("ascii"),
+            "mime_type": "image/jpeg",
+            "note": "Anteprima rossa della superficie elaborata; nessuna modifica AI.",
+        }
+
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise HTTPException(
+            status_code=503,
+            detail="OPENAI_API_KEY non configurata. Usa MOCK_MODE=true per i test.",
+        )
+
+    client = OpenAI(api_key=api_key)
+    source_file = pil_to_named_bytes(source, "source.png")[1]
+    mask_file = pil_to_named_bytes(api_mask, "mask.png")[1]
+
+    try:
+        response = client.images.edit(
+            model=os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-2"),
+            image=source_file,
+            mask=mask_file,
+            prompt=prompt,
+            input_fidelity="high",
+            quality=payload.output_quality,
+            size="auto",
+            output_format="jpeg",
+            output_compression=92,
+            n=1,
+        )
+        result_bytes = base64.b64decode(response.data[0].b64_json)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Errore motore immagini: {exc}") from exc
+
+    return {
+        "job_id": job_id,
+        "status": "completed",
+        "mode": "ai",
+        "severity_percent": severity_percent,
+        "area_percent": area_percent,
+        "result_base64": base64.b64encode(result_bytes).decode("ascii"),
+        "mime_type": "image/jpeg",
+        "prompt_version": "damage-v2-base64",
     }
