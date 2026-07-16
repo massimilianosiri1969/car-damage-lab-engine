@@ -627,12 +627,11 @@ async def edit_damage(
             prompt,
             output_quality,
         )
-        result_bytes = composite_only_selected_area(
-            source,
-            generated_bytes,
-            source_mask,
-            area_percent,
-        )
+
+        # TEST TEMPORANEO:
+        # restituisce direttamente l'immagine prodotta dal modello,
+        # senza ricomposizione rigida sulla fotografia originale.
+        result_bytes = generated_bytes
 
     result_path = OUTPUT_DIR / f"{job_id}.jpg"
     result_path.write_bytes(result_bytes)
@@ -645,7 +644,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v3",
+        "prompt_version": "damage-v6-direct-model-output-test",
     }
 
 
@@ -698,12 +697,11 @@ def edit_damage_base64(payload: DamageEditBase64Request):
             prompt,
             payload.output_quality,
         )
-        result_bytes = composite_only_selected_area(
-            source,
-            generated_bytes,
-            source_mask,
-            area_percent,
-        )
+
+        # TEST TEMPORANEO:
+        # restituisce direttamente l'immagine prodotta dal modello,
+        # senza ricomposizione rigida sulla fotografia originale.
+        result_bytes = generated_bytes
 
     return {
         "job_id": job_id,
@@ -713,5 +711,5 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v5-full-image-composite-locked",
+        "prompt_version": "damage-v6-direct-model-output-test",
     }
