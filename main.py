@@ -176,15 +176,28 @@ class DamageEditBase64Request(BaseModel):
     output_quality: Literal["low", "medium", "high", "auto"] = "medium"
 
 
-def decode_base64_image(value: str, label: str, mode: str) -> Image.Image:
-    data = value.strip()
+def _open_image_bytes(raw: bytes, mode: str) -> Image.Image | None:
+    try:
+        image = Image.open(io.BytesIO(raw))
+        image.load()
+        return image.convert(mode)
+    except Exception:
+        return None
+
+
+def _strip_data_url(value: str, label: str) -> str:
+    data = value.strip().strip('\"').strip("'")
     if data.startswith("data:"):
         if "," not in data:
             raise HTTPException(status_code=400, detail=f"Data URL non valido: {label}")
         data = data.split(",", 1)[1]
+    return "".join(data.split())
 
-    # Rimuove spazi e ritorni a capo introdotti dalla serializzazione.
-    data = "".join(data.split())
+
+def decode_base64_image(value: str, label: str, mode: str) -> Image.Image:
+    """Accetta Base64 puro, Data URL e payload accidentalmente codificati due volte."""
+    data = _strip_data_url(value, label)
+
     try:
         raw = base64.b64decode(data, validate=True)
     except Exception as exc:
@@ -193,15 +206,37 @@ def decode_base64_image(value: str, label: str, mode: str) -> Image.Image:
     if not raw:
         raise HTTPException(status_code=400, detail=f"Immagine vuota: {label}")
 
+    image = _open_image_bytes(raw, mode)
+    if image is not None:
+        return image
+
+    # Base44 può serializzare il Data URL/Base64 una seconda volta.
+    # In tal caso il primo decode restituisce ancora testo Base64 o un Data URL.
     try:
-        image = Image.open(io.BytesIO(raw))
-        image.load()
-        return image.convert(mode)
-    except Exception as exc:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Immagine Base64 non decodificabile: {label} ({len(raw)} byte)",
-        ) from exc
+        nested_text = raw.decode("utf-8").strip().strip('\"').strip("'")
+    except UnicodeDecodeError:
+        nested_text = ""
+
+    if nested_text:
+        nested_data = _strip_data_url(nested_text, label)
+        try:
+            nested_raw = base64.b64decode(nested_data, validate=True)
+        except Exception:
+            nested_raw = b""
+
+        if nested_raw:
+            image = _open_image_bytes(nested_raw, mode)
+            if image is not None:
+                return image
+
+    prefix = raw[:24].hex()
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            f"Immagine Base64 non decodificabile: {label} "
+            f"({len(raw)} byte, prefisso={prefix})"
+        ),
+    )
 
 @app.get("/health")
 def health():
