@@ -13,7 +13,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from openai import OpenAI
-from PIL import Image
+from PIL import Image, ImageFilter
 from pydantic import BaseModel, Field
 
 APP_NAME = "Car Damage Lab API"
@@ -50,6 +50,7 @@ class DamageEditBase64Request(BaseModel):
     severity_percent: int = Field(..., ge=-100, le=100)
     area_percent: int = Field(..., ge=-100, le=100)
     output_quality: Literal["low", "medium", "high", "auto"] = "medium"
+    user_instructions: str = Field(default="", max_length=500)
 
 
 def clamp_percentage(value: int) -> int:
@@ -159,13 +160,31 @@ def area_instruction(area: int) -> str:
     )
 
 
-def build_prompt(severity: int, area: int) -> str:
+def build_prompt(
+    severity: int,
+    area: int,
+    user_instructions: str = "",
+) -> str:
+    cleaned = user_instructions.strip()
+    extra_instruction = ""
+
+    if cleaned:
+        extra_instruction = f"""
+Indicazione specifica dell'utente:
+{cleaned}
+
+Applica questa indicazione esclusivamente nella zona consentita dalla maschera.
+La maschera ha sempre priorità e non autorizza modifiche al resto della fotografia.
+""".strip()
+
     return f"""
 Modifica fotografica automotive realistica e documentale.
 
 Obiettivo:
 - {severity_instruction(severity)}
 - {area_instruction(area)}
+
+{extra_instruction}
 
 Vincoli obbligatori:
 - conserva la stessa automobile, modello, colore, prospettiva e inquadratura;
@@ -175,10 +194,11 @@ Vincoli obbligatori:
 - mantieni riflessi, ombre, materiali e geometrie fisicamente plausibili;
 - non aggiungere testo, watermark, veicoli, oggetti o componenti inesistenti;
 - non cambiare il rapporto d'aspetto;
-- il risultato deve sembrare una fotografia reale, non un rendering.
+- il risultato deve sembrare una fotografia reale, non un rendering;
+- restituisci l'intera fotografia finale.
 
-Restituisci l'intera fotografia finale, con tutto ciò che non è interessato dal
-Danno visivamente identico all'originale.
+Tutto ciò che si trova fuori dalla zona modificabile deve rimanere identico
+alla fotografia originale.
 """.strip()
 
 
@@ -360,6 +380,74 @@ def make_mock_result(
     }
 
 
+
+def composite_only_selected_area(
+    source: Image.Image,
+    generated_bytes: bytes,
+    source_mask: Image.Image,
+    area_percent: int,
+) -> bytes:
+    """Mantiene invariati tutti i pixel esterni alla selezione."""
+    try:
+        generated = Image.open(io.BytesIO(generated_bytes))
+        generated.load()
+        generated = generated.convert("RGB")
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Il motore ha restituito un'immagine non valida.",
+        ) from exc
+
+    source_rgb = source.convert("RGB")
+
+    if generated.size != source_rgb.size:
+        generated = generated.resize(
+            source_rgb.size,
+            Image.Resampling.LANCZOS,
+        )
+
+    selection = np.array(source_mask.convert("L"))
+    selection = np.where(selection >= 128, 255, 0).astype(np.uint8)
+
+    if area_percent != 0:
+        height, width = selection.shape
+        reference = max(3, round(min(width, height) * 0.10))
+        radius = max(1, round(reference * abs(area_percent) / 100))
+        kernel_size = radius * 2 + 1
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (kernel_size, kernel_size),
+        )
+
+        if area_percent > 0:
+            selection = cv2.dilate(selection, kernel, iterations=1)
+        else:
+            selection = cv2.erode(selection, kernel, iterations=1)
+
+    selected_pixels = int((selection >= 128).sum())
+    if selected_pixels == 0:
+        raise HTTPException(
+            status_code=422,
+            detail="La maschera è vuota. Disegna la zona da modificare.",
+        )
+
+    blend_mask = Image.fromarray(selection, mode="L")
+    blend_mask = blend_mask.filter(ImageFilter.GaussianBlur(radius=1.2))
+
+    final_image = Image.composite(generated, source_rgb, blend_mask)
+
+    output = io.BytesIO()
+    final_image.save(
+        output,
+        format="JPEG",
+        quality=95,
+        subsampling=0,
+        optimize=True,
+    )
+    return output.getvalue()
+
+
+
 def call_openai_image_edit(
     source: Image.Image,
     api_mask: Image.Image,
@@ -457,7 +545,11 @@ async def edit_damage(
     api_mask = alter_damage_area(source_mask, area_percent)
 
     job_id = str(uuid.uuid4())
-    prompt = build_prompt(severity_percent, area_percent)
+    prompt = build_prompt(
+        severity_percent,
+        area_percent,
+        payload.user_instructions,
+    )
 
     if os.getenv("MOCK_MODE", "false").lower() == "true":
         return JSONResponse(
@@ -470,12 +562,23 @@ async def edit_damage(
             )
         )
 
-    result_bytes = call_openai_image_edit(
-        source,
-        api_mask,
-        prompt,
-        output_quality,
-    )
+    if severity_percent == 0 and area_percent == 0:
+        buffer = io.BytesIO()
+        source.save(buffer, format="JPEG", quality=95, subsampling=0)
+        result_bytes = buffer.getvalue()
+    else:
+        generated_bytes = call_openai_image_edit(
+            source,
+            api_mask,
+            prompt,
+            output_quality,
+        )
+        result_bytes = composite_only_selected_area(
+            source,
+            generated_bytes,
+            source_mask,
+            area_percent,
+        )
 
     result_path = OUTPUT_DIR / f"{job_id}.jpg"
     result_path.write_bytes(result_bytes)
@@ -522,12 +625,27 @@ def edit_damage_base64(payload: DamageEditBase64Request):
             area_percent,
         )
 
-    result_bytes = call_openai_image_edit(
-        source,
-        api_mask,
-        prompt,
-        payload.output_quality,
-    )
+    if (
+        severity_percent == 0
+        and area_percent == 0
+        and not payload.user_instructions.strip()
+    ):
+        buffer = io.BytesIO()
+        source.save(buffer, format="JPEG", quality=95, subsampling=0)
+        result_bytes = buffer.getvalue()
+    else:
+        generated_bytes = call_openai_image_edit(
+            source,
+            api_mask,
+            prompt,
+            payload.output_quality,
+        )
+        result_bytes = composite_only_selected_area(
+            source,
+            generated_bytes,
+            source_mask,
+            area_percent,
+        )
 
     return {
         "job_id": job_id,
@@ -537,5 +655,5 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v3-base64",
+        "prompt_version": "damage-v5-full-image-composite-locked",
     }
