@@ -22,6 +22,13 @@ APP_NAME = "Car Damage Lab API"
 OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "outputs"))
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+# Bordo di fusione interno alla selezione, espresso in pixel dell'immagine finale.
+# Può essere modificato su Render con la variabile SOFT_COMPOSITE_FEATHER_PX.
+SOFT_COMPOSITE_FEATHER_PX = max(
+    1,
+    int(os.getenv("SOFT_COMPOSITE_FEATHER_PX", "40")),
+)
+
 ALLOWED_ORIGINS = [
     item.strip()
     for item in os.getenv("ALLOWED_ORIGINS", "*").split(",")
@@ -30,7 +37,7 @@ ALLOWED_ORIGINS = [
 
 app = FastAPI(
     title=APP_NAME,
-    version="0.2.0",
+    version="0.3.0",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -190,7 +197,11 @@ Obiettivo:
 
 Vincoli obbligatori:
 - conserva la stessa automobile, modello, colore, prospettiva e inquadratura;
-- conserva targa, logo, ruote, vetri, fanali non coinvolti e dettagli identificativi;
+- conserva targa, logo, ruote, vetri e dettagli identificativi;
+- preserva integralmente fari, fanali, lenti, parabole, lampade e gruppi ottici:
+  non deformarli, non ridisegnarli, non spostarli e non cambiarne trasparenza,
+  forma o contenuto; modifica soltanto la lamiera selezionata, salvo esplicita
+  richiesta testuale dell'utente riferita al gruppo ottico;
 - conserva integralmente sfondo, strada, persone, edifici e illuminazione;
 - intervieni esclusivamente nella zona indicata dalla maschera;
 - mantieni riflessi, ombre, materiali e geometrie fisicamente plausibili;
@@ -435,31 +446,17 @@ def make_mock_result(
 
 
 
-def composite_only_selected_area(
-    source: Image.Image,
-    generated_bytes: bytes,
+def _adjust_binary_selection(
     source_mask: Image.Image,
     area_percent: int,
-) -> bytes:
-    """Mantiene invariati tutti i pixel esterni alla selezione."""
-    try:
-        generated = Image.open(io.BytesIO(generated_bytes))
-        generated.load()
-        generated = generated.convert("RGB")
-    except Exception as exc:
-        raise HTTPException(
-            status_code=502,
-            detail="Il motore ha restituito un'immagine non valida.",
-        ) from exc
+) -> np.ndarray:
+    """
+    Converte la maschera Base44 in una selezione binaria:
+      255 = zona modificabile
+      0   = zona protetta
 
-    source_rgb = source.convert("RGB")
-
-    if generated.size != source_rgb.size:
-        generated = generated.resize(
-            source_rgb.size,
-            Image.Resampling.LANCZOS,
-        )
-
+    Applica anche l'espansione o contrazione richiesta da area_percent.
+    """
     selection = np.array(source_mask.convert("L"))
     selection = np.where(selection >= 128, 255, 0).astype(np.uint8)
 
@@ -478,6 +475,49 @@ def composite_only_selected_area(
         else:
             selection = cv2.erode(selection, kernel, iterations=1)
 
+    return selection
+
+
+def soft_composite_selected_area(
+    source: Image.Image,
+    generated_bytes: bytes,
+    source_mask: Image.Image,
+    area_percent: int,
+    feather_radius: int = SOFT_COMPOSITE_FEATHER_PX,
+) -> bytes:
+    """
+    Fonde il risultato AI con l'originale usando un bordo morbido INTERNO.
+
+    - centro della selezione: risultato AI al 100%;
+    - bordo interno: fusione graduale;
+    - fuori selezione: fotografia originale al 100%.
+
+    La sfumatura non si estende mai fuori dalla selezione, così fari,
+    cofano, paraurti e altri elementi non selezionati restano protetti.
+    """
+    try:
+        generated = Image.open(io.BytesIO(generated_bytes))
+        generated.load()
+        generated = generated.convert("RGB")
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Il motore ha restituito un'immagine non valida.",
+        ) from exc
+
+    source_rgb = source.convert("RGB")
+
+    if generated.size != source_rgb.size:
+        generated = generated.resize(
+            source_rgb.size,
+            Image.Resampling.LANCZOS,
+        )
+
+    selection = _adjust_binary_selection(
+        source_mask,
+        area_percent,
+    )
+
     selected_pixels = int((selection >= 128).sum())
     if selected_pixels == 0:
         raise HTTPException(
@@ -485,10 +525,30 @@ def composite_only_selected_area(
             detail="La maschera è vuota. Disegna la zona da modificare.",
         )
 
-    blend_mask = Image.fromarray(selection, mode="L")
-    blend_mask = blend_mask.filter(ImageFilter.GaussianBlur(radius=1.2))
+    # Sfuma il bordo verso l'interno, senza autorizzare modifiche all'esterno.
+    binary_mask = Image.fromarray(selection, mode="L")
+    blurred_mask = binary_mask.filter(
+        ImageFilter.GaussianBlur(radius=max(1, feather_radius))
+    )
 
-    final_image = Image.composite(generated, source_rgb, blend_mask)
+    binary_array = np.array(binary_mask, dtype=np.float32) / 255.0
+    blurred_array = np.array(blurred_mask, dtype=np.float32) / 255.0
+
+    # Clip alla selezione originale: nessuna invasione oltre il bordo disegnato.
+    inward_alpha = np.minimum(blurred_array, binary_array)
+
+    # Mantiene pieno il centro e sfuma soltanto la fascia vicina al bordo.
+    inward_alpha = np.clip(inward_alpha, 0.0, 1.0)
+    blend_mask = Image.fromarray(
+        np.round(inward_alpha * 255).astype(np.uint8),
+        mode="L",
+    )
+
+    final_image = Image.composite(
+        generated,
+        source_rgb,
+        blend_mask,
+    )
 
     output = io.BytesIO()
     final_image.save(
@@ -499,7 +559,6 @@ def composite_only_selected_area(
         optimize=True,
     )
     return output.getvalue()
-
 
 
 def call_openai_image_edit(
@@ -628,10 +687,12 @@ async def edit_damage(
             output_quality,
         )
 
-        # TEST TEMPORANEO:
-        # restituisce direttamente l'immagine prodotta dal modello,
-        # senza ricomposizione rigida sulla fotografia originale.
-        result_bytes = generated_bytes
+        result_bytes = soft_composite_selected_area(
+            source=source,
+            generated_bytes=generated_bytes,
+            source_mask=source_mask,
+            area_percent=area_percent,
+        )
 
     result_path = OUTPUT_DIR / f"{job_id}.jpg"
     result_path.write_bytes(result_bytes)
@@ -644,7 +705,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v6-direct-model-output-test",
+        "prompt_version": "damage-v7-soft-composite-headlight-protection",
     }
 
 
@@ -698,10 +759,12 @@ def edit_damage_base64(payload: DamageEditBase64Request):
             payload.output_quality,
         )
 
-        # TEST TEMPORANEO:
-        # restituisce direttamente l'immagine prodotta dal modello,
-        # senza ricomposizione rigida sulla fotografia originale.
-        result_bytes = generated_bytes
+        result_bytes = soft_composite_selected_area(
+            source=source,
+            generated_bytes=generated_bytes,
+            source_mask=source_mask,
+            area_percent=area_percent,
+        )
 
     return {
         "job_id": job_id,
@@ -711,5 +774,5 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v6-direct-model-output-test",
+        "prompt_version": "damage-v7-soft-composite-headlight-protection",
     }
