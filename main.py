@@ -46,11 +46,12 @@ app.add_middleware(
 
 class DamageEditBase64Request(BaseModel):
     image_base64: str = Field(..., min_length=16)
-    mask_base64: str = Field(..., min_length=16)
+    mask_base64: str = Field(default="")
     severity_percent: int = Field(..., ge=-100, le=100)
     area_percent: int = Field(..., ge=-100, le=100)
     output_quality: Literal["low", "medium", "high", "auto"] = "medium"
     user_instructions: str = Field(default="", max_length=500)
+    selection_mode: Literal["manual", "descriptive"] = "manual"
 
 
 def clamp_percentage(value: int) -> int:
@@ -164,43 +165,62 @@ def build_prompt(
     severity: int,
     area: int,
     user_instructions: str = "",
+    selection_mode: Literal["manual", "descriptive"] = "manual",
 ) -> str:
-    extra_instruction = ""
+    cleaned_instructions = user_instructions.strip()
 
-    if user_instructions.strip():
+    if selection_mode == "descriptive":
+        mode_instruction = """
+Modalità MODIFICA DESCRITTIVA SENZA MASCHERA MANUALE.
+La richiesta testuale identifica la modifica da eseguire e la zona interessata.
+Individua autonomamente nella fotografia il danno esistente e gli eventuali
+pannelli o componenti citati dall'utente. Modifica soltanto il danno e la sua
+estensione fisicamente collegata. Tutti gli altri pixel devono restare il più
+possibile identici alla fotografia di partenza.
+""".strip()
+    else:
+        mode_instruction = """
+Modalità SELEZIONE MANUALE.
+Intervieni esclusivamente nella zona consentita dalla maschera. La maschera ha
+priorità su qualsiasi indicazione testuale e limita l'area modificabile.
+""".strip()
+
+    extra_instruction = ""
+    if cleaned_instructions:
         extra_instruction = f"""
 Indicazione specifica dell'utente:
-{user_instructions.strip()}
+{cleaned_instructions}
 
-Questa indicazione deve influenzare concretamente la modifica.
-Interpretala insieme ai valori di gravità e superficie, rispettando la zona
-consentita dalla maschera. Se l'indicazione entra in conflitto con la maschera,
-la maschera ha priorità e limita l'area modificabile.
+Questa indicazione deve influenzare concretamente la modifica, insieme ai valori
+di gravità e superficie.
 """.strip()
 
     return f"""
 Modifica fotografica automotive realistica e documentale.
 
-Obiettivo:
+{mode_instruction}
+
+Obiettivo quantitativo:
 - {severity_instruction(severity)}
 - {area_instruction(area)}
 
 {extra_instruction}
 
-Vincoli obbligatori:
-- la fotografia fornita è il riferimento vincolante;
-- conserva esattamente la stessa automobile;
-- conserva modello, colore, targa, logo, ruote, vetri e fanali non coinvolti;
-- conserva prospettiva, inquadratura, sfondo, strada, edifici e illuminazione;
-- non generare un altro veicolo e non cambiare il punto di vista;
-- intervieni esclusivamente nella zona consentita dalla maschera;
-- mantieni riflessi, ombre, materiali e geometrie fisicamente plausibili;
-- non aggiungere testo, watermark, persone, oggetti o componenti estranei;
-- non cambiare il rapporto d'aspetto;
-- il risultato deve sembrare una fotografia reale, non un rendering.
+VINCOLI ASSOLUTI DI CONSERVAZIONE:
+- usa la fotografia fornita come riferimento vincolante;
+- conserva esattamente la stessa automobile, marca, modello e allestimento;
+- conserva colore, targa, logo, cerchi, pneumatici, vetri, fanali e maniglie;
+- conserva identici prospettiva, distanza, focale, inquadratura e rapporto d'aspetto;
+- conserva identici sfondo, strada, edifici, ombre, riflessi e illuminazione;
+- non spostare, ruotare, ingrandire o ridurre l'automobile;
+- non generare un'altra automobile e non cambiare il punto di vista;
+- non aggiungere persone, oggetti, testo, watermark o componenti estranei;
+- modifica soltanto lamiera, vernice, graffi, rotture o deformazioni richieste;
+- mantieni geometrie, materiali, ombre e riflessi fisicamente plausibili;
+- restituisci l'intera fotografia, non un ritaglio e non un rendering.
 
-Restituisci l'intera fotografia finale mantenendo visivamente identico tutto ciò
-che non deve essere modificato.
+Se la richiesta non può essere applicata senza alterare l'identità della scena,
+applica una modifica più prudente e localizzata invece di rigenerare l'immagine.
 """.strip()
 
 
@@ -384,7 +404,7 @@ def make_mock_result(
 
 def call_openai_image_edit(
     source: Image.Image,
-    api_mask: Image.Image,
+    api_mask: Image.Image | None,
     prompt: str,
     quality: Literal["low", "medium", "high", "auto"],
 ) -> bytes:
@@ -397,20 +417,23 @@ def call_openai_image_edit(
 
     client = OpenAI(api_key=api_key)
     source_file = pil_to_file(source, "source.png")
-    mask_file = pil_to_file(api_mask, "mask.png")
+
+    request_args = {
+        "model": os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-2"),
+        "image": source_file,
+        "prompt": prompt,
+        "quality": quality,
+        "size": "auto",
+        "output_format": "jpeg",
+        "output_compression": 92,
+        "n": 1,
+    }
+
+    if api_mask is not None:
+        request_args["mask"] = pil_to_file(api_mask, "mask.png")
 
     try:
-        response = client.images.edit(
-            model=os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-2"),
-            image=source_file,
-            mask=mask_file,
-            prompt=prompt,
-            quality=quality,
-            size="auto",
-            output_format="jpeg",
-            output_compression=92,
-            n=1,
-        )
+        response = client.images.edit(**request_args)
 
         if not response.data or not response.data[0].b64_json:
             raise RuntimeError("OpenAI ha risposto senza dati immagine")
@@ -524,29 +547,69 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         "image_base64",
         "RGB",
     )
-    source_mask = decode_base64_image(
-        payload.mask_base64,
-        "mask_base64",
-        "L",
-    )
-    source_mask = resize_mask(source_mask, source.size)
-    api_mask = alter_damage_area(source_mask, area_percent)
+
+    if payload.selection_mode == "descriptive":
+        if not payload.user_instructions.strip():
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "In modalità descrittiva devi inserire una richiesta testuale "
+                    "che specifichi la modifica desiderata."
+                ),
+            )
+        api_mask = None
+    else:
+        if not payload.mask_base64.strip():
+            raise HTTPException(
+                status_code=422,
+                detail="In modalità manuale è necessaria una maschera.",
+            )
+
+        source_mask = decode_base64_image(
+            payload.mask_base64,
+            "mask_base64",
+            "L",
+        )
+        source_mask = resize_mask(source_mask, source.size)
+        api_mask = alter_damage_area(source_mask, area_percent)
 
     job_id = str(uuid.uuid4())
     prompt = build_prompt(
         severity_percent,
         area_percent,
         payload.user_instructions,
+        payload.selection_mode,
     )
 
     if os.getenv("MOCK_MODE", "false").lower() == "true":
-        return make_mock_result(
+        if api_mask is None:
+            result = source.copy().convert("RGB")
+            buffer = io.BytesIO()
+            result.save(buffer, format="JPEG", quality=92)
+            result_bytes = buffer.getvalue()
+            return {
+                "job_id": job_id,
+                "status": "completed",
+                "mode": "mock",
+                "selection_mode": payload.selection_mode,
+                "severity_percent": severity_percent,
+                "area_percent": area_percent,
+                "user_instructions": payload.user_instructions.strip(),
+                "result_base64": base64.b64encode(result_bytes).decode("ascii"),
+                "mime_type": "image/jpeg",
+                "note": "Mock descrittivo: fotografia restituita senza modifica AI.",
+            }
+
+        result = make_mock_result(
             source,
             api_mask,
             job_id,
             severity_percent,
             area_percent,
         )
+        result["selection_mode"] = payload.selection_mode
+        result["user_instructions"] = payload.user_instructions.strip()
+        return result
 
     result_bytes = call_openai_image_edit(
         source,
@@ -559,9 +622,12 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         "job_id": job_id,
         "status": "completed",
         "mode": "ai",
+        "selection_mode": payload.selection_mode,
         "severity_percent": severity_percent,
         "area_percent": area_percent,
+        "user_instructions": payload.user_instructions.strip(),
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v4-base64-user-instructions",
+        "prompt_version": "damage-v5-descriptive-no-mask",
     }
+
