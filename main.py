@@ -438,8 +438,19 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         )
         result_bytes = base64.b64decode(response.data[0].b64_json)
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Errore motore immagini: {exc}") from exc
+    import traceback
 
+    print("OPENAI IMAGE ERROR:", repr(exc), flush=True)
+    traceback.print_exc()
+
+    raise HTTPException(
+        status_code=502,
+        detail={
+            "message": "Errore motore immagini OpenAI",
+            "type": type(exc).__name__,
+            "error": str(exc),
+        },
+    ) from exc
     return {
         "job_id": job_id,
         "status": "completed",
