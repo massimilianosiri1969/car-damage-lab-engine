@@ -476,7 +476,6 @@ def call_openai_image_edit(
         "prompt": prompt,
         "quality": quality,
         "size": output_size_for(source),
-        "input_fidelity": "high",
         "background": "opaque",
         "output_format": "jpeg",
         "output_compression": 92,
