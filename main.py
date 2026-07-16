@@ -2,6 +2,7 @@ import base64
 import io
 import os
 import re
+import traceback
 import uuid
 from pathlib import Path
 from typing import Literal
@@ -27,7 +28,7 @@ ALLOWED_ORIGINS = [
 
 app = FastAPI(
     title=APP_NAME,
-    version="0.1.0",
+    version="0.2.0",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -43,6 +44,14 @@ app.add_middleware(
 )
 
 
+class DamageEditBase64Request(BaseModel):
+    image_base64: str = Field(..., min_length=16)
+    mask_base64: str = Field(..., min_length=16)
+    severity_percent: int = Field(..., ge=-100, le=100)
+    area_percent: int = Field(..., ge=-100, le=100)
+    output_quality: Literal["low", "medium", "high", "auto"] = "medium"
+
+
 def clamp_percentage(value: int) -> int:
     if value < -100 or value > 100:
         raise HTTPException(
@@ -55,14 +64,21 @@ def clamp_percentage(value: int) -> int:
 async def read_image(upload: UploadFile, mode: str) -> Image.Image:
     raw = await upload.read()
     if not raw:
-        raise HTTPException(status_code=400, detail=f"File vuoto: {upload.filename}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"File vuoto: {upload.filename}",
+        )
+
     try:
-        return Image.open(io.BytesIO(raw)).convert(mode)
-       except Exception as exc:
+        image = Image.open(io.BytesIO(raw))
+        image.load()
+        return image.convert(mode)
+    except Exception as exc:
         raise HTTPException(
             status_code=400,
             detail=f"Immagine non valida: {upload.filename}",
         ) from exc
+
 
 def resize_mask(mask: Image.Image, target_size: tuple[int, int]) -> Image.Image:
     if mask.size != target_size:
@@ -72,11 +88,11 @@ def resize_mask(mask: Image.Image, target_size: tuple[int, int]) -> Image.Image:
 
 def alter_damage_area(mask: Image.Image, area_percent: int) -> Image.Image:
     """
-    La maschera fornita dall'interfaccia è:
+    Maschera ricevuta da Base44:
       bianco = zona modificabile
       nero   = zona protetta
 
-    L'API OpenAI usa una maschera RGBA:
+    Maschera inviata all'API OpenAI:
       alpha 0   = zona da rigenerare
       alpha 255 = zona protetta
     """
@@ -89,8 +105,10 @@ def alter_damage_area(mask: Image.Image, area_percent: int) -> Image.Image:
         radius = max(1, round(reference * abs(area_percent) / 100))
         kernel_size = radius * 2 + 1
         kernel = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE, (kernel_size, kernel_size)
+            cv2.MORPH_ELLIPSE,
+            (kernel_size, kernel_size),
         )
+
         if area_percent > 0:
             binary = cv2.dilate(binary, kernel, iterations=1)
         else:
@@ -109,7 +127,9 @@ def severity_instruction(severity: int) -> str:
             "Mantieni sostanzialmente invariata la gravità visiva del danno, "
             "limitandoti ad armonizzare la zona modificata."
         )
+
     magnitude = abs(severity)
+
     if severity > 0:
         return (
             f"Aumenta la gravità visiva della deformazione di circa {magnitude}% "
@@ -118,6 +138,7 @@ def severity_instruction(severity: int) -> str:
             "fisicamente compatibili, senza trasformare il danno in un incidente "
             "estremo se il valore è basso."
         )
+
     return (
         f"Riduci la gravità visiva della deformazione di circa {magnitude}% "
         "rispetto alla fotografia originale. Raddrizza progressivamente la parte, "
@@ -129,6 +150,7 @@ def severity_instruction(severity: int) -> str:
 def area_instruction(area: int) -> str:
     if area == 0:
         return "Mantieni invariata l'estensione apparente del danno."
+
     direction = "estesa" if area > 0 else "ridotta"
     return (
         f"La superficie visibilmente danneggiata deve risultare {direction} di "
@@ -152,33 +174,23 @@ Vincoli obbligatori:
 - intervieni esclusivamente nella zona indicata dalla maschera;
 - mantieni riflessi, ombre, materiali e geometrie fisicamente plausibili;
 - non aggiungere testo, watermark, veicoli, oggetti o componenti inesistenti;
-- non cambiare la risoluzione logica o il rapporto d'aspetto;
+- non cambiare il rapporto d'aspetto;
 - il risultato deve sembrare una fotografia reale, non un rendering.
 
 Restituisci l'intera fotografia finale, con tutto ciò che non è interessato dal
-danno visivamente identico all'originale.
+Danno visivamente identico all'originale.
 """.strip()
 
 
-def pil_to_named_bytes(image: Image.Image, name: str) -> tuple[str, io.BytesIO, str]:
+def pil_to_file(image: Image.Image, name: str) -> io.BytesIO:
     buffer = io.BytesIO()
     image.save(buffer, format="PNG")
     buffer.seek(0)
     buffer.name = name
-    return (name, buffer, "image/png")
-
-
-
-class DamageEditBase64Request(BaseModel):
-    image_base64: str = Field(..., min_length=16)
-    mask_base64: str = Field(..., min_length=16)
-    severity_percent: int = Field(..., ge=-100, le=100)
-    area_percent: int = Field(..., ge=-100, le=100)
-    output_quality: Literal["low", "medium", "high", "auto"] = "medium"
+    return buffer
 
 
 def _open_image_bytes(raw: bytes, mode: str) -> Image.Image | None:
-    # Primo tentativo: Pillow.
     try:
         image = Image.open(io.BytesIO(raw))
         image.load()
@@ -186,7 +198,6 @@ def _open_image_bytes(raw: bytes, mode: str) -> Image.Image | None:
     except Exception:
         pass
 
-    # Secondo tentativo: OpenCV, più tollerante con alcuni JPEG prodotti dai browser.
     try:
         array = np.frombuffer(raw, dtype=np.uint8)
         decoded = cv2.imdecode(array, cv2.IMREAD_UNCHANGED)
@@ -194,12 +205,19 @@ def _open_image_bytes(raw: bytes, mode: str) -> Image.Image | None:
             return None
 
         if decoded.ndim == 2:
-            pil = Image.fromarray(decoded, mode="L")
+            pil_image = Image.fromarray(decoded, mode="L")
         elif decoded.shape[2] == 4:
-            pil = Image.fromarray(cv2.cvtColor(decoded, cv2.COLOR_BGRA2RGBA), mode="RGBA")
+            pil_image = Image.fromarray(
+                cv2.cvtColor(decoded, cv2.COLOR_BGRA2RGBA),
+                mode="RGBA",
+            )
         else:
-            pil = Image.fromarray(cv2.cvtColor(decoded, cv2.COLOR_BGR2RGB), mode="RGB")
-        return pil.convert(mode)
+            pil_image = Image.fromarray(
+                cv2.cvtColor(decoded, cv2.COLOR_BGR2RGB),
+                mode="RGB",
+            )
+
+        return pil_image.convert(mode)
     except Exception:
         return None
 
@@ -219,24 +237,31 @@ def _looks_like_hex_image(value: str) -> bool:
 
 
 def _strip_data_url(value: str, label: str) -> str:
-    data = value.strip().strip('\"').strip("'")
+    data = value.strip().strip('"').strip("'")
     if data.startswith("data:"):
         if "," not in data:
-            raise HTTPException(status_code=400, detail=f"Data URL non valido: {label}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Data URL non valido: {label}",
+            )
         data = data.split(",", 1)[1]
+
     return "".join(data.split())
 
 
 def decode_base64_image(value: str, label: str, mode: str) -> Image.Image:
-    """Accetta Data URL, Base64, Base64 doppio, HEX e immagini browser tollerate da OpenCV."""
-    original = value.strip().strip('\"').strip("'")
+    """Accetta Data URL, Base64, Base64 doppio e stringhe HEX."""
+    original = value.strip().strip('"').strip("'")
 
-    # Alcuni runtime serializzano direttamente i byte dell'immagine come stringa HEX.
     if _looks_like_hex_image(original):
         try:
             raw = bytes.fromhex("".join(original.split()))
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail=f"HEX non valido: {label}") from exc
+            raise HTTPException(
+                status_code=400,
+                detail=f"HEX non valido: {label}",
+            ) from exc
+
         image = _open_image_bytes(raw, mode)
         if image is not None:
             return image
@@ -246,23 +271,38 @@ def decode_base64_image(value: str, label: str, mode: str) -> Image.Image:
     try:
         raw = base64.b64decode(data, validate=True)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Base64 non valido: {label}") from exc
+        raise HTTPException(
+            status_code=400,
+            detail=f"Base64 non valido: {label}",
+        ) from exc
 
     if not raw:
-        raise HTTPException(status_code=400, detail=f"Immagine vuota: {label}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Immagine vuota: {label}",
+        )
 
     image = _open_image_bytes(raw, mode)
     if image is not None:
         return image
 
-    # Base44 può serializzare il Data URL/Base64 una seconda volta.
-    # In tal caso il primo decode restituisce ancora testo Base64 o un Data URL.
     try:
-        nested_text = raw.decode("utf-8").strip().strip('\"').strip("'")
+        nested_text = raw.decode("utf-8").strip().strip('"').strip("'")
     except UnicodeDecodeError:
         nested_text = ""
 
     if nested_text:
+        if _looks_like_hex_image(nested_text):
+            try:
+                nested_hex_raw = bytes.fromhex("".join(nested_text.split()))
+            except ValueError:
+                nested_hex_raw = b""
+
+            if nested_hex_raw:
+                image = _open_image_bytes(nested_hex_raw, mode)
+                if image is not None:
+                    return image
+
         nested_data = _strip_data_url(nested_text, label)
         try:
             nested_raw = base64.b64decode(nested_data, validate=True)
@@ -283,19 +323,127 @@ def decode_base64_image(value: str, label: str, mode: str) -> Image.Image:
         ),
     )
 
+
+def make_mock_result(
+    source: Image.Image,
+    api_mask: Image.Image,
+    job_id: str,
+    severity_percent: int,
+    area_percent: int,
+) -> dict:
+    preview = source.copy()
+    overlay = Image.new("RGBA", source.size, (255, 0, 0, 0))
+    editable = 255 - np.array(api_mask.getchannel("A"))
+    overlay_alpha = Image.fromarray(
+        (editable * 0.25).astype(np.uint8),
+        mode="L",
+    )
+    overlay.putalpha(overlay_alpha)
+    preview = Image.alpha_composite(
+        preview.convert("RGBA"),
+        overlay,
+    ).convert("RGB")
+
+    buffer = io.BytesIO()
+    preview.save(buffer, format="JPEG", quality=92)
+    result_bytes = buffer.getvalue()
+
+    return {
+        "job_id": job_id,
+        "status": "completed",
+        "mode": "mock",
+        "severity_percent": severity_percent,
+        "area_percent": area_percent,
+        "result_base64": base64.b64encode(result_bytes).decode("ascii"),
+        "mime_type": "image/jpeg",
+        "note": "Anteprima rossa della superficie elaborata; nessuna modifica AI.",
+    }
+
+
+def call_openai_image_edit(
+    source: Image.Image,
+    api_mask: Image.Image,
+    prompt: str,
+    quality: Literal["low", "medium", "high", "auto"],
+) -> bytes:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise HTTPException(
+            status_code=503,
+            detail="OPENAI_API_KEY non configurata. Usa MOCK_MODE=true per i test.",
+        )
+
+    client = OpenAI(api_key=api_key)
+    source_file = pil_to_file(source, "source.png")
+    mask_file = pil_to_file(api_mask, "mask.png")
+
+    try:
+        response = client.images.edit(
+            model=os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-2"),
+            image=source_file,
+            mask=mask_file,
+            prompt=prompt,
+            quality=quality,
+            size="auto",
+            output_format="jpeg",
+            output_compression=92,
+            n=1,
+        )
+
+        if not response.data or not response.data[0].b64_json:
+            raise RuntimeError("OpenAI ha risposto senza dati immagine")
+
+        return base64.b64decode(response.data[0].b64_json)
+
+    except Exception as exc:
+        request_id = getattr(exc, "request_id", None)
+        print("OPENAI IMAGE ERROR:", repr(exc), flush=True)
+        if request_id:
+            print("OPENAI REQUEST ID:", request_id, flush=True)
+        traceback.print_exc()
+
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": "Errore motore immagini OpenAI",
+                "type": type(exc).__name__,
+                "error": str(exc),
+                "request_id": request_id,
+            },
+        ) from exc
+
+
+@app.get("/")
+def root():
+    return {
+        "service": APP_NAME,
+        "status": "ok",
+        "docs": "/docs",
+        "health": "/health",
+    }
+
+
 @app.get("/health")
 def health():
     return {
         "status": "ok",
         "service": APP_NAME,
-        "mode": "mock" if os.getenv("MOCK_MODE", "false").lower() == "true" else "ai",
+        "mode": (
+            "mock"
+            if os.getenv("MOCK_MODE", "false").lower() == "true"
+            else "ai"
+        ),
+        "model": os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-2"),
     }
 
 
 @app.post("/v1/damage/edit")
 async def edit_damage(
     image: UploadFile = File(..., description="Fotografia originale"),
-    mask: UploadFile = File(..., description="Maschera: bianco modificabile, nero protetto"),
+    mask: UploadFile = File(
+        ...,
+        description="Maschera: bianco modificabile, nero protetto",
+    ),
     severity_percent: int = Form(..., ge=-100, le=100),
     area_percent: int = Form(..., ge=-100, le=100),
     output_quality: Literal["low", "medium", "high", "auto"] = Form("medium"),
@@ -311,57 +459,23 @@ async def edit_damage(
     job_id = str(uuid.uuid4())
     prompt = build_prompt(severity_percent, area_percent)
 
-    # Modalità di test: verifica collegamento Base44/API senza consumare crediti AI.
     if os.getenv("MOCK_MODE", "false").lower() == "true":
-        preview = source.copy()
-        overlay = Image.new("RGBA", source.size, (255, 0, 0, 0))
-        editable = 255 - np.array(api_mask.getchannel("A"))
-        overlay_alpha = Image.fromarray((editable * 0.25).astype(np.uint8), mode="L")
-        overlay.putalpha(overlay_alpha)
-        preview = Image.alpha_composite(preview.convert("RGBA"), overlay).convert("RGB")
-        result_path = OUTPUT_DIR / f"{job_id}.jpg"
-        preview.save(result_path, quality=92)
         return JSONResponse(
-            {
-                "job_id": job_id,
-                "status": "completed",
-                "mode": "mock",
-                "severity_percent": severity_percent,
-                "area_percent": area_percent,
-                "result_base64": base64.b64encode(result_path.read_bytes()).decode("ascii"),
-                "mime_type": "image/jpeg",
-                "note": "Anteprima rossa della superficie elaborata; nessuna modifica AI.",
-            }
+            make_mock_result(
+                source,
+                api_mask,
+                job_id,
+                severity_percent,
+                area_percent,
+            )
         )
 
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise HTTPException(
-            status_code=503,
-            detail="OPENAI_API_KEY non configurata. Usa MOCK_MODE=true per i test.",
-        )
-
-    client = OpenAI(api_key=api_key)
-    source_file = pil_to_named_bytes(source, "source.png")[1]
-    mask_file = pil_to_named_bytes(api_mask, "mask.png")[1]
-
-    try:
-        response = client.images.edit(
-            model=os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-2"),
-            image=source_file,
-            mask=mask_file,
-            prompt=prompt,
-            input_fidelity="high",
-            quality=output_quality,
-            size="auto",
-            output_format="jpeg",
-            output_compression=92,
-            n=1,
-        )
-        encoded = response.data[0].b64_json
-        result_bytes = base64.b64decode(encoded)
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Errore motore immagini: {exc}") from exc
+    result_bytes = call_openai_image_edit(
+        source,
+        api_mask,
+        prompt,
+        output_quality,
+    )
 
     result_path = OUTPUT_DIR / f"{job_id}.jpg"
     result_path.write_bytes(result_bytes)
@@ -374,7 +488,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v1",
+        "prompt_version": "damage-v3",
     }
 
 
@@ -383,8 +497,16 @@ def edit_damage_base64(payload: DamageEditBase64Request):
     severity_percent = clamp_percentage(payload.severity_percent)
     area_percent = clamp_percentage(payload.area_percent)
 
-    source = decode_base64_image(payload.image_base64, "image_base64", "RGB")
-    source_mask = decode_base64_image(payload.mask_base64, "mask_base64", "L")
+    source = decode_base64_image(
+        payload.image_base64,
+        "image_base64",
+        "RGB",
+    )
+    source_mask = decode_base64_image(
+        payload.mask_base64,
+        "mask_base64",
+        "L",
+    )
     source_mask = resize_mask(source_mask, source.size)
     api_mask = alter_damage_area(source_mask, area_percent)
 
@@ -392,65 +514,21 @@ def edit_damage_base64(payload: DamageEditBase64Request):
     prompt = build_prompt(severity_percent, area_percent)
 
     if os.getenv("MOCK_MODE", "false").lower() == "true":
-        preview = source.copy()
-        overlay = Image.new("RGBA", source.size, (255, 0, 0, 0))
-        editable = 255 - np.array(api_mask.getchannel("A"))
-        overlay_alpha = Image.fromarray((editable * 0.25).astype(np.uint8), mode="L")
-        overlay.putalpha(overlay_alpha)
-        preview = Image.alpha_composite(preview.convert("RGBA"), overlay).convert("RGB")
-        buffer = io.BytesIO()
-        preview.save(buffer, format="JPEG", quality=92)
-        result_bytes = buffer.getvalue()
-        return {
-            "job_id": job_id,
-            "status": "completed",
-            "mode": "mock",
-            "severity_percent": severity_percent,
-            "area_percent": area_percent,
-            "result_base64": base64.b64encode(result_bytes).decode("ascii"),
-            "mime_type": "image/jpeg",
-            "note": "Anteprima rossa della superficie elaborata; nessuna modifica AI.",
-        }
-
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise HTTPException(
-            status_code=503,
-            detail="OPENAI_API_KEY non configurata. Usa MOCK_MODE=true per i test.",
+        return make_mock_result(
+            source,
+            api_mask,
+            job_id,
+            severity_percent,
+            area_percent,
         )
 
-    client = OpenAI(api_key=api_key)
-    source_file = pil_to_named_bytes(source, "source.png")[1]
-    mask_file = pil_to_named_bytes(api_mask, "mask.png")[1]
+    result_bytes = call_openai_image_edit(
+        source,
+        api_mask,
+        prompt,
+        payload.output_quality,
+    )
 
-    try:
-        response = client.images.edit(
-            model=os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-2"),
-            image=source_file,
-            mask=mask_file,
-            prompt=prompt,
-            input_fidelity="high",
-            quality=payload.output_quality,
-            size="auto",
-            output_format="jpeg",
-            output_compression=92,
-            n=1,
-        )
-        result_bytes = base64.b64decode(response.data[0].b64_json)
-    except Exception as exc:
-    import traceback
-
-    print("OPENAI IMAGE ERROR:", repr(exc), flush=True)
-    traceback.print_exc()
-
-    raise HTTPException(
-        status_code=502,
-        detail={
-            "message": "Errore motore immagini OpenAI",
-            "type": type(exc).__name__,
-            "error": str(exc),
-        },
-    ) from exc
     return {
         "job_id": job_id,
         "status": "completed",
@@ -459,5 +537,5 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v2-base64",
+        "prompt_version": "damage-v3-base64",
     }
