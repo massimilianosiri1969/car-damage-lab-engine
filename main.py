@@ -59,9 +59,19 @@ async def read_image(upload: UploadFile, mode: str) -> Image.Image:
     try:
         return Image.open(io.BytesIO(raw)).convert(mode)
     except Exception as exc:
-        raise HTTPException(
-            status_code=400, detail=f"Immagine non valida: {upload.filename}"
-        ) from exc
+    import traceback
+
+    print("OPENAI IMAGE ERROR:", repr(exc), flush=True)
+    traceback.print_exc()
+
+    raise HTTPException(
+        status_code=502,
+        detail={
+            "message": "Errore motore immagini OpenAI",
+            "type": type(exc).__name__,
+            "error": str(exc),
+        },
+    ) from exc
 
 
 def resize_mask(mask: Image.Image, target_size: tuple[int, int]) -> Image.Image:
