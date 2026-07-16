@@ -22,21 +22,14 @@ APP_NAME = "Car Damage Lab API"
 OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "outputs"))
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# Bordo di fusione interno alla selezione, espresso in pixel dell'immagine finale.
-# Può essere modificato su Render con la variabile SOFT_COMPOSITE_FEATHER_PX.
+# V9: fotografia completa al modello, fusione protetta attorno alla pennellata.
+COMPOSITE_EXPANSION_PX = max(
+    0,
+    int(os.getenv("COMPOSITE_EXPANSION_PX", "15")),
+)
 SOFT_COMPOSITE_FEATHER_PX = max(
     1,
-    int(os.getenv("SOFT_COMPOSITE_FEATHER_PX", "25")),
-)
-
-# Ritaglio locale attorno alla maschera.
-LOCAL_CROP_CONTEXT_MARGIN = max(
-    0.0,
-    float(os.getenv("LOCAL_CROP_CONTEXT_MARGIN", "0.30")),
-)
-LOCAL_CROP_MIN_SIZE = max(
-    128,
-    int(os.getenv("LOCAL_CROP_MIN_SIZE", "512")),
+    int(os.getenv("SOFT_COMPOSITE_FEATHER_PX", "12")),
 )
 
 ALLOWED_ORIGINS = [
@@ -47,7 +40,7 @@ ALLOWED_ORIGINS = [
 
 app = FastAPI(
     title=APP_NAME,
-    version="0.4.0",
+    version="0.5.0",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -189,62 +182,39 @@ def build_prompt(
 
     if cleaned:
         extra_instruction = f"""
-Additional user instruction:
+Indicazione aggiuntiva dell'utente:
 {cleaned}
 
-Apply it only inside the editable transparent portion of the mask and only
-when compatible with all preservation rules below.
+Applicala soltanto dentro la zona modificabile e senza violare i vincoli
+di conservazione elencati sotto.
 """.strip()
 
-    severity_direction = (
-        "increase"
-        if severity > 0
-        else "reduce"
-        if severity < 0
-        else "preserve"
-    )
-    area_direction = (
-        "make the visible deformation slightly broader"
-        if area > 0
-        else "make the visible deformation slightly narrower"
-        if area < 0
-        else "preserve the visible damage footprint"
-    )
+    severity_text = severity_instruction(severity)
+    area_text = area_instruction(area)
 
     return f"""
-You are editing a LOCAL CROP from a real automotive photograph.
+Modifica fotografica automotive realistica.
 
-The transparent portion of the mask identifies an existing painted
-sheet-metal panel and is the only editable region.
-
-Requested adjustment:
-- {severity_direction} the damage severity by approximately {abs(severity)}%;
-- {area_direction} by approximately {abs(area)}%.
+Obiettivo:
+- {severity_text}
+- {area_text}
 
 {extra_instruction}
 
-Create a physically plausible automotive collision deformation.
-The surface must still look like stamped, painted automotive steel.
-
-Do not create melted metal, liquid-looking surfaces, plastic-looking folds,
-decorative wrinkles, transparent areas, duplicated panels, pasted shapes,
-detached overlays, replacement panels or new objects.
-
-Preserve exactly:
-- every headlight, tail light, lens, reflector, lamp and optical assembly;
-- hood, bumper, wheel and tyre;
-- panel gaps and body seams;
-- vehicle identity and paint colour;
-- camera angle, lighting and workshop background;
-- everything outside the editable transparent mask.
-
-Do not deform, redraw, move or change the transparency, shape or internal
-content of any optical component, even when it is close to the selected area.
-
-The dent must remain continuous with the surrounding fender or body panel.
-Reflections must follow the new geometry naturally.
-Do not replace the existing panel with another object.
-Return one photorealistic edited image of the same crop.
+Vincoli:
+- conserva la stessa automobile, modello, colore, prospettiva e inquadratura;
+- modifica esclusivamente la lamiera selezionata;
+- crea pieghe e deformazioni fisicamente plausibili da urto reale;
+- mantieni continuità della lamiera, vernice, ombre e riflessi;
+- non creare metallo fuso, superfici plastiche, pieghe decorative,
+  pannelli duplicati, oggetti sovrapposti o parti trasparenti;
+- preserva integralmente fari, fanali, lenti, parabole, lampade e gruppi ottici;
+- non deformare, spostare, ridisegnare o cambiare il contenuto dei fari,
+  anche quando sono vicini alla selezione;
+- preserva cofano, paraurti, ruote, pneumatici, vetri, targa, logo,
+  giunzioni dei pannelli, sfondo e illuminazione;
+- non cambiare nulla fuori dalla zona modificabile;
+- restituisci l'intera fotografia finale, fotorealistica e senza watermark.
 """.strip()
 
 
@@ -479,54 +449,22 @@ def make_mock_result(
 
 
 
-def _adjust_binary_selection(
-    source_mask: Image.Image,
-    area_percent: int,
-) -> np.ndarray:
-    """
-    Converte la maschera Base44 in una selezione binaria:
-      255 = zona modificabile
-      0   = zona protetta
-
-    Applica anche l'espansione o contrazione richiesta da area_percent.
-    """
-    selection = np.array(source_mask.convert("L"))
-    selection = np.where(selection >= 128, 255, 0).astype(np.uint8)
-
-    if area_percent != 0:
-        height, width = selection.shape
-        reference = max(3, round(min(width, height) * 0.10))
-        radius = max(1, round(reference * abs(area_percent) / 100))
-        kernel_size = radius * 2 + 1
-        kernel = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE,
-            (kernel_size, kernel_size),
-        )
-
-        if area_percent > 0:
-            selection = cv2.dilate(selection, kernel, iterations=1)
-        else:
-            selection = cv2.erode(selection, kernel, iterations=1)
-
-    return selection
-
-
-def soft_composite_selected_area(
+def protected_soft_composite(
     source: Image.Image,
     generated_bytes: bytes,
     source_mask: Image.Image,
-    area_percent: int,
-    feather_radius: int = SOFT_COMPOSITE_FEATHER_PX,
+    expansion_px: int = COMPOSITE_EXPANSION_PX,
+    feather_px: int = SOFT_COMPOSITE_FEATHER_PX,
 ) -> bytes:
     """
-    Fonde il risultato AI con l'originale usando un bordo morbido INTERNO.
+    V9:
+    - il modello riceve la fotografia completa;
+    - la fusione finale usa la pennellata originale leggermente allargata;
+    - la sfumatura resta interna alla zona allargata;
+    - tutto ciò che è lontano dalla selezione resta identico all'originale.
 
-    - centro della selezione: risultato AI al 100%;
-    - bordo interno: fusione graduale;
-    - fuori selezione: fotografia originale al 100%.
-
-    La sfumatura non si estende mai fuori dalla selezione, così fari,
-    cofano, paraurti e altri elementi non selezionati restano protetti.
+    area_percent non modifica geometricamente questa maschera: influenza
+    soltanto il prompt. In questo modo i fari vicini sono più protetti.
     """
     try:
         generated = Image.open(io.BytesIO(generated_bytes))
@@ -546,34 +484,65 @@ def soft_composite_selected_area(
             Image.Resampling.LANCZOS,
         )
 
-    selection = _adjust_binary_selection(
-        source_mask,
-        area_percent,
-    )
+    original_selection = np.array(source_mask.convert("L"))
+    original_selection = np.where(
+        original_selection >= 128,
+        255,
+        0,
+    ).astype(np.uint8)
 
-    selected_pixels = int((selection >= 128).sum())
+    selected_pixels = int((original_selection >= 128).sum())
     if selected_pixels == 0:
         raise HTTPException(
             status_code=422,
             detail="La maschera è vuota. Disegna la zona da modificare.",
         )
 
-    # Sfuma il bordo verso l'interno, senza autorizzare modifiche all'esterno.
-    binary_mask = Image.fromarray(selection, mode="L")
-    blurred_mask = binary_mask.filter(
-        ImageFilter.GaussianBlur(radius=max(1, feather_radius))
+    protected_selection = original_selection.copy()
+
+    if expansion_px > 0:
+        kernel_size = expansion_px * 2 + 1
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (kernel_size, kernel_size),
+        )
+        protected_selection = cv2.dilate(
+            protected_selection,
+            kernel,
+            iterations=1,
+        )
+
+    binary_mask = Image.fromarray(
+        protected_selection,
+        mode="L",
     )
 
-    binary_array = np.array(binary_mask, dtype=np.float32) / 255.0
-    blurred_array = np.array(blurred_mask, dtype=np.float32) / 255.0
+    blurred_mask = binary_mask.filter(
+        ImageFilter.GaussianBlur(
+            radius=max(1, feather_px),
+        )
+    )
 
-    # Clip alla selezione originale: nessuna invasione oltre il bordo disegnato.
-    inward_alpha = np.minimum(blurred_array, binary_array)
+    binary_array = np.array(
+        binary_mask,
+        dtype=np.float32,
+    ) / 255.0
 
-    # Mantiene pieno il centro e sfuma soltanto la fascia vicina al bordo.
-    inward_alpha = np.clip(inward_alpha, 0.0, 1.0)
+    blurred_array = np.array(
+        blurred_mask,
+        dtype=np.float32,
+    ) / 255.0
+
+    # Feather soltanto verso l'interno della zona protetta allargata.
+    inward_alpha = np.minimum(
+        blurred_array,
+        binary_array,
+    )
+
     blend_mask = Image.fromarray(
-        np.round(inward_alpha * 255).astype(np.uint8),
+        np.round(
+            np.clip(inward_alpha, 0.0, 1.0) * 255
+        ).astype(np.uint8),
         mode="L",
     )
 
@@ -593,168 +562,6 @@ def soft_composite_selected_area(
     )
     return output.getvalue()
 
-
-
-def _original_binary_selection(source_mask: Image.Image) -> np.ndarray:
-    """
-    Selezione originale senza dilatazione:
-      255 = modificabile
-      0   = protetto
-
-    In v8 area_percent influenza il prompt, ma non allarga fisicamente
-    la zona autorizzata. Questo protegge meglio fari e componenti vicini.
-    """
-    selection = np.array(source_mask.convert("L"))
-    return np.where(selection >= 128, 255, 0).astype(np.uint8)
-
-
-def _selection_bbox(selection: np.ndarray) -> tuple[int, int, int, int]:
-    points = cv2.findNonZero(selection)
-
-    if points is None:
-        raise HTTPException(
-            status_code=422,
-            detail="La maschera è vuota. Disegna la zona da modificare.",
-        )
-
-    return cv2.boundingRect(points)
-
-
-def _square_crop_box(
-    image_size: tuple[int, int],
-    selection_bbox: tuple[int, int, int, int],
-    context_margin: float = LOCAL_CROP_CONTEXT_MARGIN,
-    minimum_size: int = LOCAL_CROP_MIN_SIZE,
-) -> tuple[int, int, int, int]:
-    image_width, image_height = image_size
-    x, y, width, height = selection_bbox
-
-    center_x = x + width / 2
-    center_y = y + height / 2
-
-    requested_size = round(
-        max(width, height) * (1 + context_margin * 2)
-    )
-    crop_size = max(requested_size, minimum_size)
-    crop_size = min(crop_size, image_width, image_height)
-    crop_size = max(1, crop_size)
-
-    left = round(center_x - crop_size / 2)
-    top = round(center_y - crop_size / 2)
-
-    left = max(0, min(left, image_width - crop_size))
-    top = max(0, min(top, image_height - crop_size))
-
-    return (
-        left,
-        top,
-        left + crop_size,
-        top + crop_size,
-    )
-
-
-def prepare_local_crop(
-    source: Image.Image,
-    source_mask: Image.Image,
-) -> tuple[
-    Image.Image,
-    Image.Image,
-    np.ndarray,
-    tuple[int, int, int, int],
-]:
-    source_rgb = source.convert("RGB")
-    full_selection = _original_binary_selection(source_mask)
-
-    bbox = _selection_bbox(full_selection)
-    crop_box = _square_crop_box(source_rgb.size, bbox)
-
-    left, top, right, bottom = crop_box
-
-    source_crop = source_rgb.crop(crop_box)
-    selection_crop = Image.fromarray(
-        full_selection[top:bottom, left:right],
-        mode="L",
-    )
-
-    # Nessuna espansione geometrica in v8.
-    api_mask_crop = alter_damage_area(selection_crop, 0)
-
-    return (
-        source_crop,
-        api_mask_crop,
-        full_selection,
-        crop_box,
-    )
-
-
-def soft_composite_local_crop(
-    source: Image.Image,
-    generated_crop_bytes: bytes,
-    full_selection: np.ndarray,
-    crop_box: tuple[int, int, int, int],
-    feather_radius: int = SOFT_COMPOSITE_FEATHER_PX,
-) -> bytes:
-    try:
-        generated_crop = Image.open(io.BytesIO(generated_crop_bytes))
-        generated_crop.load()
-        generated_crop = generated_crop.convert("RGB")
-    except Exception as exc:
-        raise HTTPException(
-            status_code=502,
-            detail="Il motore ha restituito un ritaglio non valido.",
-        ) from exc
-
-    source_rgb = source.convert("RGB")
-    left, top, right, bottom = crop_box
-    crop_size = (right - left, bottom - top)
-
-    if generated_crop.size != crop_size:
-        generated_crop = generated_crop.resize(
-            crop_size,
-            Image.Resampling.LANCZOS,
-        )
-
-    generated_full = source_rgb.copy()
-    generated_full.paste(generated_crop, (left, top))
-
-    binary_mask = Image.fromarray(
-        np.where(full_selection >= 128, 255, 0).astype(np.uint8),
-        mode="L",
-    )
-    blurred_mask = binary_mask.filter(
-        ImageFilter.GaussianBlur(
-            radius=max(1, feather_radius),
-        )
-    )
-
-    binary_array = np.array(binary_mask, dtype=np.float32) / 255.0
-    blurred_array = np.array(blurred_mask, dtype=np.float32) / 255.0
-
-    # Feather solo verso l'interno: mai oltre la pennellata originale.
-    inward_alpha = np.minimum(blurred_array, binary_array)
-
-    blend_mask = Image.fromarray(
-        np.round(
-            np.clip(inward_alpha, 0.0, 1.0) * 255
-        ).astype(np.uint8),
-        mode="L",
-    )
-
-    final_image = Image.composite(
-        generated_full,
-        source_rgb,
-        blend_mask,
-    )
-
-    output = io.BytesIO()
-    final_image.save(
-        output,
-        format="JPEG",
-        quality=95,
-        subsampling=0,
-        optimize=True,
-    )
-    return output.getvalue()
 
 def call_openai_image_edit(
     source: Image.Image,
@@ -850,16 +657,7 @@ async def edit_damage(
     source = await read_image(image, "RGB")
     source_mask = await read_image(mask, "L")
     source_mask = resize_mask(source_mask, source.size)
-
-    (
-        source_crop,
-        api_mask_crop,
-        full_selection,
-        crop_box,
-    ) = prepare_local_crop(
-        source,
-        source_mask,
-    )
+    api_mask = alter_damage_area(source_mask, 0)
 
     job_id = str(uuid.uuid4())
     prompt = build_prompt(
@@ -872,7 +670,7 @@ async def edit_damage(
         return JSONResponse(
             make_mock_result(
                 source,
-                api_mask_crop,
+                api_mask,
                 job_id,
                 severity_percent,
                 area_percent,
@@ -884,18 +682,17 @@ async def edit_damage(
         source.save(buffer, format="JPEG", quality=95, subsampling=0)
         result_bytes = buffer.getvalue()
     else:
-        generated_crop_bytes = call_openai_image_edit(
-            source_crop,
-            api_mask_crop,
+        generated_bytes = call_openai_image_edit(
+            source,
+            api_mask,
             prompt,
             output_quality,
         )
 
-        result_bytes = soft_composite_local_crop(
+        result_bytes = protected_soft_composite(
             source=source,
-            generated_crop_bytes=generated_crop_bytes,
-            full_selection=full_selection,
-            crop_box=crop_box,
+            generated_bytes=generated_bytes,
+            source_mask=source_mask,
         )
 
     result_path = OUTPUT_DIR / f"{job_id}.jpg"
@@ -909,7 +706,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v8-local-crop-soft-composite",
+        "prompt_version": "damage-v9-full-image-protected-soft-composite",
     }
 
 
@@ -929,16 +726,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         "L",
     )
     source_mask = resize_mask(source_mask, source.size)
-
-    (
-        source_crop,
-        api_mask_crop,
-        full_selection,
-        crop_box,
-    ) = prepare_local_crop(
-        source,
-        source_mask,
-    )
+    api_mask = alter_damage_area(source_mask, 0)
 
     job_id = str(uuid.uuid4())
     prompt = build_prompt(
@@ -950,7 +738,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
     if os.getenv("MOCK_MODE", "false").lower() == "true":
         return make_mock_result(
             source,
-            api_mask_crop,
+            api_mask,
             job_id,
             severity_percent,
             area_percent,
@@ -965,18 +753,17 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         source.save(buffer, format="JPEG", quality=95, subsampling=0)
         result_bytes = buffer.getvalue()
     else:
-        generated_crop_bytes = call_openai_image_edit(
-            source_crop,
-            api_mask_crop,
+        generated_bytes = call_openai_image_edit(
+            source,
+            api_mask,
             prompt,
             payload.output_quality,
         )
 
-        result_bytes = soft_composite_local_crop(
+        result_bytes = protected_soft_composite(
             source=source,
-            generated_crop_bytes=generated_crop_bytes,
-            full_selection=full_selection,
-            crop_box=crop_box,
+            generated_bytes=generated_bytes,
+            source_mask=source_mask,
         )
 
     return {
@@ -987,5 +774,5 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v8-local-crop-soft-composite",
+        "prompt_version": "damage-v9-full-image-protected-soft-composite",
     }
