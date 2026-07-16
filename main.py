@@ -123,6 +123,66 @@ def alter_damage_area(mask: Image.Image, area_percent: int) -> Image.Image:
     return Image.fromarray(rgba, mode="RGBA")
 
 
+def validate_manual_mask(mask: Image.Image) -> dict:
+    """Verifica che la maschera manuale sia realmente localizzata."""
+    gray = np.array(mask.convert("L"))
+    selected = gray >= 128
+    selected_pixels = int(selected.sum())
+    total_pixels = int(selected.size)
+
+    if selected_pixels == 0:
+        raise HTTPException(
+            status_code=422,
+            detail="La maschera manuale è vuota. Disegna la zona da modificare.",
+        )
+
+    coverage = selected_pixels / total_pixels
+
+    # Una selezione manuale enorme equivale di fatto a rigenerare l'intera foto.
+    # Blocchiamo il caso per evitare che il modello sostituisca automobile e scena.
+    if coverage > 0.55:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"La maschera copre il {coverage * 100:.1f}% della fotografia. "
+                "Riduci la selezione: in modalità manuale deve restare localizzata."
+            ),
+        )
+
+    ys, xs = np.where(selected)
+    bbox = {
+        "x": int(xs.min()),
+        "y": int(ys.min()),
+        "width": int(xs.max() - xs.min() + 1),
+        "height": int(ys.max() - ys.min() + 1),
+    }
+
+    return {
+        "coverage": coverage,
+        "bbox": bbox,
+    }
+
+
+def _nearest_multiple_of_16(value: int) -> int:
+    return max(16, int(round(value / 16)) * 16)
+
+
+def output_size_for(source: Image.Image) -> str:
+    width, height = source.size
+    # Mantiene il rapporto originale e rispetta i requisiti di gpt-image-2.
+    target_width = _nearest_multiple_of_16(width)
+    target_height = _nearest_multiple_of_16(height)
+
+    # Evita dimensioni sperimentali eccessive mantenendo il rapporto.
+    max_edge = 2048
+    if max(target_width, target_height) > max_edge:
+        scale = max_edge / max(target_width, target_height)
+        target_width = _nearest_multiple_of_16(int(target_width * scale))
+        target_height = _nearest_multiple_of_16(int(target_height * scale))
+
+    return f"{target_width}x{target_height}"
+
+
 def severity_instruction(severity: int) -> str:
     if severity == 0:
         return (
@@ -181,8 +241,9 @@ possibile identici alla fotografia di partenza.
     else:
         mode_instruction = """
 Modalità SELEZIONE MANUALE.
-Intervieni esclusivamente nella zona consentita dalla maschera. La maschera ha
-priorità su qualsiasi indicazione testuale e limita l'area modificabile.
+Intervieni esclusivamente nei pixel trasparenti indicati dalla maschera. La maschera ha
+priorità assoluta su qualsiasi indicazione testuale. Non reinterpretare né rigenerare
+le parti esterne alla maschera: devono restare visivamente identiche all'originale.
 """.strip()
 
     extra_instruction = ""
@@ -423,7 +484,9 @@ def call_openai_image_edit(
         "image": source_file,
         "prompt": prompt,
         "quality": quality,
-        "size": "auto",
+        "size": output_size_for(source),
+        "input_fidelity": "high",
+        "background": "opaque",
         "output_format": "jpeg",
         "output_compression": 92,
         "n": 1,
@@ -533,7 +596,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v3",
+        "prompt_version": "damage-v4-mask-locked",
     }
 
 
@@ -571,6 +634,13 @@ def edit_damage_base64(payload: DamageEditBase64Request):
             "L",
         )
         source_mask = resize_mask(source_mask, source.size)
+        mask_info = validate_manual_mask(source_mask)
+        print(
+            "MANUAL MASK:",
+            f"coverage={mask_info['coverage'] * 100:.2f}%",
+            f"bbox={mask_info['bbox']}",
+            flush=True,
+        )
         api_mask = alter_damage_area(source_mask, area_percent)
 
     job_id = str(uuid.uuid4())
