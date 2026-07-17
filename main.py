@@ -1,5 +1,6 @@
 import base64
 import io
+import json
 import os
 import re
 import traceback
@@ -40,7 +41,7 @@ ALLOWED_ORIGINS = [
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -93,6 +94,10 @@ class DamageEditBase64Request(BaseModel):
     wheel_damage_type: str | None = None
     glass_damage_type: str | None = None
 
+    # Nuovo formato dinamico usato da Base44.
+    component_damage_types: dict[str, str] = Field(default_factory=dict)
+    vehicle_view: str | None = None
+
     contact_traces_enabled: bool = False
     contact_trace_type: str | None = None
     contact_vehicle_color: str | None = None
@@ -101,6 +106,10 @@ class DamageEditBase64Request(BaseModel):
 
     # Compatibilità temporanea con vecchie versioni Base44.
     user_instructions: str = Field(default="", max_length=500)
+
+
+class VehicleAnalyzeRequest(BaseModel):
+    image_base64: str = Field(..., min_length=16)
 
 
 class DamageFinalizeBase64Request(BaseModel):
@@ -255,6 +264,106 @@ def area_instruction(area: int) -> str:
     )
 
 
+VEHICLE_VIEW_LABELS = {
+    "front": "Vista anteriore",
+    "front_left": "Anteriore sinistra",
+    "front_right": "Anteriore destra",
+    "rear": "Vista posteriore",
+    "rear_left": "Posteriore sinistra",
+    "rear_right": "Posteriore destra",
+    "left_side": "Fiancata sinistra",
+    "right_side": "Fiancata destra",
+    "mixed": "Vista mista",
+    "unknown": "Vista non determinata",
+}
+
+VEHICLE_COMPONENT_CATALOG = {
+    "front_fender": "Parafango anteriore",
+    "rear_fender": "Parafango posteriore",
+    "front_headlight": "Faro anteriore",
+    "rear_light": "Fanale posteriore",
+    "front_bumper": "Paraurti anteriore",
+    "rear_bumper": "Paraurti posteriore",
+    "hood": "Cofano anteriore",
+    "tailgate": "Portellone posteriore",
+    "front_door": "Porta anteriore",
+    "rear_door": "Porta posteriore",
+    "wheel_arch": "Passaruota",
+    "wheel": "Ruota",
+    "windshield": "Parabrezza",
+    "rear_window": "Lunotto",
+    "side_window": "Vetro laterale",
+    "roof": "Tetto",
+    "side_mirror": "Specchietto",
+}
+
+DYNAMIC_COMPONENT_DAMAGE_TEXT = {
+    "front_fender": {
+        "dented": "dent the front fender",
+        "creased": "create a realistic crease in the front fender",
+        "crushed": "crush the selected portion of the front fender",
+        "scratched": "scratch the front fender",
+        "torn": "tear the selected edge of the front fender realistically",
+    },
+    "rear_fender": {
+        "dented": "dent the rear fender",
+        "creased": "create a realistic crease in the rear fender",
+        "crushed": "crush the selected portion of the rear fender",
+        "scratched": "scratch the rear fender",
+        "torn": "tear the selected edge of the rear fender realistically",
+    },
+    "front_headlight": COMPONENT_DAMAGE_TEXT["headlight"],
+    "rear_light": COMPONENT_DAMAGE_TEXT["headlight"],
+    "front_bumper": COMPONENT_DAMAGE_TEXT["bumper"],
+    "rear_bumper": COMPONENT_DAMAGE_TEXT["bumper"],
+    "hood": COMPONENT_DAMAGE_TEXT["hood"],
+    "tailgate": {
+        "dented": "dent the tailgate",
+        "edge_bent": "bend the selected tailgate edge",
+        "misaligned": "misalign the tailgate along the affected seam",
+        "partially_open": "make the tailgate appear partially open from impact",
+        "severely_deformed": "severely deform the selected tailgate area",
+    },
+    "front_door": {
+        "dented": "dent the front door",
+        "creased": "create a realistic crease in the front door",
+        "scratched": "scratch the front door",
+        "misaligned": "misalign the front door along the affected seam",
+        "jammed": "make the front door appear jammed by the collision",
+    },
+    "rear_door": {
+        "dented": "dent the rear door",
+        "creased": "create a realistic crease in the rear door",
+        "scratched": "scratch the rear door",
+        "misaligned": "misalign the rear door along the affected seam",
+        "jammed": "make the rear door appear jammed by the collision",
+    },
+    "wheel_arch": {
+        "dented": "dent the wheel arch",
+        "creased": "create a realistic crease in the wheel arch",
+        "crushed": "crush the selected wheel arch area",
+        "scratched": "scratch the wheel arch",
+    },
+    "wheel": COMPONENT_DAMAGE_TEXT["wheel"],
+    "windshield": COMPONENT_DAMAGE_TEXT["glass"],
+    "rear_window": COMPONENT_DAMAGE_TEXT["glass"],
+    "side_window": COMPONENT_DAMAGE_TEXT["glass"],
+    "roof": {
+        "dented": "dent the roof",
+        "creased": "create a realistic crease in the roof",
+        "crushed": "crush the selected roof area",
+        "scratched": "scratch the roof",
+    },
+    "side_mirror": {
+        "scratched": "scratch the side mirror",
+        "cracked": "crack the side mirror housing or glass",
+        "broken": "break the side mirror realistically",
+        "detached": "detach the side mirror",
+        "hanging": "make the side mirror hang from its mounting",
+    },
+}
+
+
 DEFORMATION_INSTRUCTIONS = {
     "dent": (
         "Create a localized inward dent with realistic depth and continuous "
@@ -343,20 +452,52 @@ def component_is_enabled(components: dict[str, bool], *names: str) -> bool:
 
 def build_component_instructions(payload: DamageEditBase64Request) -> str:
     components = payload.involved_components or {"bodyPanel": True}
-    enabled_labels = [
-        label
-        for key, label in COMPONENT_LABELS.items()
-        if bool(components.get(key, False))
+    dynamic_damage_types = payload.component_damage_types or {}
+
+    enabled_codes = [
+        code
+        for code, enabled in components.items()
+        if bool(enabled)
     ]
 
     lines: list[str] = []
 
-    if enabled_labels:
+    if payload.vehicle_view:
+        lines.append(f"Vehicle view reported by the interface: {payload.vehicle_view}.")
+
+    if enabled_codes:
+        enabled_labels = [
+            VEHICLE_COMPONENT_CATALOG.get(
+                code,
+                COMPONENT_LABELS.get(code, code.replace("_", " ")),
+            )
+            for code in enabled_codes
+        ]
         lines.append(
-            "Components explicitly involved: " + ", ".join(sorted(set(enabled_labels))) + "."
+            "Components explicitly involved: "
+            + ", ".join(enabled_labels)
+            + "."
         )
 
-    damage_values = {
+    # Nuovo formato dinamico.
+    for component_code, damage_type in dynamic_damage_types.items():
+        if not component_is_enabled(components, component_code):
+            continue
+
+        instruction = DYNAMIC_COMPONENT_DAMAGE_TEXT.get(
+            component_code,
+            {},
+        ).get(damage_type)
+
+        if instruction:
+            label = VEHICLE_COMPONENT_CATALOG.get(
+                component_code,
+                component_code.replace("_", " "),
+            )
+            lines.append(f"For {label}: {instruction}.")
+
+    # Compatibilità con i campi precedenti.
+    legacy_damage_values = {
         "hood": payload.hood_damage_type,
         "headlight": payload.headlight_damage_type,
         "bumper": payload.bumper_damage_type,
@@ -364,34 +505,67 @@ def build_component_instructions(payload: DamageEditBase64Request) -> str:
         "glass": payload.glass_damage_type,
     }
 
-    aliases = {
+    legacy_aliases = {
         "hood": ("hood",),
-        "headlight": ("headlight",),
-        "bumper": ("bumper",),
+        "headlight": ("headlight", "front_headlight", "rear_light"),
+        "bumper": ("bumper", "front_bumper", "rear_bumper"),
         "wheel": ("wheel",),
-        "glass": ("glass",),
+        "glass": ("glass", "windshield", "rear_window", "side_window"),
     }
 
-    for component, damage_type in damage_values.items():
-        if component_is_enabled(components, *aliases[component]) and damage_type:
-            instruction = COMPONENT_DAMAGE_TEXT.get(component, {}).get(damage_type)
-            if instruction:
-                lines.append(f"For the {component}: {instruction}.")
+    for component, damage_type in legacy_damage_values.items():
+        if not damage_type:
+            continue
+        if not component_is_enabled(components, *legacy_aliases[component]):
+            continue
 
+        instruction = COMPONENT_DAMAGE_TEXT.get(component, {}).get(damage_type)
+        if instruction:
+            lines.append(f"For the {component}: {instruction}.")
+
+    # Protegge soltanto le categorie non coinvolte.
     protected_components: list[str] = []
 
     if not component_is_enabled(components, "hood"):
         protected_components.append("hood")
-    if not component_is_enabled(components, "headlight"):
+
+    if not component_is_enabled(
+        components,
+        "headlight",
+        "front_headlight",
+        "rear_light",
+    ):
         protected_components.append(
-            "headlight, lens, reflector, bulbs and optical assembly"
+            "all headlights, rear lights, lenses, reflectors and optical assemblies"
         )
-    if not component_is_enabled(components, "bumper"):
-        protected_components.append("bumper")
-    if not component_is_enabled(components, "wheel", "wheelArch", "wheel_arch"):
-        protected_components.append("wheel, tyre and wheel arch")
-    if not component_is_enabled(components, "glass"):
-        protected_components.append("glass")
+
+    if not component_is_enabled(
+        components,
+        "bumper",
+        "front_bumper",
+        "rear_bumper",
+    ):
+        protected_components.append("front and rear bumpers")
+
+    if not component_is_enabled(
+        components,
+        "wheel",
+        "wheelArch",
+        "wheel_arch",
+    ):
+        protected_components.append("wheels, tyres and wheel arches")
+
+    if not component_is_enabled(
+        components,
+        "glass",
+        "windshield",
+        "rear_window",
+        "side_window",
+    ):
+        protected_components.append("all vehicle glass")
+
+    if not component_is_enabled(components, "tailgate"):
+        protected_components.append("tailgate")
 
     if protected_components:
         lines.append(
@@ -933,6 +1107,314 @@ def health():
     }
 
 
+
+def image_to_data_url(image: Image.Image) -> str:
+    """
+    Normalizza l'immagine in JPEG per l'analisi visuale.
+    Riduce solo immagini molto grandi per contenere latenza e payload.
+    """
+    normalized = image.convert("RGB")
+    max_side = max(normalized.size)
+
+    if max_side > 1800:
+        scale = 1800 / max_side
+        normalized = normalized.resize(
+            (
+                max(1, round(normalized.width * scale)),
+                max(1, round(normalized.height * scale)),
+            ),
+            Image.Resampling.LANCZOS,
+        )
+
+    buffer = io.BytesIO()
+    normalized.save(
+        buffer,
+        format="JPEG",
+        quality=88,
+        optimize=True,
+    )
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    return f"data:image/jpeg;base64,{encoded}"
+
+
+def extract_json_object(raw_text: str) -> dict:
+    cleaned = raw_text.strip()
+
+    if cleaned.startswith("```"):
+        cleaned = re.sub(
+            r"^```(?:json)?\s*|\s*```$",
+            "",
+            cleaned,
+            flags=re.IGNORECASE | re.DOTALL,
+        ).strip()
+
+    try:
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+
+    match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
+    if not match:
+        raise ValueError("Nessun oggetto JSON trovato nella risposta.")
+
+    parsed = json.loads(match.group(0))
+    if not isinstance(parsed, dict):
+        raise ValueError("La risposta JSON non è un oggetto.")
+    return parsed
+
+
+def normalize_vehicle_analysis(raw: dict) -> dict:
+    vehicle_view = str(raw.get("vehicle_view", "unknown")).strip()
+
+    if vehicle_view not in VEHICLE_VIEW_LABELS:
+        vehicle_view = "unknown"
+
+    raw_components = raw.get("visible_components", [])
+    normalized_components: list[dict] = []
+    seen: set[str] = set()
+
+    if isinstance(raw_components, list):
+        for item in raw_components:
+            if isinstance(item, str):
+                code = item
+                confidence = 0.75
+            elif isinstance(item, dict):
+                code = str(item.get("code", "")).strip()
+                try:
+                    confidence = float(item.get("confidence", 0.75))
+                except Exception:
+                    confidence = 0.75
+            else:
+                continue
+
+            if code not in VEHICLE_COMPONENT_CATALOG or code in seen:
+                continue
+
+            seen.add(code)
+            normalized_components.append(
+                {
+                    "code": code,
+                    "label": VEHICLE_COMPONENT_CATALOG[code],
+                    "confidence": round(
+                        max(0.0, min(confidence, 1.0)),
+                        2,
+                    ),
+                }
+            )
+
+    # Fallback minimo coerente con la vista quando il modello è troppo prudente.
+    view_defaults = {
+        "front": [
+            "hood",
+            "front_headlight",
+            "front_bumper",
+            "windshield",
+        ],
+        "front_left": [
+            "front_fender",
+            "front_headlight",
+            "front_bumper",
+            "hood",
+            "front_door",
+            "wheel_arch",
+            "wheel",
+            "windshield",
+            "side_mirror",
+        ],
+        "front_right": [
+            "front_fender",
+            "front_headlight",
+            "front_bumper",
+            "hood",
+            "front_door",
+            "wheel_arch",
+            "wheel",
+            "windshield",
+            "side_mirror",
+        ],
+        "rear": [
+            "tailgate",
+            "rear_light",
+            "rear_bumper",
+            "rear_window",
+        ],
+        "rear_left": [
+            "rear_fender",
+            "rear_light",
+            "rear_bumper",
+            "tailgate",
+            "rear_door",
+            "wheel_arch",
+            "wheel",
+            "rear_window",
+            "side_window",
+        ],
+        "rear_right": [
+            "rear_fender",
+            "rear_light",
+            "rear_bumper",
+            "tailgate",
+            "rear_door",
+            "wheel_arch",
+            "wheel",
+            "rear_window",
+            "side_window",
+        ],
+        "left_side": [
+            "front_fender",
+            "rear_fender",
+            "front_door",
+            "rear_door",
+            "wheel_arch",
+            "wheel",
+            "side_window",
+            "side_mirror",
+        ],
+        "right_side": [
+            "front_fender",
+            "rear_fender",
+            "front_door",
+            "rear_door",
+            "wheel_arch",
+            "wheel",
+            "side_window",
+            "side_mirror",
+        ],
+    }
+
+    if not normalized_components and vehicle_view in view_defaults:
+        normalized_components = [
+            {
+                "code": code,
+                "label": VEHICLE_COMPONENT_CATALOG[code],
+                "confidence": 0.60,
+            }
+            for code in view_defaults[vehicle_view]
+        ]
+
+    normalized_components.sort(
+        key=lambda item: item["confidence"],
+        reverse=True,
+    )
+
+    return {
+        "vehicle_view": vehicle_view,
+        "vehicle_view_label": VEHICLE_VIEW_LABELS[vehicle_view],
+        "visible_components": normalized_components,
+    }
+
+
+def call_openai_vehicle_analysis(image_data_url: str) -> dict:
+    client = OpenAI()
+    configured_model = os.getenv(
+        "OPENAI_VISION_MODEL",
+        "gpt-4.1-mini",
+    )
+
+    prompt = f"""
+Analyze this automotive photograph.
+
+Return ONLY a JSON object with:
+{{
+  "vehicle_view": one of [
+    "front", "front_left", "front_right",
+    "rear", "rear_left", "rear_right",
+    "left_side", "right_side", "mixed", "unknown"
+  ],
+  "visible_components": [
+    {{
+      "code": one of {list(VEHICLE_COMPONENT_CATALOG.keys())},
+      "confidence": number from 0 to 1
+    }}
+  ]
+}}
+
+Rules:
+- Include only components genuinely visible in the photograph.
+- Distinguish front_headlight from rear_light.
+- Distinguish hood from tailgate.
+- Distinguish front_bumper from rear_bumper.
+- Distinguish front_fender from rear_fender.
+- Include a component even when partly visible, but lower its confidence.
+- Do not identify damage severity and do not describe people or the background.
+- Do not invent components outside the allowed code list.
+""".strip()
+
+    try:
+        response = client.chat.completions.create(
+            model=configured_model,
+            temperature=0,
+            response_format={"type": "json_object"},
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a precise automotive body-component classifier. "
+                        "Return valid JSON only."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": prompt,
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": image_data_url,
+                                "detail": "high",
+                            },
+                        },
+                    ],
+                },
+            ],
+        )
+
+        content = response.choices[0].message.content or "{}"
+        return extract_json_object(content)
+
+    except Exception as exc:
+        print(
+            "OPENAI VEHICLE ANALYSIS ERROR:",
+            type(exc).__name__,
+            str(exc),
+        )
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Il motore di analisi non ha completato il riconoscimento "
+                "dei componenti."
+            ),
+        ) from exc
+
+
+@app.post("/v1/vehicle/analyze-components")
+def analyze_vehicle_components(payload: VehicleAnalyzeRequest):
+    source = decode_base64_image(
+        payload.image_base64,
+        "image_base64",
+        "RGB",
+    )
+
+    image_data_url = image_to_data_url(source)
+    raw_analysis = call_openai_vehicle_analysis(image_data_url)
+    normalized = normalize_vehicle_analysis(raw_analysis)
+
+    return {
+        **normalized,
+        "model": os.getenv(
+            "OPENAI_VISION_MODEL",
+            "gpt-4.1-mini",
+        ),
+        "analysis_version": "vehicle-components-v1",
+    }
+
+
 @app.post("/v1/damage/edit")
 async def edit_damage(
     image: UploadFile = File(..., description="Fotografia originale"),
@@ -999,7 +1481,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v13-structured-workflow",
+        "prompt_version": "damage-v14-component-analysis",
     }
 
 
@@ -1087,7 +1569,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v13-structured-workflow",
+        "prompt_version": "damage-v14-component-analysis",
         "deformation_type": payload.deformation_type,
         "impact_direction": payload.impact_direction,
         "contact_traces_enabled": payload.contact_traces_enabled,
