@@ -41,7 +41,7 @@ ALLOWED_ORIGINS = [
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.2.3",
+    version="1.2.1",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -486,16 +486,8 @@ DYNAMIC_COMPONENT_DAMAGE_TEXT = {
             "an organic-looking interior, a black blob or a featureless dark shape."
         ),
         "partially_detached": (
-            "partially detach the selected side mirror from the door while keeping "
-            "the complete mirror assembly fully visible and recognizable. Move and "
-            "rotate the mirror outward and slightly downward from its original "
-            "mounting position. Show a clear physical gap between the mounting base "
-            "and the door. Keep the housing, mirror body and mounting arm intact. "
-            "Where physically plausible, show broken mounting clips or a short "
-            "electrical cable. Preserve realistic scale, proportions and material "
-            "details. Do not shrink, compress, erase, flatten or collapse the mirror "
-            "into the mounting base. Do not make the mirror disappear and do not "
-            "replace it with a black shape or indistinct dark mass."
+            "partially detach the mirror from the door while keeping the complete "
+            "assembly recognizable"
         ),
     },
 }
@@ -566,102 +558,6 @@ def has_component_damage_request(payload: DamageEditBase64Request) -> bool:
             payload.glass_damage_type,
         )
     )
-
-
-DISPLACEMENT_DAMAGE_TYPES = {
-    "partially_detached",
-    "detached",
-    "hanging",
-    "unclipped",
-    "partially_open",
-    "misaligned",
-    "lifted",
-    "wheel_misaligned",
-}
-
-
-def displacement_request(payload: DamageEditBase64Request) -> tuple[bool, str | None]:
-    """
-    Restituisce se il danno richiede una zona di movimento più ampia e,
-    quando possibile, il componente principale coinvolto.
-    """
-    damage_types = payload.component_damage_types or {}
-
-    for component_code, damage_type in damage_types.items():
-        if damage_type in DISPLACEMENT_DAMAGE_TYPES:
-            return True, component_code
-
-    legacy_values = (
-        payload.hood_damage_type,
-        payload.headlight_damage_type,
-        payload.bumper_damage_type,
-        payload.wheel_damage_type,
-        payload.glass_damage_type,
-    )
-
-    if any(value in DISPLACEMENT_DAMAGE_TYPES for value in legacy_values if value):
-        return True, None
-
-    return False, None
-
-
-def displacement_margin_px(
-    source_size: tuple[int, int],
-    component_code: str | None,
-) -> int:
-    """
-    Calcola un margine realistico per consentire lo spostamento del componente.
-
-    Lo specchietto necessita di più spazio rispetto a un faro o a una giunzione.
-    """
-    width, height = source_size
-    reference = min(width, height)
-
-    ratios = {
-        "side_mirror": 0.075,
-        "front_bumper": 0.055,
-        "rear_bumper": 0.055,
-        "front_headlight": 0.045,
-        "rear_light": 0.045,
-        "tailgate": 0.045,
-        "hood": 0.040,
-        "wheel": 0.040,
-    }
-
-    ratio = ratios.get(component_code, 0.050)
-    return max(28, min(150, round(reference * ratio)))
-
-
-def expand_edit_mask_for_displacement(
-    edit_mask: Image.Image,
-    protect_mask: Image.Image | None,
-    source_size: tuple[int, int],
-    component_code: str | None,
-) -> tuple[Image.Image, int]:
-    """
-    Amplia la maschera sia per la generazione sia per il compositing finale.
-
-    Questo consente a elementi come specchietti o paraurti di spostarsi oltre
-    la sagoma iniziale senza essere tagliati dal soft composite.
-    """
-    margin = displacement_margin_px(source_size, component_code)
-    binary = mask_to_binary(edit_mask)
-
-    kernel_size = margin * 2 + 1
-    kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE,
-        (kernel_size, kernel_size),
-    )
-    expanded = cv2.dilate(binary, kernel, iterations=1)
-
-    if protect_mask is not None:
-        protect_binary = mask_to_binary(protect_mask)
-        expanded = cv2.bitwise_and(
-            expanded,
-            cv2.bitwise_not(protect_binary),
-        )
-
-    return Image.fromarray(expanded, mode="L"), margin
 
 
 def build_component_instructions(payload: DamageEditBase64Request) -> str:
@@ -1757,7 +1653,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v15.3-displacement-mask",
+        "prompt_version": "damage-v15.1-side-mirror-housing-fix",
     }
 
 
@@ -1792,20 +1688,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         raw_protect_mask,
         source.size,
     )
-
-    requires_displacement, displacement_component = displacement_request(payload)
-    generation_mask = source_mask
-    displacement_margin = 0
-
-    if requires_displacement:
-        generation_mask, displacement_margin = expand_edit_mask_for_displacement(
-            edit_mask=source_mask,
-            protect_mask=protect_mask,
-            source_size=source.size,
-            component_code=displacement_component,
-        )
-
-    api_mask = alter_damage_area(generation_mask, 0)
+    api_mask = alter_damage_area(source_mask, 0)
 
     job_id = str(uuid.uuid4())
     resolved_damage_mode = infer_damage_mode(payload)
@@ -1850,18 +1733,8 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         result_bytes = protected_soft_composite(
             source=source,
             generated_bytes=generated_bytes,
-            source_mask=generation_mask,
+            source_mask=source_mask,
             protect_mask=protect_mask,
-            expansion_px=(
-                8
-                if requires_displacement
-                else COMPOSITE_EXPANSION_PX
-            ),
-            feather_px=(
-                8
-                if requires_displacement
-                else SOFT_COMPOSITE_FEATHER_PX
-            ),
         )
 
     return {
@@ -1872,15 +1745,12 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v15.3-displacement-mask",
+        "prompt_version": "damage-v15.1-side-mirror-housing-fix",
         "deformation_type": payload.deformation_type,
         "impact_direction": payload.impact_direction,
         "contact_traces_enabled": payload.contact_traces_enabled,
         "involved_components": payload.involved_components,
         "damage_mode": resolved_damage_mode,
-        "displacement_mode": requires_displacement,
-        "displacement_component": displacement_component,
-        "displacement_margin_px": displacement_margin,
     }
 
 
