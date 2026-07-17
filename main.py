@@ -41,7 +41,7 @@ ALLOWED_ORIGINS = [
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.2.1.4",
+    version="1.2.1.6",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -468,8 +468,92 @@ DYNAMIC_COMPONENT_DAMAGE_TEXT = {
             "keeping the complete assembly recognizable"
         ),
     },
-    "front_bumper": COMPONENT_DAMAGE_TEXT["bumper"],
-    "rear_bumper": COMPONENT_DAMAGE_TEXT["bumper"],
+    "front_bumper": {
+        "scratched": (
+            "add localized superficial scratches to the existing front bumper "
+            "surface while preserving exactly its original shape, colour, trim, "
+            "seams, grilles, openings and mounting position"
+        ),
+        "cracked": (
+            "create one or two localized cracks in the existing front bumper plastic. "
+            "Preserve exactly the original bumper shape, colour, trim, seams, grilles, "
+            "openings, mounting position and surrounding bodywork. Do not redesign, "
+            "replace or recolour the bumper. Do not add parking sensors, covers, "
+            "grilles, mouldings, vents, fog lights, openings or details that were not "
+            "present in the source image"
+        ),
+        "deformed": (
+            "create a localized plastic deformation in the existing front bumper "
+            "surface while preserving the bumper's overall original geometry, colour, "
+            "trim, seams, grilles, openings and mounting position. Do not replace or "
+            "redesign the bumper and do not invent new parts or details"
+        ),
+        "broken": (
+            "create a clearly visible but localized break in the existing front "
+            "bumper plastic, with realistic cracked edges and limited missing material. "
+            "Keep the bumper recognizable and preserve its original colour, shape, "
+            "trim, seams, grilles, openings and mounting position. Do not reconstruct "
+            "the bumper as a different component"
+        ),
+        "unclipped": (
+            "slightly unclip the existing front bumper at one local mounting point "
+            "while keeping the complete original bumper recognizable and preserving "
+            "its colour, trim, geometry and surrounding bodywork"
+        ),
+        "partially_detached": (
+            "partially release the existing front bumper from one mounting point while "
+            "keeping the complete original bumper recognizable and preserving its "
+            "colour, trim and geometry. Do not redesign or replace the bumper"
+        ),
+        "hanging": (
+            "make one side of the existing front bumper hang slightly from its original "
+            "mounting while preserving the original component identity, colour, trim "
+            "and geometry. Do not replace or redesign the bumper"
+        ),
+    },
+    "rear_bumper": {
+        "scratched": (
+            "add localized superficial scratches to the existing rear bumper "
+            "surface while preserving exactly its original shape, colour, trim, "
+            "seams, openings and mounting position"
+        ),
+        "cracked": (
+            "create one or two localized cracks in the existing rear bumper plastic. "
+            "Preserve exactly the original bumper shape, colour, trim, seams, openings, "
+            "mounting position and surrounding bodywork. Do not redesign, replace or "
+            "recolour the bumper. Do not add parking sensors, covers, grilles, "
+            "mouldings, vents, openings or details that were not present in the source "
+            "image"
+        ),
+        "deformed": (
+            "create a localized plastic deformation in the existing rear bumper "
+            "surface while preserving the bumper's overall original geometry, colour, "
+            "trim, seams, openings and mounting position. Do not replace or redesign "
+            "the bumper and do not invent new parts or details"
+        ),
+        "broken": (
+            "create a clearly visible but localized break in the existing rear bumper "
+            "plastic, with realistic cracked edges and limited missing material. Keep "
+            "the bumper recognizable and preserve its original colour, shape, trim, "
+            "seams, openings and mounting position. Do not reconstruct the bumper as "
+            "a different component"
+        ),
+        "unclipped": (
+            "slightly unclip the existing rear bumper at one local mounting point "
+            "while keeping the complete original bumper recognizable and preserving "
+            "its colour, trim, geometry and surrounding bodywork"
+        ),
+        "partially_detached": (
+            "partially release the existing rear bumper from one mounting point while "
+            "keeping the complete original bumper recognizable and preserving its "
+            "colour, trim and geometry. Do not redesign or replace the bumper"
+        ),
+        "hanging": (
+            "make one side of the existing rear bumper hang slightly from its original "
+            "mounting while preserving the original component identity, colour, trim "
+            "and geometry. Do not replace or redesign the bumper"
+        ),
+    },
     "hood": COMPONENT_DAMAGE_TEXT["hood"],
     "tailgate": {
         "dented": "dent the tailgate",
@@ -922,6 +1006,11 @@ Component-only rules:
   shattered means dense cracking across most of the lens with multiple fragments;
 - show realistic plastic, glass, metal, mounting points and material thickness;
 - when breaking or detaching a component, preserve believable attachment details;
+- for bumpers, preserve exactly the original component identity, colour, shape,
+  trim, seams, openings, grilles and mounting position unless the selected damage
+  explicitly requests a limited local detachment;
+- never redesign, replace, recolour or invent bumper details such as parking sensors,
+  covers, grilles, mouldings, vents, fog lights or openings not present in the source;
 - do not add dents, folds or crushed sheet metal unless bodywork is also selected;
 - do not interpret broken or detached as a solid black shape or erased area.
 
@@ -1792,7 +1881,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v15.1.4-light-crack-control",
+        "prompt_version": "damage-v15.1.6-bumper-identity-preservation",
     }
 
 
@@ -1884,7 +1973,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v15.1.4-light-crack-control",
+        "prompt_version": "damage-v15.1.6-bumper-identity-preservation",
         "deformation_type": payload.deformation_type,
         "impact_direction": payload.impact_direction,
         "contact_traces_enabled": payload.contact_traces_enabled,
