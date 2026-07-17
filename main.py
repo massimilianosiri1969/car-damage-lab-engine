@@ -41,7 +41,7 @@ ALLOWED_ORIGINS = [
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.2.1.6",
+    version="1.2.2.0",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -61,6 +61,12 @@ class DamageEditBase64Request(BaseModel):
     image_base64: str = Field(..., min_length=16)
     mask_base64: str = Field(..., min_length=16)
     protect_mask_base64: str | None = None
+
+    # Maschere evolute, usate soprattutto in modalità mixed:
+    # - bodywork_mask_base64: sola lamiera;
+    # - component_masks_base64: una maschera per ogni componente.
+    bodywork_mask_base64: str | None = None
+    component_masks_base64: dict[str, str] = Field(default_factory=dict)
 
     severity_percent: int = Field(..., ge=-100, le=100)
     area_percent: int = Field(..., ge=-100, le=100)
@@ -196,6 +202,48 @@ def combine_edit_and_protect_masks(
         )
 
     return Image.fromarray(edit_binary, mode="L"), resized_protect
+
+
+def apply_area_percent_to_edit_mask(
+    mask: Image.Image,
+    area_percent: int,
+) -> Image.Image:
+    """
+    Applica geometricamente il parametro Superficie danneggiata.
+
+    - valori negativi: restringono realmente la zona modificabile;
+    - 0: mantengono la maschera originale;
+    - valori positivi: espandono realmente la zona modificabile.
+
+    Il risultato viene usato sia per la generazione sia per il compositing,
+    così l'estensione non rimane una semplice istruzione testuale.
+    """
+    area_percent = clamp_percentage(area_percent)
+    binary = mask_to_binary(mask)
+
+    if area_percent == 0:
+        return Image.fromarray(binary, mode="L")
+
+    height, width = binary.shape
+    reference = max(3, round(min(width, height) * 0.10))
+    radius = max(1, round(reference * abs(area_percent) / 100))
+    kernel_size = radius * 2 + 1
+
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (kernel_size, kernel_size),
+    )
+
+    if area_percent > 0:
+        adjusted = cv2.dilate(binary, kernel, iterations=1)
+    else:
+        adjusted = cv2.erode(binary, kernel, iterations=1)
+
+    if int((adjusted >= 128).sum()) == 0:
+        # Non lasciamo che una forte erosione cancelli completamente la zona.
+        adjusted = binary
+
+    return Image.fromarray(adjusted, mode="L")
 
 
 def alter_damage_area(mask: Image.Image, area_percent: int) -> Image.Image:
@@ -708,6 +756,61 @@ def has_component_damage_request(payload: DamageEditBase64Request) -> bool:
             payload.glass_damage_type,
         )
     )
+
+
+def selected_bodywork_component_codes(
+    payload: DamageEditBase64Request,
+) -> list[str]:
+    components = payload.involved_components or {}
+    return [
+        code
+        for code, enabled in components.items()
+        if bool(enabled) and code in BODYWORK_COMPONENT_CODES
+    ]
+
+
+def selected_non_body_component_codes(
+    payload: DamageEditBase64Request,
+) -> list[str]:
+    components = payload.involved_components or {}
+    return [
+        code
+        for code, enabled in components.items()
+        if bool(enabled) and code in NON_BODY_COMPONENT_CODES
+    ]
+
+
+def payload_for_single_component(
+    payload: DamageEditBase64Request,
+    component_code: str,
+) -> DamageEditBase64Request:
+    """
+    Crea una copia del payload limitata a un solo componente.
+    Serve per generare ogni danno non-lamiera in un passaggio indipendente.
+    """
+    selected_damage_type = (
+        payload.component_damage_types or {}
+    ).get(component_code)
+
+    return payload.model_copy(
+        update={
+            "damage_mode": "component_only",
+            "involved_components": {component_code: True},
+            "component_damage_types": (
+                {component_code: selected_damage_type}
+                if selected_damage_type
+                else {}
+            ),
+            "bodywork_mask_base64": None,
+            "component_masks_base64": {},
+        }
+    )
+
+
+def jpeg_bytes_to_rgb_image(image_bytes: bytes) -> Image.Image:
+    image = Image.open(io.BytesIO(image_bytes))
+    image.load()
+    return image.convert("RGB")
 
 
 def build_component_instructions(payload: DamageEditBase64Request) -> str:
@@ -1895,6 +1998,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         "image_base64",
         "RGB",
     )
+
     raw_edit_mask = decode_base64_image(
         payload.mask_base64,
         "mask_base64",
@@ -1916,25 +2020,19 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         raw_protect_mask,
         source.size,
     )
-    api_mask = alter_damage_area(source_mask, 0)
 
     job_id = str(uuid.uuid4())
     resolved_damage_mode = infer_damage_mode(payload)
 
-    prompt = build_prompt(
-        severity=severity_percent,
-        area=area_percent,
-        damage_mode=resolved_damage_mode,
-        deformation_type=payload.deformation_type,
-        impact_direction=payload.impact_direction,
-        component_instructions=build_component_instructions(payload),
-        contact_trace_instructions=build_contact_trace_instructions(payload),
-    )
-
     if os.getenv("MOCK_MODE", "false").lower() == "true":
+        adjusted_mock_mask = apply_area_percent_to_edit_mask(
+            source_mask,
+            area_percent,
+        )
+        api_mock_mask = alter_damage_area(adjusted_mock_mask, 0)
         return make_mock_result(
             source,
-            api_mask,
+            api_mock_mask,
             job_id,
             severity_percent,
             area_percent,
@@ -1950,7 +2048,25 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         buffer = io.BytesIO()
         source.save(buffer, format="JPEG", quality=95, subsampling=0)
         result_bytes = buffer.getvalue()
-    else:
+
+    elif resolved_damage_mode != "mixed":
+        # Modalità singola: controllo geometrico reale della superficie.
+        effective_mask = apply_area_percent_to_edit_mask(
+            source_mask,
+            area_percent,
+        )
+        api_mask = alter_damage_area(effective_mask, 0)
+
+        prompt = build_prompt(
+            severity=severity_percent,
+            area=area_percent,
+            damage_mode=resolved_damage_mode,
+            deformation_type=payload.deformation_type,
+            impact_direction=payload.impact_direction,
+            component_instructions=build_component_instructions(payload),
+            contact_trace_instructions=build_contact_trace_instructions(payload),
+        )
+
         generated_bytes = call_openai_image_edit(
             source,
             api_mask,
@@ -1961,9 +2077,171 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         result_bytes = protected_soft_composite(
             source=source,
             generated_bytes=generated_bytes,
-            source_mask=source_mask,
+            source_mask=effective_mask,
             protect_mask=protect_mask,
         )
+
+    else:
+        # Modalità mista evoluta: un passaggio per la lamiera e uno per ogni
+        # componente non-lamiera, con maschere indipendenti.
+        bodywork_codes = selected_bodywork_component_codes(payload)
+        component_codes = selected_non_body_component_codes(payload)
+
+        if bodywork_codes and not payload.bodywork_mask_base64:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "La modalità mixed richiede bodywork_mask_base64 per separare "
+                    "la lamiera dagli altri componenti."
+                ),
+            )
+
+        missing_component_masks = [
+            code
+            for code in component_codes
+            if not payload.component_masks_base64.get(code)
+        ]
+        if missing_component_masks:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Mancano le maschere separate per: "
+                    + ", ".join(missing_component_masks)
+                ),
+            )
+
+        current_image = source
+        sequential_steps: list[str] = []
+
+        # Passaggio 1: sola lamiera.
+        if bodywork_codes:
+            raw_bodywork_mask = decode_base64_image(
+                payload.bodywork_mask_base64,
+                "bodywork_mask_base64",
+                "L",
+            )
+            bodywork_mask, _ = combine_edit_and_protect_masks(
+                raw_bodywork_mask,
+                raw_protect_mask,
+                source.size,
+            )
+            effective_bodywork_mask = apply_area_percent_to_edit_mask(
+                bodywork_mask,
+                area_percent,
+            )
+            api_bodywork_mask = alter_damage_area(
+                effective_bodywork_mask,
+                0,
+            )
+
+            bodywork_payload = payload.model_copy(
+                update={
+                    "damage_mode": "bodywork",
+                    "involved_components": {
+                        code: True for code in bodywork_codes
+                    },
+                    "component_damage_types": {
+                        code: damage_type
+                        for code, damage_type in (
+                            payload.component_damage_types or {}
+                        ).items()
+                        if code in bodywork_codes
+                    },
+                    "bodywork_mask_base64": None,
+                    "component_masks_base64": {},
+                }
+            )
+
+            bodywork_prompt = build_prompt(
+                severity=severity_percent,
+                area=area_percent,
+                damage_mode="bodywork",
+                deformation_type=payload.deformation_type,
+                impact_direction=payload.impact_direction,
+                component_instructions=build_component_instructions(
+                    bodywork_payload
+                ),
+                contact_trace_instructions=build_contact_trace_instructions(
+                    bodywork_payload
+                ),
+            )
+
+            generated_bodywork = call_openai_image_edit(
+                current_image,
+                api_bodywork_mask,
+                bodywork_prompt,
+                payload.output_quality,
+            )
+
+            bodywork_result = protected_soft_composite(
+                source=current_image,
+                generated_bytes=generated_bodywork,
+                source_mask=effective_bodywork_mask,
+                protect_mask=protect_mask,
+            )
+            current_image = jpeg_bytes_to_rgb_image(bodywork_result)
+            sequential_steps.append("bodywork")
+
+        # Passaggi successivi: un componente per volta.
+        for component_code in component_codes:
+            raw_component_mask = decode_base64_image(
+                payload.component_masks_base64[component_code],
+                f"component_masks_base64[{component_code}]",
+                "L",
+            )
+            component_mask, _ = combine_edit_and_protect_masks(
+                raw_component_mask,
+                raw_protect_mask,
+                source.size,
+            )
+
+            # La superficie danneggiata riguarda la lamiera: non altera
+            # geometricamente fari, vetri, specchietti, ruote o paraurti.
+            api_component_mask = alter_damage_area(component_mask, 0)
+
+            component_payload = payload_for_single_component(
+                payload,
+                component_code,
+            )
+
+            component_prompt = build_prompt(
+                severity=severity_percent,
+                area=0,
+                damage_mode="component_only",
+                deformation_type=payload.deformation_type,
+                impact_direction=payload.impact_direction,
+                component_instructions=build_component_instructions(
+                    component_payload
+                ),
+                contact_trace_instructions=build_contact_trace_instructions(
+                    component_payload
+                ),
+            )
+
+            generated_component = call_openai_image_edit(
+                current_image,
+                api_component_mask,
+                component_prompt,
+                payload.output_quality,
+            )
+
+            component_result = protected_soft_composite(
+                source=current_image,
+                generated_bytes=generated_component,
+                source_mask=component_mask,
+                protect_mask=protect_mask,
+            )
+            current_image = jpeg_bytes_to_rgb_image(component_result)
+            sequential_steps.append(component_code)
+
+        output = io.BytesIO()
+        current_image.save(
+            output,
+            format="JPEG",
+            quality=95,
+            subsampling=0,
+        )
+        result_bytes = output.getvalue()
 
     return {
         "job_id": job_id,
@@ -1973,12 +2251,23 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v15.1.6-bumper-identity-preservation",
+        "prompt_version": "damage-v15.2.0-sequential-mixed-area-control",
         "deformation_type": payload.deformation_type,
         "impact_direction": payload.impact_direction,
         "contact_traces_enabled": payload.contact_traces_enabled,
         "involved_components": payload.involved_components,
         "damage_mode": resolved_damage_mode,
+        "area_control": "geometric_mask_transform",
+        "mixed_strategy": (
+            "sequential_per_component"
+            if resolved_damage_mode == "mixed"
+            else "single_pass"
+        ),
+        "sequential_steps": (
+            sequential_steps
+            if resolved_damage_mode == "mixed"
+            else []
+        ),
     }
 
 
