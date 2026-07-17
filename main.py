@@ -41,7 +41,7 @@ ALLOWED_ORIGINS = [
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.2.1.2",
+    version="1.2.1.1",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -757,23 +757,16 @@ def bodywork_geometry_instruction(
 
     if severity_abs <= 30:
         severity_rule = (
-            "Create one compact primary impact depression and no more than two "
-            "short secondary creases converging toward the impact point. The visible "
-            "deformation must occupy no more than approximately one third of the "
-            "selected body panel, even when the editable mask is larger. Keep at "
-            "least 60 to 70 percent of the selected panel visually unchanged. Make "
-            "the transition from undamaged to deformed metal relatively clear and "
-            "localized. Preserve the original wheel-arch profile, panel perimeter, "
-            "nearby seams and shut lines. Do not stretch the deformation vertically "
-            "or along the full length of the panel."
+            "Create one localized primary impact depression and no more than two "
+            "short secondary creases. Keep most of the selected panel visually "
+            "unchanged. Preserve the original wheel-arch profile, panel perimeter "
+            "and adjacent seams."
         )
     elif severity_abs <= 60:
         severity_rule = (
-            "Create one clear but still localized primary impact depression with "
-            "two or three short related creases converging toward the impact point. "
-            "Avoid long smooth valleys and avoid pulling the deformation across the "
-            "whole panel. Preserve substantial undamaged areas, the panel identity, "
-            "main perimeter, wheel-arch profile and neighbouring seams."
+            "Create one clear primary impact depression with two or three related "
+            "creases. Allow moderate depth, but preserve the panel identity, main "
+            "perimeter, wheel-arch profile and neighbouring seams."
         )
     else:
         severity_rule = (
@@ -906,15 +899,11 @@ Contact traces:
 
 Bodywork geometry control:
 - {geometry_text}
-- create one dominant and compact impact point;
+- create one dominant impact point;
 - keep large portions of the selected panel unchanged at low and medium severity;
 - do not deform the whole panel unless severity and area are both high;
-- keep the primary depression short and localized;
-- make secondary creases short and convergent toward the impact point;
-- avoid long smooth valleys, vertically dragged deformation, stretched metal bands,
-  smooth sculpted waves, inflated surfaces, repeated folds, decorative wrinkles
-  and uniformly softened metal;
-- create a clearer visual boundary between undamaged and deformed metal;
+- avoid smooth sculpted waves, inflated surfaces, repeated folds,
+  decorative wrinkles and uniformly softened metal;
 - preserve the original wheel-arch curve, panel perimeter and nearby shut lines
   at low and medium severity.
 
@@ -1732,7 +1721,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v15.1.2-compact-bodywork-damage",
+        "prompt_version": "damage-v15.1.1-bodywork-geometry-control",
     }
 
 
@@ -1824,7 +1813,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v15.1.2-compact-bodywork-damage",
+        "prompt_version": "damage-v15.1.1-bodywork-geometry-control",
         "deformation_type": payload.deformation_type,
         "impact_direction": payload.impact_direction,
         "contact_traces_enabled": payload.contact_traces_enabled,
