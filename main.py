@@ -41,7 +41,7 @@ ALLOWED_ORIGINS = [
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.2.1",
+    version="1.2.1.1",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -740,6 +740,60 @@ def build_contact_trace_instructions(
     )
 
 
+def bodywork_geometry_instruction(
+    severity: int,
+    area: int,
+) -> str:
+    """
+    Traduce gravità ed estensione in vincoli geometrici più concreti.
+
+    Obiettivo:
+    - ridurre deformazioni troppo ampie a bassa intensità;
+    - evitare onde lisce, pieghe decorative e pannelli interamente modellati;
+    - rendere più stabile la relazione tra percentuali e risultato visivo.
+    """
+    severity_abs = abs(severity)
+    area_abs = abs(area)
+
+    if severity_abs <= 30:
+        severity_rule = (
+            "Create one localized primary impact depression and no more than two "
+            "short secondary creases. Keep most of the selected panel visually "
+            "unchanged. Preserve the original wheel-arch profile, panel perimeter "
+            "and adjacent seams."
+        )
+    elif severity_abs <= 60:
+        severity_rule = (
+            "Create one clear primary impact depression with two or three related "
+            "creases. Allow moderate depth, but preserve the panel identity, main "
+            "perimeter, wheel-arch profile and neighbouring seams."
+        )
+    else:
+        severity_rule = (
+            "Create a strong but physically plausible collision deformation with "
+            "a dominant impact zone and a limited number of connected folds. Avoid "
+            "random wrinkling and preserve recognizable panel boundaries."
+        )
+
+    if area_abs <= 20:
+        area_rule = (
+            "Concentrate the visible deformation in a compact portion of the "
+            "editable mask. Do not use the entire mask just because it is available."
+        )
+    elif area_abs <= 60:
+        area_rule = (
+            "Use a medium portion of the editable mask, leaving clearly unchanged "
+            "areas around the primary impact zone."
+        )
+    else:
+        area_rule = (
+            "The damage may use a broad portion of the editable mask, but it must "
+            "still have one dominant impact area rather than uniform deformation."
+        )
+
+    return f"{severity_rule} {area_rule}"
+
+
 def build_prompt(
     severity: int,
     area: int,
@@ -809,6 +863,10 @@ Component-only rules:
         deformation_type,
         DEFORMATION_INSTRUCTIONS["dent"],
     )
+    geometry_text = bodywork_geometry_instruction(
+        severity=severity,
+        area=area,
+    )
 
     if damage_mode == "mixed":
         mode_heading = (
@@ -838,6 +896,16 @@ Specific component rules:
 
 Contact traces:
 {contact_trace_instructions or "Do not add contact traces."}
+
+Bodywork geometry control:
+- {geometry_text}
+- create one dominant impact point;
+- keep large portions of the selected panel unchanged at low and medium severity;
+- do not deform the whole panel unless severity and area are both high;
+- avoid smooth sculpted waves, inflated surfaces, repeated folds,
+  decorative wrinkles and uniformly softened metal;
+- preserve the original wheel-arch curve, panel perimeter and nearby shut lines
+  at low and medium severity.
 
 Bodywork rules:
 - keep deformation concentrated in the selected sheet-metal area;
@@ -1653,7 +1721,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v15.1-side-mirror-housing-fix",
+        "prompt_version": "damage-v15.1.1-bodywork-geometry-control",
     }
 
 
@@ -1745,7 +1813,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v15.1-side-mirror-housing-fix",
+        "prompt_version": "damage-v15.1.1-bodywork-geometry-control",
         "deformation_type": payload.deformation_type,
         "impact_direction": payload.impact_direction,
         "contact_traces_enabled": payload.contact_traces_enabled,
