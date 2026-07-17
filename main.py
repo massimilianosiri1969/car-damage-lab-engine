@@ -40,7 +40,7 @@ ALLOWED_ORIGINS = [
 
 app = FastAPI(
     title=APP_NAME,
-    version="0.7.0",
+    version="0.5.0",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -177,11 +177,6 @@ def build_prompt(
     area: int,
     user_instructions: str = "",
 ) -> str:
-    """
-    V11: mantiene il valore reale di gravità e usa profili tecnici
-    più realistici, evitando sia pieghe eccessive sia deformazioni
-    larghe, gonfie o uniformemente stirate.
-    """
     cleaned = user_instructions.strip()
     extra_instruction = ""
 
@@ -190,86 +185,36 @@ def build_prompt(
 Indicazione aggiuntiva dell'utente:
 {cleaned}
 
-Applicala soltanto dentro la zona modificabile e senza violare
-i vincoli di conservazione elencati sotto.
+Applicala soltanto dentro la zona modificabile e senza violare i vincoli
+di conservazione elencati sotto.
 """.strip()
 
-    severity_abs = abs(severity)
-
-    if severity_abs <= 30:
-        damage_profile = (
-            "a localized mild dent with limited depth, one main impact area, "
-            "natural edges and preservation of the original panel curvature"
-        )
-    elif severity_abs <= 65:
-        damage_profile = (
-            "a medium collision deformation with one or two principal realistic "
-            "creases, a clearly identifiable impact zone and preserved panel shape "
-            "outside the central damaged area"
-        )
-    else:
-        damage_profile = (
-            "a severe but physically plausible collision deformation with deeper "
-            "creases and stronger local collapse, while preserving recognizable "
-            "panel boundaries and avoiding melted or inflated surfaces"
-        )
-
-    if severity > 0:
-        severity_action = (
-            f"increase the visible damage by approximately {severity_abs}%"
-        )
-    elif severity < 0:
-        severity_action = (
-            f"reduce the visible damage by approximately {severity_abs}%"
-        )
-    else:
-        severity_action = "preserve the current damage severity"
-
-    if area > 0:
-        area_action = (
-            f"extend the visible deformation by approximately {abs(area)}%, "
-            "but only within the editable region"
-        )
-    elif area < 0:
-        area_action = (
-            f"reduce the visible deformation footprint by approximately {abs(area)}%, "
-            "while preserving realistic continuity"
-        )
-    else:
-        area_action = "preserve the current visible damage footprint"
+    severity_text = severity_instruction(severity)
+    area_text = area_instruction(area)
 
     return f"""
-Realistic automotive photo editing.
+Modifica fotografica automotive realistica.
 
-Objective:
-- {severity_action};
-- use this damage profile: {damage_profile};
-- {area_action}.
+Obiettivo:
+- {severity_text}
+- {area_text}
 
 {extra_instruction}
 
-Damage-shape rules:
-- keep the deformation concentrated around the actual impact zone;
-- preserve the original curvature of the fender outside the central impact area;
-- do not flatten, inflate or uniformly stretch the entire panel;
-- do not create a large smooth bulge;
-- do not create decorative, repetitive or liquid-looking folds;
-- for low severity, use one localized dent with limited depth;
-- for medium severity, use one or two main realistic creases;
-- reserve deep structural folds for high severity only;
-- all reflections must follow the resulting metal geometry naturally.
-
-Preservation rules:
-- preserve the same vehicle, model, colour, perspective and framing;
-- modify only the selected painted sheet-metal region;
-- preserve headlights, lenses, reflectors, bulbs and optical assemblies exactly;
-- do not deform, move, redraw or alter any headlight content;
-- preserve hood, bumper, wheel, tyre, glass, plate, logo, panel gaps,
-  workshop background and lighting;
-- do not create melted metal, plastic-looking surfaces, duplicated panels,
-  pasted objects, transparency or missing body parts;
-- do not modify anything outside the editable mask;
-- return the complete final photograph, photorealistic and without watermark.
+Vincoli:
+- conserva la stessa automobile, modello, colore, prospettiva e inquadratura;
+- modifica esclusivamente la lamiera selezionata;
+- crea pieghe e deformazioni fisicamente plausibili da urto reale;
+- mantieni continuità della lamiera, vernice, ombre e riflessi;
+- non creare metallo fuso, superfici plastiche, pieghe decorative,
+  pannelli duplicati, oggetti sovrapposti o parti trasparenti;
+- preserva integralmente fari, fanali, lenti, parabole, lampade e gruppi ottici;
+- non deformare, spostare, ridisegnare o cambiare il contenuto dei fari,
+  anche quando sono vicini alla selezione;
+- preserva cofano, paraurti, ruote, pneumatici, vetri, targa, logo,
+  giunzioni dei pannelli, sfondo e illuminazione;
+- non cambiare nulla fuori dalla zona modificabile;
+- restituisci l'intera fotografia finale, fotorealistica e senza watermark.
 """.strip()
 
 
@@ -761,7 +706,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v11-realistic-damage-profiles",
+        "prompt_version": "damage-v9-full-image-protected-soft-composite",
     }
 
 
@@ -829,5 +774,5 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v11-realistic-damage-profiles",
+        "prompt_version": "damage-v9-full-image-protected-soft-composite",
     }
