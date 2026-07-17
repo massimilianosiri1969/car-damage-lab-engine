@@ -40,7 +40,7 @@ ALLOWED_ORIGINS = [
 
 app = FastAPI(
     title=APP_NAME,
-    version="0.5.0",
+    version="0.6.0",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -177,6 +177,13 @@ def build_prompt(
     area: int,
     user_instructions: str = "",
 ) -> str:
+    """
+    V10: controlla la severità effettiva inviata al modello.
+
+    L'interfaccia continua a usare -100..+100, ma il modello riceve una
+    richiesta attenuata per evitare pieghe eccessive e deformazioni strutturali
+    non realistiche nei valori bassi e medi.
+    """
     cleaned = user_instructions.strip()
     extra_instruction = ""
 
@@ -189,22 +196,71 @@ Applicala soltanto dentro la zona modificabile e senza violare i vincoli
 di conservazione elencati sotto.
 """.strip()
 
-    severity_text = severity_instruction(severity)
-    area_text = area_instruction(area)
+    effective_severity = round(severity * 0.45)
+
+    if abs(severity) <= 30:
+        damage_profile = (
+            "a mild, broad and shallow dent with smooth transitions, "
+            "without sharp folds or structural collapse"
+        )
+    elif abs(severity) <= 65:
+        damage_profile = (
+            "a medium collision dent with one or two realistic creases, "
+            "while preserving the overall shape of the panel"
+        )
+    else:
+        damage_profile = (
+            "a severe but physically plausible collision deformation with "
+            "deeper creases, without melted metal or decorative wrinkling"
+        )
+
+    if severity > 0:
+        severity_action = (
+            f"increase the visible damage moderately, using an effective "
+            f"severity of about +{abs(effective_severity)}%"
+        )
+    elif severity < 0:
+        severity_action = (
+            f"reduce the visible damage moderately, using an effective "
+            f"severity of about -{abs(effective_severity)}%"
+        )
+    else:
+        severity_action = "preserve the current damage severity"
+
+    if area > 0:
+        area_action = (
+            f"make the visible deformation slightly broader by about "
+            f"{abs(area)}%, but keep it inside the editable area"
+        )
+    elif area < 0:
+        area_action = (
+            f"make the visible deformation slightly narrower by about "
+            f"{abs(area)}%, while preserving natural panel continuity"
+        )
+    else:
+        area_action = "preserve the current visible damage footprint"
 
     return f"""
 Modifica fotografica automotive realistica.
 
 Obiettivo:
-- {severity_text}
-- {area_text}
+- {severity_action};
+- use this damage profile: {damage_profile};
+- {area_action}.
 
 {extra_instruction}
+
+Regole di severità:
+- for severity below 60%, create broad, shallow and smooth dents;
+- do not create sharp folds, torn-looking creases, collapsed wheel arches
+  or severe structural deformation at low or medium severity;
+- allow sharp creases only at very high severity;
+- keep the panel visually continuous and physically plausible.
 
 Vincoli:
 - conserva la stessa automobile, modello, colore, prospettiva e inquadratura;
 - modifica esclusivamente la lamiera selezionata;
-- crea pieghe e deformazioni fisicamente plausibili da urto reale;
+- crea deformazioni compatibili con lamiera automobilistica stampata;
 - mantieni continuità della lamiera, vernice, ombre e riflessi;
 - non creare metallo fuso, superfici plastiche, pieghe decorative,
   pannelli duplicati, oggetti sovrapposti o parti trasparenti;
@@ -706,7 +762,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v9-full-image-protected-soft-composite",
+        "prompt_version": "damage-v10-controlled-severity",
     }
 
 
@@ -774,5 +830,5 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v9-full-image-protected-soft-composite",
+        "prompt_version": "damage-v10-controlled-severity",
     }
