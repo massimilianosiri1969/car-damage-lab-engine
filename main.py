@@ -41,7 +41,7 @@ ALLOWED_ORIGINS = [
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.2.2.0",
+    version="1.2.2.1",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -244,6 +244,43 @@ def apply_area_percent_to_edit_mask(
         adjusted = binary
 
     return Image.fromarray(adjusted, mode="L")
+
+
+def area_transition_feather_px(
+    image_size: tuple[int, int],
+    area_percent: int,
+) -> int:
+    """
+    Calcola una sfumatura più ampia per le maschere ristrette.
+
+    Quando area_percent è negativo, l'erosione geometrica crea un bordo più netto.
+    Questo feather aggiuntivo rende la transizione tra lamiera sana e deformata
+    più progressiva, senza perdere il controllo reale dell'estensione.
+    """
+    area_percent = clamp_percentage(area_percent)
+    width, height = image_size
+    reference = min(width, height)
+
+    base = SOFT_COMPOSITE_FEATHER_PX
+
+    if area_percent >= 0:
+        return base
+
+    extra = round(reference * 0.012 * (abs(area_percent) / 100))
+    return max(base, min(28, base + extra))
+
+
+def area_transition_expansion_px(area_percent: int) -> int:
+    """
+    Mantiene il compositing leggermente più morbido dopo l'erosione,
+    evitando contorni visivamente tagliati.
+    """
+    area_percent = clamp_percentage(area_percent)
+
+    if area_percent >= 0:
+        return COMPOSITE_EXPANSION_PX
+
+    return max(COMPOSITE_EXPANSION_PX, 5)
 
 
 def alter_damage_area(mask: Image.Image, area_percent: int) -> Image.Image:
@@ -2079,6 +2116,11 @@ def edit_damage_base64(payload: DamageEditBase64Request):
             generated_bytes=generated_bytes,
             source_mask=effective_mask,
             protect_mask=protect_mask,
+            expansion_px=area_transition_expansion_px(area_percent),
+            feather_px=area_transition_feather_px(
+                source.size,
+                area_percent,
+            ),
         )
 
     else:
@@ -2178,6 +2220,11 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 generated_bytes=generated_bodywork,
                 source_mask=effective_bodywork_mask,
                 protect_mask=protect_mask,
+                expansion_px=area_transition_expansion_px(area_percent),
+                feather_px=area_transition_feather_px(
+                    current_image.size,
+                    area_percent,
+                ),
             )
             current_image = jpeg_bytes_to_rgb_image(bodywork_result)
             sequential_steps.append("bodywork")
@@ -2251,13 +2298,17 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v15.2.0-sequential-mixed-area-control",
+        "prompt_version": "damage-v15.2.1-soft-area-transition",
         "deformation_type": payload.deformation_type,
         "impact_direction": payload.impact_direction,
         "contact_traces_enabled": payload.contact_traces_enabled,
         "involved_components": payload.involved_components,
         "damage_mode": resolved_damage_mode,
-        "area_control": "geometric_mask_transform",
+        "area_control": "geometric_mask_transform_with_soft_transition",
+        "area_transition_feather_px": area_transition_feather_px(
+            source.size,
+            area_percent,
+        ),
         "mixed_strategy": (
             "sequential_per_component"
             if resolved_damage_mode == "mixed"
