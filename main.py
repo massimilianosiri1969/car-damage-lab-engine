@@ -41,7 +41,7 @@ ALLOWED_ORIGINS = [
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.2.1",
+    version="1.2.2",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -486,8 +486,16 @@ DYNAMIC_COMPONENT_DAMAGE_TEXT = {
             "an organic-looking interior, a black blob or a featureless dark shape."
         ),
         "partially_detached": (
-            "partially detach the mirror from the door while keeping the complete "
-            "assembly recognizable"
+            "partially detach the selected side mirror from the door while keeping "
+            "the complete mirror assembly fully visible and recognizable. Move and "
+            "rotate the mirror outward and slightly downward from its original "
+            "mounting position. Show a clear physical gap between the mounting base "
+            "and the door. Keep the housing, mirror body and mounting arm intact. "
+            "Where physically plausible, show broken mounting clips or a short "
+            "electrical cable. Preserve realistic scale, proportions and material "
+            "details. Do not shrink, compress, erase, flatten or collapse the mirror "
+            "into the mounting base. Do not make the mirror disappear and do not "
+            "replace it with a black shape or indistinct dark mass."
         ),
     },
 }
@@ -1653,7 +1661,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v15.1-side-mirror-housing-fix",
+        "prompt_version": "damage-v15.2-side-mirror-partial-detach-fix",
     }
 
 
@@ -1745,7 +1753,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v15.1-side-mirror-housing-fix",
+        "prompt_version": "damage-v15.2-side-mirror-partial-detach-fix",
         "deformation_type": payload.deformation_type,
         "impact_direction": payload.impact_direction,
         "contact_traces_enabled": payload.contact_traces_enabled,
