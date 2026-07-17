@@ -41,7 +41,7 @@ ALLOWED_ORIGINS = [
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.2.1.4",
+    version="1.2.1.5",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -406,12 +406,15 @@ DYNAMIC_COMPONENT_DAMAGE_TEXT = {
             "while preserving transparency, reflectors and the overall assembly"
         ),
         "cracked": (
-            "create exactly one main crack in the selected front headlight lens, "
-            "with no more than two or three short, thin secondary branches. Keep at "
-            "least 70 to 80 percent of the lens perfectly intact, clear and optically "
-            "unchanged. Do not add missing fragments, cloudy areas, widespread "
-            "distortion, dense crack networks, spiderweb patterns or shattered-glass "
-            "effects. Preserve the original reflector details and overall lamp shape"
+            "create exactly one main crack only on the outer transparent lens surface "
+            "of the selected front headlight, with no more than two or three short, "
+            "thin secondary branches. Keep at least 70 to 80 percent of the lens "
+            "perfectly intact, clear and optically unchanged. Preserve exactly the "
+            "internal reflectors, chrome elements, bulbs, optical chambers, internal "
+            "geometry, original lighting and reflections. Do not add missing "
+            "fragments, cloudy areas, widespread distortion, dense crack networks, "
+            "spiderweb patterns or shattered-glass effects. Do not warp, melt, blur, "
+            "cloud, redesign or alter the internal headlight structure"
         ),
         "broken": (
             "break the selected front headlight lens in a clearly visible but still "
@@ -441,12 +444,15 @@ DYNAMIC_COMPONENT_DAMAGE_TEXT = {
             "preserving colour, transparency and reflector details"
         ),
         "cracked": (
-            "create exactly one main crack in the selected rear light lens, with no "
-            "more than two or three short, thin secondary branches. Keep at least "
-            "70 to 80 percent of the lens perfectly intact, clear and unchanged. Do "
-            "not add missing fragments, cloudy areas, dense crack networks, spiderweb "
-            "patterns or shattered-glass effects. Preserve the original colour, "
-            "reflector details and overall lamp shape"
+            "create exactly one main crack only on the outer transparent lens surface "
+            "of the selected rear light, with no more than two or three short, thin "
+            "secondary branches. Keep at least 70 to 80 percent of the lens perfectly "
+            "intact, clear and unchanged. Preserve exactly the internal reflectors, "
+            "colour sections, bulbs, optical chambers, internal geometry, original "
+            "lighting and reflections. Do not add missing fragments, cloudy areas, "
+            "dense crack networks, spiderweb patterns or shattered-glass effects. "
+            "Do not warp, melt, blur, cloud, redesign or alter the internal rear-light "
+            "structure"
         ),
         "broken": (
             "break the selected rear light lens in a clearly visible but localized "
@@ -918,6 +924,9 @@ Component-only rules:
 - for lights and glass, strictly distinguish between cracked, broken and shattered:
   cracked means exactly one main crack, at most two or three short branches, no
   missing fragments and at least 70 to 80 percent of the lens perfectly intact;
+  for cracked lights, alter only the outer transparent lens surface and preserve
+  exactly all internal reflectors, bulbs, chrome elements, optical chambers,
+  internal geometry, lighting and reflections;
   broken means several cracks plus one or two small missing fragments;
   shattered means dense cracking across most of the lens with multiple fragments;
 - show realistic plastic, glass, metal, mounting points and material thickness;
@@ -1792,7 +1801,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v15.1.4-light-crack-control",
+        "prompt_version": "damage-v15.1.5-headlight-internal-preservation",
     }
 
 
@@ -1884,7 +1893,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v15.1.4-light-crack-control",
+        "prompt_version": "damage-v15.1.5-headlight-internal-preservation",
         "deformation_type": payload.deformation_type,
         "impact_direction": payload.impact_direction,
         "contact_traces_enabled": payload.contact_traces_enabled,
