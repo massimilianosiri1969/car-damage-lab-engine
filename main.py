@@ -41,7 +41,7 @@ ALLOWED_ORIGINS = [
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.1.1",
+    version="1.2.0",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -65,6 +65,13 @@ class DamageEditBase64Request(BaseModel):
     severity_percent: int = Field(..., ge=-100, le=100)
     area_percent: int = Field(..., ge=-100, le=100)
     output_quality: Literal["low", "medium", "high", "auto"] = "medium"
+
+    damage_mode: Literal[
+        "auto",
+        "bodywork",
+        "component_only",
+        "mixed",
+    ] = "auto"
 
     deformation_type: Literal[
         "dent",
@@ -436,11 +443,45 @@ DYNAMIC_COMPONENT_DAMAGE_TEXT = {
         "scratched": "scratch the roof",
     },
     "side_mirror": {
-        "scratched": "scratch the side mirror",
-        "cracked": "crack the side mirror housing or glass",
-        "broken": "break the side mirror realistically",
-        "detached": "detach the side mirror",
-        "hanging": "make the side mirror hang from its mounting",
+        "scratched": (
+            "add realistic scratches to the selected side mirror while keeping "
+            "the mirror assembly, glass and mounting recognizable"
+        ),
+        "cracked": (
+            "create realistic cracks in the mirror glass or outer housing, "
+            "without turning the mirror into a black silhouette"
+        ),
+        "broken": (
+            "break the painted outer housing with realistic cracks and limited "
+            "missing fragments; keep the mirror glass, mounting base and internal "
+            "mechanism recognizable; do not erase the mirror and do not replace it "
+            "with a black blob"
+        ),
+        "detached": (
+            "partially detach the mirror assembly from its mounting base; keep the "
+            "mirror recognizable and naturally displaced; show the mounting point "
+            "and, where plausible, a short electrical cable; do not create a black "
+            "hole or completely erase the mirror"
+        ),
+        "hanging": (
+            "make the mirror assembly hang naturally from its mounting or cable, "
+            "while preserving recognizable glass, housing and attachment details"
+        ),
+        "glass_cracked": (
+            "crack only the mirror glass while preserving the outer housing"
+        ),
+        "glass_shattered": (
+            "shatter the mirror glass with realistic fragments remaining in the "
+            "housing; preserve the housing and mounting"
+        ),
+        "housing_broken": (
+            "break the painted mirror housing with realistic plastic edges and "
+            "material thickness; preserve the mirror glass and mounting base"
+        ),
+        "partially_detached": (
+            "partially detach the mirror from the door while keeping the complete "
+            "assembly recognizable"
+        ),
     },
 }
 
@@ -448,6 +489,68 @@ DYNAMIC_COMPONENT_DAMAGE_TEXT = {
 
 def component_is_enabled(components: dict[str, bool], *names: str) -> bool:
     return any(bool(components.get(name, False)) for name in names)
+
+
+BODYWORK_COMPONENT_CODES = {
+    "bodyPanel",
+    "body_panel",
+    "front_fender",
+    "rear_fender",
+    "hood",
+    "tailgate",
+    "front_door",
+    "rear_door",
+    "wheel_arch",
+    "roof",
+}
+
+NON_BODY_COMPONENT_CODES = {
+    "front_headlight",
+    "rear_light",
+    "front_bumper",
+    "rear_bumper",
+    "wheel",
+    "windshield",
+    "rear_window",
+    "side_window",
+    "side_mirror",
+}
+
+
+def infer_damage_mode(payload: DamageEditBase64Request) -> str:
+    if payload.damage_mode != "auto":
+        return payload.damage_mode
+
+    selected = {
+        code
+        for code, enabled in (payload.involved_components or {}).items()
+        if bool(enabled)
+    }
+
+    has_bodywork = bool(selected & BODYWORK_COMPONENT_CODES)
+    has_non_body = bool(selected & NON_BODY_COMPONENT_CODES)
+
+    if has_bodywork and has_non_body:
+        return "mixed"
+    if has_non_body and not has_bodywork:
+        return "component_only"
+    return "bodywork"
+
+
+def has_component_damage_request(payload: DamageEditBase64Request) -> bool:
+    return any(
+        bool(value)
+        for value in (payload.component_damage_types or {}).values()
+    ) or any(
+        bool(value)
+        for value in (
+            payload.hood_damage_type,
+            payload.headlight_damage_type,
+            payload.bumper_damage_type,
+            payload.wheel_damage_type,
+            payload.glass_damage_type,
+        )
+    )
 
 
 def build_component_instructions(payload: DamageEditBase64Request) -> str:
@@ -633,48 +736,110 @@ def build_contact_trace_instructions(
 def build_prompt(
     severity: int,
     area: int,
+    damage_mode: str = "bodywork",
     deformation_type: str = "dent",
     impact_direction: str = "frontal",
     component_instructions: str = "",
     contact_trace_instructions: str = "",
 ) -> str:
+    direction_text = IMPACT_DIRECTION_INSTRUCTIONS.get(
+        impact_direction,
+        IMPACT_DIRECTION_INSTRUCTIONS["frontal"],
+    )
+
+    common_constraints = """
+General constraints:
+- preserve the same vehicle, model, colour, perspective and framing;
+- modify only areas permitted by the editable mask;
+- the protected mask has absolute priority;
+- preserve all non-involved components and everything outside the editable mask;
+- maintain realistic materials, edges, thickness, shadows and reflections;
+- do not create black blobs, black silhouettes, featureless patches,
+  liquid surfaces, duplicated objects, pasted shapes or transparent bodywork;
+- return the complete final photograph, photorealistic and without watermark.
+""".strip()
+
+    if damage_mode == "component_only":
+        intensity = abs(severity)
+        intensity_text = (
+            "light"
+            if intensity <= 30
+            else "moderate"
+            if intensity <= 65
+            else "strong but physically plausible"
+        )
+
+        return f"""
+Realistic automotive COMPONENT repair-estimate simulation.
+
+This is a component-only edit. Do not apply body-panel dent logic.
+
+Requested component damage:
+{component_instructions}
+
+Impact:
+- {direction_text}
+- damage intensity: {intensity_text} ({severity:+d}% reference).
+
+Contact traces:
+{contact_trace_instructions or "Do not add contact traces."}
+
+Component-only rules:
+- execute the selected component damage literally and locally;
+- keep the damaged component recognizable unless the selected damage explicitly
+  requests missing or detached parts;
+- show realistic plastic, glass, metal, mounting points and material thickness;
+- when breaking or detaching a component, preserve believable attachment details;
+- do not add dents, folds or crushed sheet metal unless bodywork is also selected;
+- do not interpret broken or detached as a solid black shape or erased area.
+
+{common_constraints}
+""".strip()
+
     severity_text = severity_instruction(severity)
     area_text = area_instruction(area)
     deformation_text = DEFORMATION_INSTRUCTIONS.get(
         deformation_type,
         DEFORMATION_INSTRUCTIONS["dent"],
     )
-    direction_text = IMPACT_DIRECTION_INSTRUCTIONS.get(
-        impact_direction,
-        IMPACT_DIRECTION_INSTRUCTIONS["frontal"],
-    )
+
+    if damage_mode == "mixed":
+        mode_heading = (
+            "This is a mixed edit: apply bodywork deformation only to selected "
+            "sheet-metal components, and apply each specific component instruction "
+            "to its corresponding selected component."
+        )
+    else:
+        mode_heading = (
+            "This is a bodywork edit. Apply deformation only to selected "
+            "sheet-metal components."
+        )
 
     return f"""
-Realistic automotive photo editing.
+Realistic automotive collision photo editing.
 
-Objective:
+{mode_heading}
+
+Bodywork objective:
 - {severity_text}
 - {area_text}
 - {deformation_text}
 - {direction_text}
 
-Component rules:
+Specific component rules:
 {component_instructions or "Modify only the selected painted body panel."}
 
 Contact traces:
 {contact_trace_instructions or "Do not add contact traces."}
 
-General constraints:
-- preserve the same vehicle, model, colour, perspective and framing;
-- modify only areas permitted by the editable mask;
-- the protected mask has absolute priority and must remain pixel-consistent
-  with the source photograph;
-- create physically plausible automotive collision damage;
-- keep paint, shadows and reflections coherent with the new geometry;
-- do not create melted metal, liquid surfaces, decorative wrinkles,
-  duplicated panels, pasted objects or transparent bodywork;
-- preserve all non-involved components and everything outside the editable mask;
-- return the complete final photograph, photorealistic and without watermark.
+Bodywork rules:
+- keep deformation concentrated in the selected sheet-metal area;
+- create physically plausible stamped-metal damage;
+- maintain coherent paint, panel edges, shadows and reflections;
+- do not apply dent, crease or crush logic to glass, lights, mirrors or wheels;
+- in mixed mode, execute non-body component damage separately and literally.
+
+{common_constraints}
 """.strip()
 
 
@@ -1436,9 +1601,9 @@ async def edit_damage(
 
     job_id = str(uuid.uuid4())
     prompt = build_prompt(
-        severity_percent,
-        area_percent,
-        "",
+        severity=severity_percent,
+        area=area_percent,
+        damage_mode="bodywork",
     )
 
     if os.getenv("MOCK_MODE", "false").lower() == "true":
@@ -1481,7 +1646,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v14-component-analysis",
+        "prompt_version": "damage-v15-damage-modes",
     }
 
 
@@ -1519,9 +1684,12 @@ def edit_damage_base64(payload: DamageEditBase64Request):
     api_mask = alter_damage_area(source_mask, 0)
 
     job_id = str(uuid.uuid4())
+    resolved_damage_mode = infer_damage_mode(payload)
+
     prompt = build_prompt(
         severity=severity_percent,
         area=area_percent,
+        damage_mode=resolved_damage_mode,
         deformation_type=payload.deformation_type,
         impact_direction=payload.impact_direction,
         component_instructions=build_component_instructions(payload),
@@ -1542,6 +1710,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         and area_percent == 0
         and payload.deformation_type == "dent"
         and not payload.contact_traces_enabled
+        and not has_component_damage_request(payload)
     ):
         buffer = io.BytesIO()
         source.save(buffer, format="JPEG", quality=95, subsampling=0)
@@ -1569,11 +1738,12 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v14-component-analysis",
+        "prompt_version": "damage-v15-damage-modes",
         "deformation_type": payload.deformation_type,
         "impact_direction": payload.impact_direction,
         "contact_traces_enabled": payload.contact_traces_enabled,
         "involved_components": payload.involved_components,
+        "damage_mode": resolved_damage_mode,
     }
 
 
