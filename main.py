@@ -41,7 +41,7 @@ ALLOWED_ORIGINS = [
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.2.0",
+    version="1.2.1",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -475,8 +475,15 @@ DYNAMIC_COMPONENT_DAMAGE_TEXT = {
             "housing; preserve the housing and mounting"
         ),
         "housing_broken": (
-            "break the painted mirror housing with realistic plastic edges and "
-            "material thickness; preserve the mirror glass and mounting base"
+            "break only the painted outer plastic housing of the selected side "
+            "mirror. Show visible cracked plastic edges, realistic plastic "
+            "thickness, one or two missing housing fragments, scratches and "
+            "fracture lines, with the internal support structure only partially "
+            "visible. Keep the mirror glass opaque, reflective and recognizable. "
+            "Keep the mounting base attached and preserve the original size, "
+            "position and orientation of the mirror assembly. Do not create "
+            "transparent or translucent plastic, melted material, an empty shell, "
+            "an organic-looking interior, a black blob or a featureless dark shape."
         ),
         "partially_detached": (
             "partially detach the mirror from the door while keeping the complete "
@@ -1646,7 +1653,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v15-damage-modes",
+        "prompt_version": "damage-v15.1-side-mirror-housing-fix",
     }
 
 
@@ -1738,7 +1745,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v15-damage-modes",
+        "prompt_version": "damage-v15.1-side-mirror-housing-fix",
         "deformation_type": payload.deformation_type,
         "impact_direction": payload.impact_direction,
         "contact_traces_enabled": payload.contact_traces_enabled,
