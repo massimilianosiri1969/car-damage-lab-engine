@@ -40,7 +40,7 @@ ALLOWED_ORIGINS = [
 
 app = FastAPI(
     title=APP_NAME,
-    version="0.8.0",
+    version="0.5.0",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -588,7 +588,6 @@ def call_openai_image_edit(
             prompt=prompt,
             quality=quality,
             size="auto",
-            input_fidelity="high",
             output_format="jpeg",
             output_compression=92,
             n=1,
@@ -707,7 +706,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v12-high-input-fidelity",
+        "prompt_version": "damage-v9-full-image-protected-soft-composite",
     }
 
 
@@ -775,5 +774,5 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v12-high-input-fidelity",
+        "prompt_version": "damage-v9-full-image-protected-soft-composite",
     }
