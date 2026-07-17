@@ -41,7 +41,7 @@ ALLOWED_ORIGINS = [
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.1.0",
+    version="1.1.1",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -297,73 +297,6 @@ VEHICLE_COMPONENT_CATALOG = {
     "side_mirror": "Specchietto",
 }
 
-DYNAMIC_COMPONENT_DAMAGE_TEXT = {
-    "front_fender": {
-        "dented": "dent the front fender",
-        "creased": "create a realistic crease in the front fender",
-        "crushed": "crush the selected portion of the front fender",
-        "scratched": "scratch the front fender",
-        "torn": "tear the selected edge of the front fender realistically",
-    },
-    "rear_fender": {
-        "dented": "dent the rear fender",
-        "creased": "create a realistic crease in the rear fender",
-        "crushed": "crush the selected portion of the rear fender",
-        "scratched": "scratch the rear fender",
-        "torn": "tear the selected edge of the rear fender realistically",
-    },
-    "front_headlight": COMPONENT_DAMAGE_TEXT["headlight"],
-    "rear_light": COMPONENT_DAMAGE_TEXT["headlight"],
-    "front_bumper": COMPONENT_DAMAGE_TEXT["bumper"],
-    "rear_bumper": COMPONENT_DAMAGE_TEXT["bumper"],
-    "hood": COMPONENT_DAMAGE_TEXT["hood"],
-    "tailgate": {
-        "dented": "dent the tailgate",
-        "edge_bent": "bend the selected tailgate edge",
-        "misaligned": "misalign the tailgate along the affected seam",
-        "partially_open": "make the tailgate appear partially open from impact",
-        "severely_deformed": "severely deform the selected tailgate area",
-    },
-    "front_door": {
-        "dented": "dent the front door",
-        "creased": "create a realistic crease in the front door",
-        "scratched": "scratch the front door",
-        "misaligned": "misalign the front door along the affected seam",
-        "jammed": "make the front door appear jammed by the collision",
-    },
-    "rear_door": {
-        "dented": "dent the rear door",
-        "creased": "create a realistic crease in the rear door",
-        "scratched": "scratch the rear door",
-        "misaligned": "misalign the rear door along the affected seam",
-        "jammed": "make the rear door appear jammed by the collision",
-    },
-    "wheel_arch": {
-        "dented": "dent the wheel arch",
-        "creased": "create a realistic crease in the wheel arch",
-        "crushed": "crush the selected wheel arch area",
-        "scratched": "scratch the wheel arch",
-    },
-    "wheel": COMPONENT_DAMAGE_TEXT["wheel"],
-    "windshield": COMPONENT_DAMAGE_TEXT["glass"],
-    "rear_window": COMPONENT_DAMAGE_TEXT["glass"],
-    "side_window": COMPONENT_DAMAGE_TEXT["glass"],
-    "roof": {
-        "dented": "dent the roof",
-        "creased": "create a realistic crease in the roof",
-        "crushed": "crush the selected roof area",
-        "scratched": "scratch the roof",
-    },
-    "side_mirror": {
-        "scratched": "scratch the side mirror",
-        "cracked": "crack the side mirror housing or glass",
-        "broken": "break the side mirror realistically",
-        "detached": "detach the side mirror",
-        "hanging": "make the side mirror hang from its mounting",
-    },
-}
-
-
 DEFORMATION_INSTRUCTIONS = {
     "dent": (
         "Create a localized inward dent with realistic depth and continuous "
@@ -444,6 +377,73 @@ COMPONENT_DAMAGE_TEXT = {
         "shattered": "shatter the selected glass realistically",
     },
 }
+
+DYNAMIC_COMPONENT_DAMAGE_TEXT = {
+    "front_fender": {
+        "dented": "dent the front fender",
+        "creased": "create a realistic crease in the front fender",
+        "crushed": "crush the selected portion of the front fender",
+        "scratched": "scratch the front fender",
+        "torn": "tear the selected edge of the front fender realistically",
+    },
+    "rear_fender": {
+        "dented": "dent the rear fender",
+        "creased": "create a realistic crease in the rear fender",
+        "crushed": "crush the selected portion of the rear fender",
+        "scratched": "scratch the rear fender",
+        "torn": "tear the selected edge of the rear fender realistically",
+    },
+    "front_headlight": COMPONENT_DAMAGE_TEXT["headlight"],
+    "rear_light": COMPONENT_DAMAGE_TEXT["headlight"],
+    "front_bumper": COMPONENT_DAMAGE_TEXT["bumper"],
+    "rear_bumper": COMPONENT_DAMAGE_TEXT["bumper"],
+    "hood": COMPONENT_DAMAGE_TEXT["hood"],
+    "tailgate": {
+        "dented": "dent the tailgate",
+        "edge_bent": "bend the selected tailgate edge",
+        "misaligned": "misalign the tailgate along the affected seam",
+        "partially_open": "make the tailgate appear partially open from impact",
+        "severely_deformed": "severely deform the selected tailgate area",
+    },
+    "front_door": {
+        "dented": "dent the front door",
+        "creased": "create a realistic crease in the front door",
+        "scratched": "scratch the front door",
+        "misaligned": "misalign the front door along the affected seam",
+        "jammed": "make the front door appear jammed by the collision",
+    },
+    "rear_door": {
+        "dented": "dent the rear door",
+        "creased": "create a realistic crease in the rear door",
+        "scratched": "scratch the rear door",
+        "misaligned": "misalign the rear door along the affected seam",
+        "jammed": "make the rear door appear jammed by the collision",
+    },
+    "wheel_arch": {
+        "dented": "dent the wheel arch",
+        "creased": "create a realistic crease in the wheel arch",
+        "crushed": "crush the selected wheel arch area",
+        "scratched": "scratch the wheel arch",
+    },
+    "wheel": COMPONENT_DAMAGE_TEXT["wheel"],
+    "windshield": COMPONENT_DAMAGE_TEXT["glass"],
+    "rear_window": COMPONENT_DAMAGE_TEXT["glass"],
+    "side_window": COMPONENT_DAMAGE_TEXT["glass"],
+    "roof": {
+        "dented": "dent the roof",
+        "creased": "create a realistic crease in the roof",
+        "crushed": "crush the selected roof area",
+        "scratched": "scratch the roof",
+    },
+    "side_mirror": {
+        "scratched": "scratch the side mirror",
+        "cracked": "crack the side mirror housing or glass",
+        "broken": "break the side mirror realistically",
+        "detached": "detach the side mirror",
+        "hanging": "make the side mirror hang from its mounting",
+    },
+}
+
 
 
 def component_is_enabled(components: dict[str, bool], *names: str) -> bool:
@@ -1411,7 +1411,7 @@ def analyze_vehicle_components(payload: VehicleAnalyzeRequest):
             "OPENAI_VISION_MODEL",
             "gpt-4.1-mini",
         ),
-        "analysis_version": "vehicle-components-v1",
+        "analysis_version": "vehicle-components-v1.1",
     }
 
 
