@@ -41,7 +41,7 @@ ALLOWED_ORIGINS = [
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.2.1.1",
+    version="1.2.1.3",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -400,8 +400,70 @@ DYNAMIC_COMPONENT_DAMAGE_TEXT = {
         "scratched": "scratch the rear fender",
         "torn": "tear the selected edge of the rear fender realistically",
     },
-    "front_headlight": COMPONENT_DAMAGE_TEXT["headlight"],
-    "rear_light": COMPONENT_DAMAGE_TEXT["headlight"],
+    "front_headlight": {
+        "scratched": (
+            "add light superficial scratches to the selected front headlight lens "
+            "while preserving transparency, reflectors and the overall assembly"
+        ),
+        "cracked": (
+            "create one or two primary cracks in the selected front headlight lens, "
+            "with only a few thin secondary branches. Keep at least half of the lens "
+            "visibly intact and clear. Do not create a full spiderweb pattern, do not "
+            "shatter the whole lens and do not remove fragments"
+        ),
+        "broken": (
+            "break the selected front headlight lens in a clearly visible but still "
+            "localized way. Show several intersecting cracks and one or two small "
+            "missing fragments, while keeping the housing, reflector geometry and "
+            "most of the optical assembly recognizable. Do not turn the entire lamp "
+            "into uniformly shattered glass"
+        ),
+        "shattered": (
+            "heavily shatter most of the selected front headlight lens with dense "
+            "crack networks, multiple missing fragments and exposed internal optical "
+            "elements, while preserving the overall lamp housing position"
+        ),
+        "partially_missing": (
+            "remove a limited portion of the selected front headlight lens, with "
+            "realistic broken edges and visible internal optical elements, while "
+            "preserving the rest of the lamp assembly"
+        ),
+        "detached": (
+            "displace the selected front headlight slightly from its mounting while "
+            "keeping the complete assembly recognizable and connected to the vehicle"
+        ),
+    },
+    "rear_light": {
+        "scratched": (
+            "add light superficial scratches to the selected rear light lens while "
+            "preserving colour, transparency and reflector details"
+        ),
+        "cracked": (
+            "create one or two primary cracks in the selected rear light lens, with "
+            "only a few thin secondary branches. Keep at least half of the lens "
+            "visibly intact. Do not create a full spiderweb pattern and do not remove "
+            "fragments"
+        ),
+        "broken": (
+            "break the selected rear light lens in a clearly visible but localized "
+            "way. Show several intersecting cracks and one or two small missing "
+            "fragments while preserving the housing and most of the light assembly"
+        ),
+        "shattered": (
+            "heavily shatter most of the selected rear light lens with dense crack "
+            "networks, multiple missing fragments and visible internal reflectors, "
+            "while preserving the overall housing position"
+        ),
+        "partially_missing": (
+            "remove a limited portion of the selected rear light lens, with realistic "
+            "broken edges and exposed internal reflectors, while preserving the rest "
+            "of the assembly"
+        ),
+        "detached": (
+            "displace the selected rear light slightly from its mounting while "
+            "keeping the complete assembly recognizable"
+        ),
+    },
     "front_bumper": COMPONENT_DAMAGE_TEXT["bumper"],
     "rear_bumper": COMPONENT_DAMAGE_TEXT["bumper"],
     "hood": COMPONENT_DAMAGE_TEXT["hood"],
@@ -849,6 +911,10 @@ Component-only rules:
 - execute the selected component damage literally and locally;
 - keep the damaged component recognizable unless the selected damage explicitly
   requests missing or detached parts;
+- for lights and glass, strictly distinguish between cracked, broken and shattered:
+  cracked means limited crack lines with most of the lens intact;
+  broken means several cracks plus one or two small missing fragments;
+  shattered means dense cracking across most of the lens with multiple fragments;
 - show realistic plastic, glass, metal, mounting points and material thickness;
 - when breaking or detaching a component, preserve believable attachment details;
 - do not add dents, folds or crushed sheet metal unless bodywork is also selected;
@@ -1721,7 +1787,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v15.1.1-bodywork-geometry-control",
+        "prompt_version": "damage-v15.1.3-headlight-damage-levels",
     }
 
 
@@ -1813,7 +1879,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v15.1.1-bodywork-geometry-control",
+        "prompt_version": "damage-v15.1.3-headlight-damage-levels",
         "deformation_type": payload.deformation_type,
         "impact_direction": payload.impact_direction,
         "contact_traces_enabled": payload.contact_traces_enabled,
