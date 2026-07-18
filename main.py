@@ -41,7 +41,7 @@ ALLOWED_ORIGINS = [
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.6.0.1",
+    version="1.6.0.2",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -428,6 +428,20 @@ SMART_COMPOSITE_PYRAMID_LEVELS = max(
 SMART_COMPOSITE_COLOR_STRENGTH = max(
     0.0,
     min(1.0, float(os.getenv("SMART_COMPOSITE_COLOR_STRENGTH", "0.72"))),
+)
+
+
+ANALYSIS_MAX_SIDE = max(
+    640,
+    min(1600, int(os.getenv("ANALYSIS_MAX_SIDE", "1024"))),
+)
+SEGMENTATION_GRABCUT_MAX_SIDE = max(
+    480,
+    min(1280, int(os.getenv("SEGMENTATION_GRABCUT_MAX_SIDE", "768"))),
+)
+SMART_COMPOSITE_MAX_SIDE = max(
+    720,
+    min(2048, int(os.getenv("SMART_COMPOSITE_MAX_SIDE", "1400"))),
 )
 
 DEFORMATION_INSTRUCTIONS = {
@@ -1779,14 +1793,6 @@ def smart_component_composite(
     expansion_px: int = COMPOSITE_EXPANSION_PX,
     feather_px: int = SOFT_COMPOSITE_FEATHER_PX,
 ) -> bytes:
-    """
-    V16 Smart Composite:
-    - limita la modifica alla maschera autorizzata;
-    - riallinea localmente colore e luminosità;
-    - mantiene nitido il centro;
-    - fonde i bordi tramite blending multibanda;
-    - riapplica in modo assoluto la maschera protetta.
-    """
     if not SMART_COMPOSITE_ENABLED:
         return protected_soft_composite(
             source=source,
@@ -1804,17 +1810,45 @@ def smart_component_composite(
             detail="Il risultato generato non è un'immagine valida.",
         )
 
-    generated = generated.resize(source.size, Image.Resampling.LANCZOS)
+    original_size = source.size
 
-    source_rgb = np.array(source.convert("RGB"))
-    generated_rgb = np.array(generated.convert("RGB"))
-
-    mask = resize_mask(source_mask.convert("L"), source.size)
-    mask_binary = mask_to_binary(mask)
+    work_source, scale = resize_image_for_processing(
+        source.convert("RGB"),
+        SMART_COMPOSITE_MAX_SIDE,
+    )
+    work_generated = generated.resize(
+        work_source.size,
+        Image.Resampling.LANCZOS,
+    )
+    work_mask = resize_mask(
+        source_mask.convert("L"),
+        work_source.size,
+    )
 
     if protect_mask is not None:
-        protect = resize_mask(protect_mask.convert("L"), source.size)
-        protect_binary = mask_to_binary(protect)
+        work_protect = resize_mask(
+            protect_mask.convert("L"),
+            work_source.size,
+        )
+    else:
+        work_protect = None
+
+    adjusted_expansion = max(
+        0,
+        round(expansion_px * scale),
+    )
+    adjusted_feather = max(
+        2,
+        round(feather_px * scale),
+    )
+
+    source_rgb = np.asarray(work_source, dtype=np.uint8)
+    generated_rgb = np.asarray(work_generated, dtype=np.uint8)
+
+    mask_binary = mask_to_binary(work_mask)
+
+    if work_protect is not None:
+        protect_binary = mask_to_binary(work_protect)
         mask_binary = cv2.bitwise_and(
             mask_binary,
             cv2.bitwise_not(protect_binary),
@@ -1822,15 +1856,15 @@ def smart_component_composite(
     else:
         protect_binary = np.zeros_like(mask_binary)
 
-    if expansion_px > 0:
-        kernel_size = max(3, expansion_px * 2 + 1)
+    if adjusted_expansion > 0:
+        kernel_size = max(3, adjusted_expansion * 2 + 1)
         expanded = cv2.dilate(
             mask_binary,
             np.ones((kernel_size, kernel_size), np.uint8),
             iterations=1,
         )
     else:
-        expanded = mask_binary
+        expanded = mask_binary.copy()
 
     expanded = cv2.bitwise_and(
         expanded,
@@ -1849,42 +1883,66 @@ def smart_component_composite(
         expanded,
     )
 
-    # Alpha: pieno al centro, transizione progressiva soltanto sul bordo.
     distance_inside = cv2.distanceTransform(
         np.where(expanded > 0, 255, 0).astype(np.uint8),
         cv2.DIST_L2,
         5,
     )
 
-    feather = max(2.0, float(feather_px))
+    feather = max(2.0, float(adjusted_feather))
     alpha = np.clip(distance_inside / feather, 0.0, 1.0)
 
-    # Mantiene il centro completamente generato.
     alpha[mask_binary > 0] = np.maximum(
         alpha[mask_binary > 0],
         0.92,
     )
 
-    # Leggerissima sfumatura per eliminare scalettature senza creare una toppa.
-    alpha = cv2.GaussianBlur(alpha, (0, 0), sigmaX=1.25)
+    alpha = cv2.GaussianBlur(
+        alpha,
+        (0, 0),
+        sigmaX=1.0,
+    )
     alpha[protect_binary > 0] = 0.0
 
     blended = _laplacian_pyramid_blend(
         source_rgb,
         corrected_generated,
         alpha,
+        levels=SMART_COMPOSITE_PYRAMID_LEVELS,
     )
-
-    # Garanzia assoluta: ogni pixel protetto torna identico all'originale.
     blended[protect_binary > 0] = source_rgb[protect_binary > 0]
 
+    work_result = Image.fromarray(blended, mode="RGB")
+
+    if work_result.size != original_size:
+        work_result = work_result.resize(
+            original_size,
+            Image.Resampling.LANCZOS,
+        )
+
     output = io.BytesIO()
-    Image.fromarray(blended, mode="RGB").save(
+    work_result.save(
         output,
         format="JPEG",
-        quality=95,
+        quality=94,
         subsampling=0,
     )
+
+    del generated
+    del work_source
+    del work_generated
+    del work_mask
+    del source_rgb
+    del generated_rgb
+    del mask_binary
+    del protect_binary
+    del expanded
+    del corrected_generated
+    del distance_inside
+    del alpha
+    del blended
+    del work_result
+
     return output.getvalue()
 
 
@@ -1965,6 +2023,55 @@ def health():
     }
 
 
+
+
+
+def resize_image_for_processing(
+    image: Image.Image,
+    max_side: int,
+) -> tuple[Image.Image, float]:
+    width, height = image.size
+    current_max = max(width, height)
+
+    if current_max <= max_side:
+        return image.copy(), 1.0
+
+    scale = max_side / float(current_max)
+    resized = image.resize(
+        (
+            max(1, round(width * scale)),
+            max(1, round(height * scale)),
+        ),
+        Image.Resampling.LANCZOS,
+    )
+    return resized, scale
+
+
+def scale_polygon_points(
+    points: list[tuple[int, int]],
+    scale: float,
+) -> list[tuple[int, int]]:
+    if scale == 1.0:
+        return list(points)
+    return [
+        (
+            max(0, round(x * scale)),
+            max(0, round(y * scale)),
+        )
+        for x, y in points
+    ]
+
+
+def upscale_mask_to_original(
+    mask: Image.Image,
+    original_size: tuple[int, int],
+) -> Image.Image:
+    if mask.size == original_size:
+        return mask.convert("L")
+    return mask.convert("L").resize(
+        original_size,
+        Image.Resampling.NEAREST,
+    )
 
 
 def component_category(code: str) -> str:
@@ -2076,22 +2183,35 @@ def refine_mask_with_grabcut(
     if not SEGMENTATION_GRABCUT_ENABLED:
         return clean_component_mask(initial_mask)
 
-    rgb = np.array(source.convert("RGB"))
-    initial = mask_to_binary(initial_mask)
+    reduced_source, scale = resize_image_for_processing(
+        source.convert("RGB"),
+        SEGMENTATION_GRABCUT_MAX_SIDE,
+    )
+
+    reduced_mask = initial_mask.convert("L")
+    if scale != 1.0:
+        reduced_mask = reduced_mask.resize(
+            reduced_source.size,
+            Image.Resampling.NEAREST,
+        )
+
+    rgb = np.asarray(reduced_source, dtype=np.uint8)
+    initial = mask_to_binary(reduced_mask)
 
     if int((initial > 0).sum()) < 64:
-        return clean_component_mask(initial_mask)
+        result = clean_component_mask(reduced_mask)
+        return upscale_mask_to_original(result, source.size)
 
     grabcut_mask = np.full(initial.shape, cv2.GC_BGD, dtype=np.uint8)
 
     probable_fg = cv2.dilate(
         initial,
-        np.ones((9, 9), np.uint8),
+        np.ones((7, 7), np.uint8),
         iterations=1,
     )
     sure_fg = cv2.erode(
         initial,
-        np.ones((5, 5), np.uint8),
+        np.ones((3, 3), np.uint8),
         iterations=1,
     )
 
@@ -2100,7 +2220,7 @@ def refine_mask_with_grabcut(
 
     probable_bg = cv2.dilate(
         probable_fg,
-        np.ones((31, 31), np.uint8),
+        np.ones((21, 21), np.uint8),
         iterations=1,
     )
     grabcut_mask[probable_bg == 0] = cv2.GC_BGD
@@ -2109,13 +2229,15 @@ def refine_mask_with_grabcut(
     foreground_model = np.zeros((1, 65), np.float64)
 
     try:
+        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+
         cv2.grabCut(
-            cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
+            bgr,
             grabcut_mask,
             None,
             background_model,
             foreground_model,
-            3,
+            2,
             cv2.GC_INIT_WITH_MASK,
         )
 
@@ -2126,21 +2248,39 @@ def refine_mask_with_grabcut(
             0,
         ).astype(np.uint8)
 
-        # Non permettere al raffinamento di allontanarsi troppo dal poligono.
         allowed = cv2.dilate(
             initial,
-            np.ones((21, 21), np.uint8),
+            np.ones((15, 15), np.uint8),
             iterations=1,
         )
         refined = cv2.bitwise_and(refined, allowed)
 
-        if int((refined > 0).sum()) < max(32, int((initial > 0).sum() * 0.25)):
+        if int((refined > 0).sum()) < max(
+            32,
+            int((initial > 0).sum() * 0.25),
+        ):
             refined = initial
 
-        return clean_component_mask(Image.fromarray(refined, mode="L"))
+        cleaned = clean_component_mask(
+            Image.fromarray(refined, mode="L")
+        )
+        return upscale_mask_to_original(cleaned, source.size)
 
     except Exception:
-        return clean_component_mask(initial_mask)
+        cleaned = clean_component_mask(reduced_mask)
+        return upscale_mask_to_original(cleaned, source.size)
+
+    finally:
+        del rgb
+        del initial
+        del grabcut_mask
+        del probable_fg
+        del sure_fg
+        del probable_bg
+        del background_model
+        del foreground_model
+        if "bgr" in locals():
+            del bgr
 
 
 def build_component_segmentation(
@@ -2454,7 +2594,7 @@ Polygon rules:
                 "model": configured_model,
                 "primary_error": primary_message[:800],
                 "fallback_error": fallback_message[:800],
-                "analysis_version": "vehicle-segmentation-v16.0.1",
+                "analysis_version": "vehicle-segmentation-v16.0.2",
             },
         ) from fallback_exc
 
@@ -2467,8 +2607,18 @@ def analyze_vehicle_components(payload: VehicleAnalyzeRequest):
         "RGB",
     )
 
-    image_data_url = image_to_data_url(source)
-    raw_analysis = call_openai_vehicle_analysis(image_data_url)
+    analysis_source, _ = resize_image_for_processing(
+        source,
+        ANALYSIS_MAX_SIDE,
+    )
+    image_data_url = image_to_data_url(analysis_source)
+
+    try:
+        raw_analysis = call_openai_vehicle_analysis(image_data_url)
+    finally:
+        del analysis_source
+        del image_data_url
+
     normalized = normalize_vehicle_analysis(raw_analysis, source)
 
     if not normalized["components"]:
@@ -2488,7 +2638,7 @@ def analyze_vehicle_components(payload: VehicleAnalyzeRequest):
                     if isinstance(raw_analysis, dict)
                     else []
                 ),
-                "analysis_version": "vehicle-segmentation-v16.0.1",
+                "analysis_version": "vehicle-segmentation-v16.0.2",
             },
         )
 
@@ -2498,7 +2648,7 @@ def analyze_vehicle_components(payload: VehicleAnalyzeRequest):
             "OPENAI_VISION_MODEL",
             "gpt-4.1-mini",
         ),
-        "analysis_version": "vehicle-segmentation-v16.0.1",
+        "analysis_version": "vehicle-segmentation-v16.0.2",
         "mask_format": "data:image/png;base64",
         "mask_semantics": "white_component_black_background",
     }
@@ -2570,7 +2720,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v16.0-component-segmentation-smart-composite",
+        "prompt_version": "damage-v16.0.2-render-free-memory-optimized",
     }
 
 
@@ -2854,7 +3004,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v16.0-component-segmentation-smart-composite",
+        "prompt_version": "damage-v16.0.2-render-free-memory-optimized",
         "deformation_type": payload.deformation_type,
         "impact_direction": payload.impact_direction,
         "contact_traces_enabled": payload.contact_traces_enabled,
