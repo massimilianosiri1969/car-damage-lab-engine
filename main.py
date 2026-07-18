@@ -41,7 +41,7 @@ ALLOWED_ORIGINS = [
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.2.2.1",
+    version="1.6.0",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -66,7 +66,7 @@ class DamageEditBase64Request(BaseModel):
     # - bodywork_mask_base64: sola lamiera;
     # - component_masks_base64: una maschera per ogni componente.
     bodywork_mask_base64: str | None = None
-    component_masks_base64: dict[str, str] = Field(default_factory=dict)
+    component_masks_base64: dict[str, str] | None = None
 
     severity_percent: int = Field(..., ge=-100, le=100)
     area_percent: int = Field(..., ge=-100, le=100)
@@ -388,6 +388,47 @@ VEHICLE_COMPONENT_CATALOG = {
     "roof": "Tetto",
     "side_mirror": "Specchietto",
 }
+
+
+VEHICLE_COMPONENT_CATEGORIES = {
+    "hood": "bodywork",
+    "tailgate": "bodywork",
+    "front_fender": "bodywork",
+    "rear_fender": "bodywork",
+    "front_door": "bodywork",
+    "rear_door": "bodywork",
+    "roof": "bodywork",
+    "wheel_arch": "bodywork",
+    "front_headlight": "light",
+    "rear_light": "light",
+    "front_bumper": "bumper",
+    "rear_bumper": "bumper",
+    "windshield": "glass",
+    "rear_window": "glass",
+    "side_window": "glass",
+    "side_mirror": "mirror",
+    "wheel": "wheel",
+    "grille": "trim",
+}
+
+SEGMENTATION_POLYGON_SCALE = 1000
+SEGMENTATION_MIN_AREA_RATIO = float(
+    os.getenv("SEGMENTATION_MIN_AREA_RATIO", "0.0008")
+)
+SEGMENTATION_GRABCUT_ENABLED = (
+    os.getenv("SEGMENTATION_GRABCUT_ENABLED", "true").lower() == "true"
+)
+SMART_COMPOSITE_ENABLED = (
+    os.getenv("SMART_COMPOSITE_ENABLED", "true").lower() == "true"
+)
+SMART_COMPOSITE_PYRAMID_LEVELS = max(
+    2,
+    min(6, int(os.getenv("SMART_COMPOSITE_PYRAMID_LEVELS", "4"))),
+)
+SMART_COMPOSITE_COLOR_STRENGTH = max(
+    0.0,
+    min(1.0, float(os.getenv("SMART_COMPOSITE_COLOR_STRENGTH", "0.72"))),
+)
 
 DEFORMATION_INSTRUCTIONS = {
     "dent": (
@@ -817,6 +858,16 @@ def selected_non_body_component_codes(
     ]
 
 
+
+def copy_request_model(
+    payload: DamageEditBase64Request,
+    updates: dict,
+) -> DamageEditBase64Request:
+    if hasattr(payload, "model_copy"):
+        return payload.model_copy(update=updates)
+    return payload.copy(update=updates)
+
+
 def payload_for_single_component(
     payload: DamageEditBase64Request,
     component_code: str,
@@ -829,8 +880,9 @@ def payload_for_single_component(
         payload.component_damage_types or {}
     ).get(component_code)
 
-    return payload.model_copy(
-        update={
+    return copy_request_model(
+        payload,
+        {
             "damage_mode": "component_only",
             "involved_components": {component_code: True},
             "component_damage_types": (
@@ -1570,6 +1622,272 @@ def protected_soft_composite(
     return output.getvalue()
 
 
+
+def _lab_color_match_inside_mask(
+    source_rgb: np.ndarray,
+    generated_rgb: np.ndarray,
+    mask_binary: np.ndarray,
+    strength: float = SMART_COMPOSITE_COLOR_STRENGTH,
+) -> np.ndarray:
+    if strength <= 0:
+        return generated_rgb
+
+    source_lab = cv2.cvtColor(source_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    generated_lab = cv2.cvtColor(
+        generated_rgb,
+        cv2.COLOR_RGB2LAB,
+    ).astype(np.float32)
+
+    ring_kernel = np.ones((21, 21), np.uint8)
+    outer = cv2.dilate(mask_binary, ring_kernel, iterations=1)
+    inner = cv2.erode(mask_binary, np.ones((7, 7), np.uint8), iterations=1)
+    ring = cv2.subtract(outer, inner)
+
+    sample = ring > 0
+    if int(sample.sum()) < 64:
+        sample = mask_binary > 0
+
+    if int(sample.sum()) < 32:
+        return generated_rgb
+
+    corrected = generated_lab.copy()
+
+    for channel in range(3):
+        source_values = source_lab[:, :, channel][sample]
+        generated_values = generated_lab[:, :, channel][sample]
+
+        source_mean = float(source_values.mean())
+        generated_mean = float(generated_values.mean())
+        source_std = max(float(source_values.std()), 1.0)
+        generated_std = max(float(generated_values.std()), 1.0)
+
+        matched = (
+            (generated_lab[:, :, channel] - generated_mean)
+            * (source_std / generated_std)
+            + source_mean
+        )
+
+        corrected[:, :, channel] = (
+            generated_lab[:, :, channel] * (1.0 - strength)
+            + matched * strength
+        )
+
+    corrected = np.clip(corrected, 0, 255).astype(np.uint8)
+    corrected_rgb = cv2.cvtColor(corrected, cv2.COLOR_LAB2RGB)
+
+    # Applica il color match soltanto dentro e poco attorno alla maschera.
+    local_zone = cv2.dilate(
+        mask_binary,
+        np.ones((15, 15), np.uint8),
+        iterations=1,
+    )
+    local_alpha = (
+        cv2.GaussianBlur(local_zone, (0, 0), sigmaX=5)
+        .astype(np.float32)
+        / 255.0
+    )[:, :, None]
+
+    return np.clip(
+        generated_rgb.astype(np.float32) * (1.0 - local_alpha)
+        + corrected_rgb.astype(np.float32) * local_alpha,
+        0,
+        255,
+    ).astype(np.uint8)
+
+
+def _laplacian_pyramid_blend(
+    source_rgb: np.ndarray,
+    generated_rgb: np.ndarray,
+    alpha: np.ndarray,
+    levels: int = SMART_COMPOSITE_PYRAMID_LEVELS,
+) -> np.ndarray:
+    source = source_rgb.astype(np.float32)
+    generated = generated_rgb.astype(np.float32)
+    mask = np.clip(alpha.astype(np.float32), 0.0, 1.0)
+
+    if mask.ndim == 2:
+        mask = mask[:, :, None]
+
+    gaussian_source = [source]
+    gaussian_generated = [generated]
+    gaussian_mask = [mask]
+
+    for _ in range(levels):
+        if min(gaussian_source[-1].shape[:2]) < 16:
+            break
+
+        gaussian_source.append(cv2.pyrDown(gaussian_source[-1]))
+        gaussian_generated.append(cv2.pyrDown(gaussian_generated[-1]))
+        gaussian_mask.append(cv2.pyrDown(gaussian_mask[-1]))
+
+    laplacian_source = []
+    laplacian_generated = []
+
+    for index in range(len(gaussian_source) - 1):
+        size = (
+            gaussian_source[index].shape[1],
+            gaussian_source[index].shape[0],
+        )
+        source_up = cv2.pyrUp(
+            gaussian_source[index + 1],
+            dstsize=size,
+        )
+        generated_up = cv2.pyrUp(
+            gaussian_generated[index + 1],
+            dstsize=size,
+        )
+        laplacian_source.append(gaussian_source[index] - source_up)
+        laplacian_generated.append(
+            gaussian_generated[index] - generated_up
+        )
+
+    laplacian_source.append(gaussian_source[-1])
+    laplacian_generated.append(gaussian_generated[-1])
+
+    blended_levels = []
+
+    for source_level, generated_level, mask_level in zip(
+        laplacian_source,
+        laplacian_generated,
+        gaussian_mask,
+    ):
+        if mask_level.ndim == 2:
+            mask_level = mask_level[:, :, None]
+
+        blended_levels.append(
+            generated_level * mask_level
+            + source_level * (1.0 - mask_level)
+        )
+
+    result = blended_levels[-1]
+
+    for index in range(len(blended_levels) - 2, -1, -1):
+        size = (
+            blended_levels[index].shape[1],
+            blended_levels[index].shape[0],
+        )
+        result = cv2.pyrUp(result, dstsize=size) + blended_levels[index]
+
+    return np.clip(result, 0, 255).astype(np.uint8)
+
+
+def smart_component_composite(
+    source: Image.Image,
+    generated_bytes: bytes,
+    source_mask: Image.Image,
+    protect_mask: Image.Image | None = None,
+    expansion_px: int = COMPOSITE_EXPANSION_PX,
+    feather_px: int = SOFT_COMPOSITE_FEATHER_PX,
+) -> bytes:
+    """
+    V16 Smart Composite:
+    - limita la modifica alla maschera autorizzata;
+    - riallinea localmente colore e luminosità;
+    - mantiene nitido il centro;
+    - fonde i bordi tramite blending multibanda;
+    - riapplica in modo assoluto la maschera protetta.
+    """
+    if not SMART_COMPOSITE_ENABLED:
+        return protected_soft_composite(
+            source=source,
+            generated_bytes=generated_bytes,
+            source_mask=source_mask,
+            protect_mask=protect_mask,
+            expansion_px=expansion_px,
+            feather_px=feather_px,
+        )
+
+    generated = _open_image_bytes(generated_bytes, "RGB")
+    if generated is None:
+        raise HTTPException(
+            status_code=502,
+            detail="Il risultato generato non è un'immagine valida.",
+        )
+
+    generated = generated.resize(source.size, Image.Resampling.LANCZOS)
+
+    source_rgb = np.array(source.convert("RGB"))
+    generated_rgb = np.array(generated.convert("RGB"))
+
+    mask = resize_mask(source_mask.convert("L"), source.size)
+    mask_binary = mask_to_binary(mask)
+
+    if protect_mask is not None:
+        protect = resize_mask(protect_mask.convert("L"), source.size)
+        protect_binary = mask_to_binary(protect)
+        mask_binary = cv2.bitwise_and(
+            mask_binary,
+            cv2.bitwise_not(protect_binary),
+        )
+    else:
+        protect_binary = np.zeros_like(mask_binary)
+
+    if expansion_px > 0:
+        kernel_size = max(3, expansion_px * 2 + 1)
+        expanded = cv2.dilate(
+            mask_binary,
+            np.ones((kernel_size, kernel_size), np.uint8),
+            iterations=1,
+        )
+    else:
+        expanded = mask_binary
+
+    expanded = cv2.bitwise_and(
+        expanded,
+        cv2.bitwise_not(protect_binary),
+    )
+
+    if int((expanded > 0).sum()) == 0:
+        raise HTTPException(
+            status_code=422,
+            detail="La maschera effettiva del compositing è vuota.",
+        )
+
+    corrected_generated = _lab_color_match_inside_mask(
+        source_rgb,
+        generated_rgb,
+        expanded,
+    )
+
+    # Alpha: pieno al centro, transizione progressiva soltanto sul bordo.
+    distance_inside = cv2.distanceTransform(
+        np.where(expanded > 0, 255, 0).astype(np.uint8),
+        cv2.DIST_L2,
+        5,
+    )
+
+    feather = max(2.0, float(feather_px))
+    alpha = np.clip(distance_inside / feather, 0.0, 1.0)
+
+    # Mantiene il centro completamente generato.
+    alpha[mask_binary > 0] = np.maximum(
+        alpha[mask_binary > 0],
+        0.92,
+    )
+
+    # Leggerissima sfumatura per eliminare scalettature senza creare una toppa.
+    alpha = cv2.GaussianBlur(alpha, (0, 0), sigmaX=1.25)
+    alpha[protect_binary > 0] = 0.0
+
+    blended = _laplacian_pyramid_blend(
+        source_rgb,
+        corrected_generated,
+        alpha,
+    )
+
+    # Garanzia assoluta: ogni pixel protetto torna identico all'originale.
+    blended[protect_binary > 0] = source_rgb[protect_binary > 0]
+
+    output = io.BytesIO()
+    Image.fromarray(blended, mode="RGB").save(
+        output,
+        format="JPEG",
+        quality=95,
+        subsampling=0,
+    )
+    return output.getvalue()
+
+
 def call_openai_image_edit(
     source: Image.Image,
     api_mask: Image.Image,
@@ -1648,6 +1966,239 @@ def health():
 
 
 
+
+def component_category(code: str) -> str:
+    return VEHICLE_COMPONENT_CATEGORIES.get(code, "trim")
+
+
+def mask_image_to_data_url(mask: Image.Image) -> str:
+    normalized = mask.convert("L")
+    buffer = io.BytesIO()
+    normalized.save(buffer, format="PNG", optimize=True)
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
+
+
+def normalize_polygon_points(
+    raw_polygon,
+    width: int,
+    height: int,
+) -> list[tuple[int, int]]:
+    if not isinstance(raw_polygon, list):
+        return []
+
+    points: list[tuple[int, int]] = []
+
+    for item in raw_polygon:
+        if isinstance(item, dict):
+            raw_x = item.get("x")
+            raw_y = item.get("y")
+        elif isinstance(item, (list, tuple)) and len(item) >= 2:
+            raw_x, raw_y = item[0], item[1]
+        else:
+            continue
+
+        try:
+            x_value = float(raw_x)
+            y_value = float(raw_y)
+        except Exception:
+            continue
+
+        # Il modello restituisce coordinate normalizzate 0..1000.
+        x = round((x_value / SEGMENTATION_POLYGON_SCALE) * (width - 1))
+        y = round((y_value / SEGMENTATION_POLYGON_SCALE) * (height - 1))
+
+        points.append(
+            (
+                max(0, min(width - 1, x)),
+                max(0, min(height - 1, y)),
+            )
+        )
+
+    return points if len(points) >= 3 else []
+
+
+def polygon_mask(
+    image_size: tuple[int, int],
+    points: list[tuple[int, int]],
+) -> Image.Image:
+    width, height = image_size
+    mask = np.zeros((height, width), dtype=np.uint8)
+
+    if len(points) >= 3:
+        polygon = np.array(points, dtype=np.int32).reshape((-1, 1, 2))
+        cv2.fillPoly(mask, [polygon], 255)
+
+    return Image.fromarray(mask, mode="L")
+
+
+def clean_component_mask(mask: Image.Image) -> Image.Image:
+    binary = mask_to_binary(mask)
+    height, width = binary.shape
+
+    kernel_size = max(3, round(min(width, height) * 0.004))
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+
+    kernel = np.ones((kernel_size, kernel_size), np.uint8)
+    cleaned = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+    cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, kernel)
+
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        np.where(cleaned > 0, 1, 0).astype(np.uint8),
+        connectivity=8,
+    )
+
+    if count <= 1:
+        return Image.fromarray(cleaned, mode="L")
+
+    minimum_area = max(
+        16,
+        round(width * height * SEGMENTATION_MIN_AREA_RATIO),
+    )
+    selected = np.zeros_like(cleaned)
+
+    for index in range(1, count):
+        area = int(stats[index, cv2.CC_STAT_AREA])
+        if area >= minimum_area:
+            selected[labels == index] = 255
+
+    if int((selected > 0).sum()) == 0:
+        selected = cleaned
+
+    return Image.fromarray(selected, mode="L")
+
+
+def refine_mask_with_grabcut(
+    source: Image.Image,
+    initial_mask: Image.Image,
+) -> Image.Image:
+    if not SEGMENTATION_GRABCUT_ENABLED:
+        return clean_component_mask(initial_mask)
+
+    rgb = np.array(source.convert("RGB"))
+    initial = mask_to_binary(initial_mask)
+
+    if int((initial > 0).sum()) < 64:
+        return clean_component_mask(initial_mask)
+
+    grabcut_mask = np.full(initial.shape, cv2.GC_BGD, dtype=np.uint8)
+
+    probable_fg = cv2.dilate(
+        initial,
+        np.ones((9, 9), np.uint8),
+        iterations=1,
+    )
+    sure_fg = cv2.erode(
+        initial,
+        np.ones((5, 5), np.uint8),
+        iterations=1,
+    )
+
+    grabcut_mask[probable_fg > 0] = cv2.GC_PR_FGD
+    grabcut_mask[sure_fg > 0] = cv2.GC_FGD
+
+    probable_bg = cv2.dilate(
+        probable_fg,
+        np.ones((31, 31), np.uint8),
+        iterations=1,
+    )
+    grabcut_mask[probable_bg == 0] = cv2.GC_BGD
+
+    background_model = np.zeros((1, 65), np.float64)
+    foreground_model = np.zeros((1, 65), np.float64)
+
+    try:
+        cv2.grabCut(
+            cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
+            grabcut_mask,
+            None,
+            background_model,
+            foreground_model,
+            3,
+            cv2.GC_INIT_WITH_MASK,
+        )
+
+        refined = np.where(
+            (grabcut_mask == cv2.GC_FGD)
+            | (grabcut_mask == cv2.GC_PR_FGD),
+            255,
+            0,
+        ).astype(np.uint8)
+
+        # Non permettere al raffinamento di allontanarsi troppo dal poligono.
+        allowed = cv2.dilate(
+            initial,
+            np.ones((21, 21), np.uint8),
+            iterations=1,
+        )
+        refined = cv2.bitwise_and(refined, allowed)
+
+        if int((refined > 0).sum()) < max(32, int((initial > 0).sum() * 0.25)):
+            refined = initial
+
+        return clean_component_mask(Image.fromarray(refined, mode="L"))
+
+    except Exception:
+        return clean_component_mask(initial_mask)
+
+
+def build_component_segmentation(
+    source: Image.Image,
+    component: dict,
+) -> dict | None:
+    code = str(component.get("code", "")).strip()
+    if code not in VEHICLE_COMPONENT_CATALOG:
+        return None
+
+    polygon = normalize_polygon_points(
+        component.get("polygon", []),
+        source.width,
+        source.height,
+    )
+
+    if not polygon:
+        return None
+
+    initial_mask = polygon_mask(source.size, polygon)
+    refined_mask = refine_mask_with_grabcut(source, initial_mask)
+
+    binary = mask_to_binary(refined_mask)
+    pixel_area = int((binary > 0).sum())
+
+    if pixel_area < max(
+        16,
+        round(source.width * source.height * SEGMENTATION_MIN_AREA_RATIO),
+    ):
+        return None
+
+    x, y, width, height = cv2.boundingRect(binary)
+
+    try:
+        confidence = float(component.get("confidence", 0.70))
+    except Exception:
+        confidence = 0.70
+
+    return {
+        "code": code,
+        "label": VEHICLE_COMPONENT_CATALOG[code],
+        "category": component_category(code),
+        "confidence": round(max(0.0, min(confidence, 1.0)), 2),
+        "mask_base64": mask_image_to_data_url(refined_mask),
+        "bounding_box": {
+            "x": int(x),
+            "y": int(y),
+            "width": int(width),
+            "height": int(height),
+        },
+        "polygon": [
+            {"x": int(point[0]), "y": int(point[1])}
+            for point in polygon
+        ],
+        "mask_source": "vision_polygon_grabcut",
+    }
+
+
 def image_to_data_url(image: Image.Image) -> str:
     """
     Normalizza l'immagine in JPEG per l'analisi visuale.
@@ -1705,144 +2256,64 @@ def extract_json_object(raw_text: str) -> dict:
     return parsed
 
 
-def normalize_vehicle_analysis(raw: dict) -> dict:
-    vehicle_view = str(raw.get("vehicle_view", "unknown")).strip()
+def normalize_vehicle_analysis(
+    raw: dict,
+    source: Image.Image,
+) -> dict:
+    vehicle_view = str(
+        raw.get("vehicle_view", raw.get("view", "unknown"))
+    ).strip()
 
     if vehicle_view not in VEHICLE_VIEW_LABELS:
         vehicle_view = "unknown"
 
-    raw_components = raw.get("visible_components", [])
-    normalized_components: list[dict] = []
+    raw_components = raw.get(
+        "components",
+        raw.get("visible_components", []),
+    )
+
+    segmented_components: list[dict] = []
     seen: set[str] = set()
 
     if isinstance(raw_components, list):
         for item in raw_components:
-            if isinstance(item, str):
-                code = item
-                confidence = 0.75
-            elif isinstance(item, dict):
-                code = str(item.get("code", "")).strip()
-                try:
-                    confidence = float(item.get("confidence", 0.75))
-                except Exception:
-                    confidence = 0.75
-            else:
+            if not isinstance(item, dict):
                 continue
 
-            if code not in VEHICLE_COMPONENT_CATALOG or code in seen:
+            code = str(item.get("code", "")).strip()
+            if code in seen:
+                continue
+
+            segmentation = build_component_segmentation(source, item)
+            if segmentation is None:
                 continue
 
             seen.add(code)
-            normalized_components.append(
-                {
-                    "code": code,
-                    "label": VEHICLE_COMPONENT_CATALOG[code],
-                    "confidence": round(
-                        max(0.0, min(confidence, 1.0)),
-                        2,
-                    ),
-                }
-            )
+            segmented_components.append(segmentation)
 
-    # Fallback minimo coerente con la vista quando il modello è troppo prudente.
-    view_defaults = {
-        "front": [
-            "hood",
-            "front_headlight",
-            "front_bumper",
-            "windshield",
-        ],
-        "front_left": [
-            "front_fender",
-            "front_headlight",
-            "front_bumper",
-            "hood",
-            "front_door",
-            "wheel_arch",
-            "wheel",
-            "windshield",
-            "side_mirror",
-        ],
-        "front_right": [
-            "front_fender",
-            "front_headlight",
-            "front_bumper",
-            "hood",
-            "front_door",
-            "wheel_arch",
-            "wheel",
-            "windshield",
-            "side_mirror",
-        ],
-        "rear": [
-            "tailgate",
-            "rear_light",
-            "rear_bumper",
-            "rear_window",
-        ],
-        "rear_left": [
-            "rear_fender",
-            "rear_light",
-            "rear_bumper",
-            "tailgate",
-            "rear_door",
-            "wheel_arch",
-            "wheel",
-            "rear_window",
-            "side_window",
-        ],
-        "rear_right": [
-            "rear_fender",
-            "rear_light",
-            "rear_bumper",
-            "tailgate",
-            "rear_door",
-            "wheel_arch",
-            "wheel",
-            "rear_window",
-            "side_window",
-        ],
-        "left_side": [
-            "front_fender",
-            "rear_fender",
-            "front_door",
-            "rear_door",
-            "wheel_arch",
-            "wheel",
-            "side_window",
-            "side_mirror",
-        ],
-        "right_side": [
-            "front_fender",
-            "rear_fender",
-            "front_door",
-            "rear_door",
-            "wheel_arch",
-            "wheel",
-            "side_window",
-            "side_mirror",
-        ],
-    }
-
-    if not normalized_components and vehicle_view in view_defaults:
-        normalized_components = [
-            {
-                "code": code,
-                "label": VEHICLE_COMPONENT_CATALOG[code],
-                "confidence": 0.60,
-            }
-            for code in view_defaults[vehicle_view]
-        ]
-
-    normalized_components.sort(
+    segmented_components.sort(
         key=lambda item: item["confidence"],
         reverse=True,
     )
 
     return {
+        "view": vehicle_view,
+        "view_label": VEHICLE_VIEW_LABELS[vehicle_view],
         "vehicle_view": vehicle_view,
         "vehicle_view_label": VEHICLE_VIEW_LABELS[vehicle_view],
-        "visible_components": normalized_components,
+        "components": segmented_components,
+        # Compatibilità con il vecchio frontend.
+        "visible_components": [
+            {
+                "code": item["code"],
+                "label": item["label"],
+                "category": item["category"],
+                "confidence": item["confidence"],
+                "mask_base64": item["mask_base64"],
+                "bounding_box": item["bounding_box"],
+            }
+            for item in segmented_components
+        ],
     }
 
 
@@ -1853,33 +2324,40 @@ def call_openai_vehicle_analysis(image_data_url: str) -> dict:
         "gpt-4.1-mini",
     )
 
-    prompt = f"""
-Analyze this automotive photograph.
+    allowed_codes = list(VEHICLE_COMPONENT_CATALOG.keys())
 
-Return ONLY a JSON object with:
+    prompt = f"""
+Analyze this automotive photograph and segment the visible vehicle components.
+
+Return ONLY a valid JSON object with this exact structure:
 {{
   "vehicle_view": one of [
     "front", "front_left", "front_right",
     "rear", "rear_left", "rear_right",
     "left_side", "right_side", "mixed", "unknown"
   ],
-  "visible_components": [
+  "components": [
     {{
-      "code": one of {list(VEHICLE_COMPONENT_CATALOG.keys())},
-      "confidence": number from 0 to 1
+      "code": one of {allowed_codes},
+      "confidence": number from 0 to 1,
+      "polygon": [
+        {{"x": integer from 0 to 1000, "y": integer from 0 to 1000}}
+      ]
     }}
   ]
 }}
 
-Rules:
-- Include only components genuinely visible in the photograph.
-- Distinguish front_headlight from rear_light.
-- Distinguish hood from tailgate.
-- Distinguish front_bumper from rear_bumper.
-- Distinguish front_fender from rear_fender.
-- Include a component even when partly visible, but lower its confidence.
-- Do not identify damage severity and do not describe people or the background.
-- Do not invent components outside the allowed code list.
+Polygon rules:
+- Coordinates are normalized to the complete image: top-left is 0,0 and bottom-right is 1000,1000.
+- Trace the visible outer contour of the physical component, not an ellipse and not a generic bounding box.
+- Use 8 to 30 polygon points when possible.
+- Follow actual panel seams, lamp edges, glass edges, wheel outline and bumper boundaries.
+- Do not include the floor, workshop equipment, shadows, another vehicle or empty background.
+- Components may be partially visible; trace only the visible portion.
+- Do not overlap unrelated components unnecessarily.
+- Return only components genuinely visible in the photograph.
+- Do not describe damage severity, people or background.
+- Do not invent component codes.
 """.strip()
 
     try:
@@ -1891,17 +2369,14 @@ Rules:
                 {
                     "role": "system",
                     "content": (
-                        "You are a precise automotive body-component classifier. "
-                        "Return valid JSON only."
+                        "You are a precise automotive component segmentation "
+                        "assistant. Return valid JSON only."
                     ),
                 },
                 {
                     "role": "user",
                     "content": [
-                        {
-                            "type": "text",
-                            "text": prompt,
-                        },
+                        {"type": "text", "text": prompt},
                         {
                             "type": "image_url",
                             "image_url": {
@@ -1919,7 +2394,7 @@ Rules:
 
     except Exception as exc:
         print(
-            "OPENAI VEHICLE ANALYSIS ERROR:",
+            "OPENAI VEHICLE SEGMENTATION ERROR:",
             type(exc).__name__,
             str(exc),
         )
@@ -1927,7 +2402,7 @@ Rules:
         raise HTTPException(
             status_code=502,
             detail=(
-                "Il motore di analisi non ha completato il riconoscimento "
+                "Il motore V16 non ha completato la segmentazione "
                 "dei componenti."
             ),
         ) from exc
@@ -1943,7 +2418,17 @@ def analyze_vehicle_components(payload: VehicleAnalyzeRequest):
 
     image_data_url = image_to_data_url(source)
     raw_analysis = call_openai_vehicle_analysis(image_data_url)
-    normalized = normalize_vehicle_analysis(raw_analysis)
+    normalized = normalize_vehicle_analysis(raw_analysis, source)
+
+    if not normalized["components"]:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Non è stato possibile ottenere maschere attendibili. "
+                "Prova con una foto più nitida o aggiungi manualmente "
+                "il componente."
+            ),
+        )
 
     return {
         **normalized,
@@ -1951,7 +2436,9 @@ def analyze_vehicle_components(payload: VehicleAnalyzeRequest):
             "OPENAI_VISION_MODEL",
             "gpt-4.1-mini",
         ),
-        "analysis_version": "vehicle-components-v1.1",
+        "analysis_version": "vehicle-segmentation-v16.0",
+        "mask_format": "data:image/png;base64",
+        "mask_semantics": "white_component_black_background",
     }
 
 
@@ -2021,12 +2508,18 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v15.1.6-bumper-identity-preservation",
+        "prompt_version": "damage-v16.0-component-segmentation-smart-composite",
     }
 
 
 @app.post("/v1/damage/edit-base64")
 def edit_damage_base64(payload: DamageEditBase64Request):
+    if payload.component_masks_base64 is None:
+        payload = copy_request_model(
+            payload,
+            {"component_masks_base64": {}},
+        )
+
     severity_percent = clamp_percentage(payload.severity_percent)
     area_percent = clamp_percentage(payload.area_percent)
 
@@ -2111,7 +2604,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
             payload.output_quality,
         )
 
-        result_bytes = protected_soft_composite(
+        result_bytes = smart_component_composite(
             source=source,
             generated_bytes=generated_bytes,
             source_mask=effective_mask,
@@ -2141,7 +2634,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         missing_component_masks = [
             code
             for code in component_codes
-            if not payload.component_masks_base64.get(code)
+            if not (payload.component_masks_base64 or {}).get(code)
         ]
         if missing_component_masks:
             raise HTTPException(
@@ -2176,8 +2669,9 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 0,
             )
 
-            bodywork_payload = payload.model_copy(
-                update={
+            bodywork_payload = copy_request_model(
+                payload,
+                {
                     "damage_mode": "bodywork",
                     "involved_components": {
                         code: True for code in bodywork_codes
@@ -2215,7 +2709,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 payload.output_quality,
             )
 
-            bodywork_result = protected_soft_composite(
+            bodywork_result = smart_component_composite(
                 source=current_image,
                 generated_bytes=generated_bodywork,
                 source_mask=effective_bodywork_mask,
@@ -2232,7 +2726,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         # Passaggi successivi: un componente per volta.
         for component_code in component_codes:
             raw_component_mask = decode_base64_image(
-                payload.component_masks_base64[component_code],
+                (payload.component_masks_base64 or {})[component_code],
                 f"component_masks_base64[{component_code}]",
                 "L",
             )
@@ -2272,7 +2766,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 payload.output_quality,
             )
 
-            component_result = protected_soft_composite(
+            component_result = smart_component_composite(
                 source=current_image,
                 generated_bytes=generated_component,
                 source_mask=component_mask,
@@ -2298,17 +2792,19 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v15.2.1-soft-area-transition",
+        "prompt_version": "damage-v16.0-component-segmentation-smart-composite",
         "deformation_type": payload.deformation_type,
         "impact_direction": payload.impact_direction,
         "contact_traces_enabled": payload.contact_traces_enabled,
         "involved_components": payload.involved_components,
         "damage_mode": resolved_damage_mode,
-        "area_control": "geometric_mask_transform_with_soft_transition",
+        "area_control": "geometric_mask_transform_smart_composite",
         "area_transition_feather_px": area_transition_feather_px(
             source.size,
             area_percent,
         ),
+        "composite_strategy": "lab_color_match_multiband",
+        "segmentation_contract": "per_component_png_masks",
         "mixed_strategy": (
             "sequential_per_component"
             if resolved_damage_mode == "mixed"
