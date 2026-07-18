@@ -41,7 +41,7 @@ ALLOWED_ORIGINS = [
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.6.0",
+    version="1.6.0.1",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -2350,7 +2350,7 @@ Return ONLY a valid JSON object with this exact structure:
 Polygon rules:
 - Coordinates are normalized to the complete image: top-left is 0,0 and bottom-right is 1000,1000.
 - Trace the visible outer contour of the physical component, not an ellipse and not a generic bounding box.
-- Use 8 to 30 polygon points when possible.
+- Use 8 to 24 polygon points when possible.
 - Follow actual panel seams, lamp edges, glass edges, wheel outline and bumper boundaries.
 - Do not include the floor, workshop equipment, shadows, another vehicle or empty background.
 - Components may be partially visible; trace only the visible portion.
@@ -2360,52 +2360,103 @@ Polygon rules:
 - Do not invent component codes.
 """.strip()
 
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a precise automotive component segmentation "
+                "assistant. Return valid JSON only."
+            ),
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": image_data_url,
+                        "detail": "high",
+                    },
+                },
+            ],
+        },
+    ]
+
+    first_error: Exception | None = None
+
+    # Tentativo 1: JSON mode.
     try:
         response = client.chat.completions.create(
             model=configured_model,
             temperature=0,
             response_format={"type": "json_object"},
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a precise automotive component segmentation "
-                        "assistant. Return valid JSON only."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": image_data_url,
-                                "detail": "high",
-                            },
-                        },
-                    ],
-                },
-            ],
+            messages=messages,
         )
 
         content = response.choices[0].message.content or "{}"
-        return extract_json_object(content)
+        parsed = extract_json_object(content)
+
+        if not isinstance(parsed, dict):
+            raise ValueError("La risposta JSON non è un oggetto.")
+
+        return parsed
 
     except Exception as exc:
+        first_error = exc
         print(
-            "OPENAI VEHICLE SEGMENTATION ERROR:",
+            "OPENAI VEHICLE SEGMENTATION PRIMARY ERROR:",
             type(exc).__name__,
             str(exc),
         )
         traceback.print_exc()
+
+    # Tentativo 2: fallback senza response_format.
+    try:
+        response = client.chat.completions.create(
+            model=configured_model,
+            temperature=0,
+            messages=messages,
+        )
+
+        content = response.choices[0].message.content or "{}"
+        parsed = extract_json_object(content)
+
+        if not isinstance(parsed, dict):
+            raise ValueError("La risposta fallback non è un oggetto JSON.")
+
+        return parsed
+
+    except Exception as fallback_exc:
+        print(
+            "OPENAI VEHICLE SEGMENTATION FALLBACK ERROR:",
+            type(fallback_exc).__name__,
+            str(fallback_exc),
+        )
+        traceback.print_exc()
+
+        primary_message = (
+            f"{type(first_error).__name__}: {str(first_error)}"
+            if first_error is not None
+            else "nessun dettaglio"
+        )
+        fallback_message = (
+            f"{type(fallback_exc).__name__}: {str(fallback_exc)}"
+        )
+
         raise HTTPException(
             status_code=502,
-            detail=(
-                "Il motore V16 non ha completato la segmentazione "
-                "dei componenti."
-            ),
-        ) from exc
+            detail={
+                "message": (
+                    "Il motore V16 non ha completato la segmentazione "
+                    "dei componenti."
+                ),
+                "model": configured_model,
+                "primary_error": primary_message[:800],
+                "fallback_error": fallback_message[:800],
+                "analysis_version": "vehicle-segmentation-v16.0.1",
+            },
+        ) from fallback_exc
 
 
 @app.post("/v1/vehicle/analyze-components")
@@ -2423,11 +2474,22 @@ def analyze_vehicle_components(payload: VehicleAnalyzeRequest):
     if not normalized["components"]:
         raise HTTPException(
             status_code=422,
-            detail=(
-                "Non è stato possibile ottenere maschere attendibili. "
-                "Prova con una foto più nitida o aggiungi manualmente "
-                "il componente."
-            ),
+            detail={
+                "message": (
+                    "Non è stato possibile ottenere maschere attendibili. "
+                    "Prova con una foto più nitida o aggiungi manualmente "
+                    "il componente."
+                ),
+                "raw_component_count": len(
+                    raw_analysis.get(
+                        "components",
+                        raw_analysis.get("visible_components", []),
+                    )
+                    if isinstance(raw_analysis, dict)
+                    else []
+                ),
+                "analysis_version": "vehicle-segmentation-v16.0.1",
+            },
         )
 
     return {
@@ -2436,7 +2498,7 @@ def analyze_vehicle_components(payload: VehicleAnalyzeRequest):
             "OPENAI_VISION_MODEL",
             "gpt-4.1-mini",
         ),
-        "analysis_version": "vehicle-segmentation-v16.0",
+        "analysis_version": "vehicle-segmentation-v16.0.1",
         "mask_format": "data:image/png;base64",
         "mask_semantics": "white_component_black_background",
     }
