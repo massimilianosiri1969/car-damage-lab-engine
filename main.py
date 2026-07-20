@@ -1,4 +1,4 @@
-import base64
+base64
 import io
 import json
 import os
@@ -49,7 +49,7 @@ ALLOWED_ORIGINS = [
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.6.4",
+    version="1.7.0",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -158,6 +158,28 @@ class AssistedComponentSelectionRequest(BaseModel):
     reset_mask: bool = False
     manual_mask_base64: str | None = None
     confirm_manual_mask: bool = False
+
+
+class PolygonPoint(BaseModel):
+    x: float = Field(..., ge=0, le=1000)
+    y: float = Field(..., ge=0, le=1000)
+
+
+class SmartPolygonRequest(BaseModel):
+    image_base64: str = Field(..., min_length=16)
+    component_code: str = Field(..., min_length=1, max_length=80)
+    points: list[PolygonPoint] = Field(..., min_length=3, max_length=120)
+    snap_to_edges: bool = True
+    snap_radius: int = Field(default=14, ge=0, le=60)
+    smooth_polygon: bool = True
+    feather_radius: int = Field(default=2, ge=0, le=12)
+    confirm_mask: bool = True
+
+
+class SmartPolygonSnapRequest(BaseModel):
+    image_base64: str = Field(..., min_length=16)
+    points: list[PolygonPoint] = Field(..., min_length=1, max_length=120)
+    snap_radius: int = Field(default=14, ge=0, le=60)
 
 
 class DamageFinalizeBase64Request(BaseModel):
@@ -549,6 +571,24 @@ PROMPTED_SAM_COMPONENT_TIMEOUT_SECONDS = max(
             )
         ),
     ),
+)
+
+
+SMART_POLYGON_EDGE_BLUR = max(
+    1,
+    min(9, int(os.getenv("SMART_POLYGON_EDGE_BLUR", "5"))),
+)
+SMART_POLYGON_CANNY_LOW = max(
+    10,
+    min(180, int(os.getenv("SMART_POLYGON_CANNY_LOW", "45"))),
+)
+SMART_POLYGON_CANNY_HIGH = max(
+    SMART_POLYGON_CANNY_LOW + 1,
+    min(255, int(os.getenv("SMART_POLYGON_CANNY_HIGH", "135"))),
+)
+SMART_POLYGON_MIN_AREA_PIXELS = max(
+    32,
+    int(os.getenv("SMART_POLYGON_MIN_AREA_PIXELS", "120")),
 )
 
 
@@ -2354,7 +2394,7 @@ def _replicate_json_request(
             status_code=500,
             detail={
                 "message": "REPLICATE_API_TOKEN non configurato su Render.",
-                "analysis_version": "vehicle-segmentation-v16.4-assisted-selection",
+                "analysis_version": "vehicle-segmentation-v17-manual-smart-polygon",
             },
         )
 
@@ -2397,7 +2437,7 @@ def _replicate_json_request(
                 "http_status": exc.code,
                 "request_url": url,
                 "replicate_detail": error_body[:2000],
-                "analysis_version": "vehicle-segmentation-v16.4-assisted-selection",
+                "analysis_version": "vehicle-segmentation-v17-manual-smart-polygon",
             },
         ) from exc
     except Exception as exc:
@@ -2406,7 +2446,7 @@ def _replicate_json_request(
             detail={
                 "message": "Connessione a Replicate non riuscita.",
                 "error": f"{type(exc).__name__}: {str(exc)}"[:1200],
-                "analysis_version": "vehicle-segmentation-v16.4-assisted-selection",
+                "analysis_version": "vehicle-segmentation-v17-manual-smart-polygon",
             },
         ) from exc
 
@@ -3301,7 +3341,7 @@ def _create_replicate_prediction(
                 "Limite Replicate ancora attivo dopo diversi tentativi."
             ),
             "analysis_version": (
-                "vehicle-segmentation-v16.4-assisted-selection"
+                "vehicle-segmentation-v17-manual-smart-polygon"
             ),
         },
     )
@@ -4048,6 +4088,316 @@ def apply_component_refinement(
 
 
 
+
+def polygon_points_to_pixels(
+    points: list,
+    width: int,
+    height: int,
+) -> list[tuple[int, int]]:
+    result: list[tuple[int, int]] = []
+
+    for point in points:
+        if isinstance(point, BaseModel):
+            raw_x = getattr(point, "x", None)
+            raw_y = getattr(point, "y", None)
+        elif isinstance(point, dict):
+            raw_x = point.get("x")
+            raw_y = point.get("y")
+        elif isinstance(point, (list, tuple)) and len(point) >= 2:
+            raw_x, raw_y = point[0], point[1]
+        else:
+            continue
+
+        try:
+            x = float(raw_x)
+            y = float(raw_y)
+        except Exception:
+            continue
+
+        # V17 frontend exchanges polygon coordinates in the 0..1000 space.
+        px = round(x * (width - 1) / 1000.0)
+        py = round(y * (height - 1) / 1000.0)
+
+        result.append((
+            max(0, min(width - 1, px)),
+            max(0, min(height - 1, py)),
+        ))
+
+    return result
+
+
+def polygon_points_to_normalized(
+    points: list[tuple[int, int]],
+    width: int,
+    height: int,
+) -> list[dict]:
+    return [
+        {
+            "x": round(x * 1000.0 / max(1, width - 1), 2),
+            "y": round(y * 1000.0 / max(1, height - 1), 2),
+        }
+        for x, y in points
+    ]
+
+
+def build_vehicle_edge_map(source: Image.Image) -> np.ndarray:
+    rgb = np.asarray(source.convert("RGB"), dtype=np.uint8)
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+
+    blur_size = SMART_POLYGON_EDGE_BLUR
+    if blur_size % 2 == 0:
+        blur_size += 1
+
+    gray = cv2.GaussianBlur(
+        gray,
+        (blur_size, blur_size),
+        0,
+    )
+
+    canny = cv2.Canny(
+        gray,
+        SMART_POLYGON_CANNY_LOW,
+        SMART_POLYGON_CANNY_HIGH,
+    )
+
+    # Add panel seams and strong local contrast in both directions.
+    grad_x = cv2.Sobel(gray, cv2.CV_16S, 1, 0, ksize=3)
+    grad_y = cv2.Sobel(gray, cv2.CV_16S, 0, 1, ksize=3)
+    gradient = cv2.addWeighted(
+        cv2.convertScaleAbs(grad_x),
+        0.5,
+        cv2.convertScaleAbs(grad_y),
+        0.5,
+        0,
+    )
+    _, strong_gradient = cv2.threshold(
+        gradient,
+        55,
+        255,
+        cv2.THRESH_BINARY,
+    )
+
+    edge_map = cv2.bitwise_or(canny, strong_gradient)
+    edge_map = cv2.morphologyEx(
+        edge_map,
+        cv2.MORPH_CLOSE,
+        np.ones((3, 3), np.uint8),
+    )
+
+    return edge_map
+
+
+def snap_point_to_edge(
+    point: tuple[int, int],
+    edge_map: np.ndarray,
+    radius: int,
+) -> tuple[int, int]:
+    if radius <= 0:
+        return point
+
+    height, width = edge_map.shape
+    x, y = point
+
+    x1 = max(0, x - radius)
+    y1 = max(0, y - radius)
+    x2 = min(width, x + radius + 1)
+    y2 = min(height, y + radius + 1)
+
+    region = edge_map[y1:y2, x1:x2]
+    ys, xs = np.where(region > 0)
+
+    if len(xs) == 0:
+        return point
+
+    absolute_xs = xs + x1
+    absolute_ys = ys + y1
+    distances = (
+        (absolute_xs - x) ** 2
+        + (absolute_ys - y) ** 2
+    )
+
+    index = int(np.argmin(distances))
+    return (
+        int(absolute_xs[index]),
+        int(absolute_ys[index]),
+    )
+
+
+def snap_polygon_points(
+    points: list[tuple[int, int]],
+    edge_map: np.ndarray,
+    radius: int,
+) -> list[tuple[int, int]]:
+    return [
+        snap_point_to_edge(point, edge_map, radius)
+        for point in points
+    ]
+
+
+def smooth_closed_polygon(
+    points: list[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    if len(points) < 5:
+        return points
+
+    contour = np.asarray(points, dtype=np.int32).reshape((-1, 1, 2))
+    perimeter = cv2.arcLength(contour, True)
+
+    # Keep the polygon editable and avoid over-simplifying curved panels.
+    epsilon = max(0.8, perimeter * 0.0035)
+    simplified = cv2.approxPolyDP(
+        contour,
+        epsilon,
+        True,
+    )
+
+    result = [
+        (int(point[0][0]), int(point[0][1]))
+        for point in simplified
+    ]
+
+    return result if len(result) >= 3 else points
+
+
+def polygon_to_mask(
+    source_size: tuple[int, int],
+    points: list[tuple[int, int]],
+    feather_radius: int = 0,
+) -> Image.Image:
+    width, height = source_size
+    mask = np.zeros((height, width), dtype=np.uint8)
+
+    contour = np.asarray(
+        points,
+        dtype=np.int32,
+    ).reshape((-1, 1, 2))
+
+    cv2.fillPoly(mask, [contour], 255)
+
+    if feather_radius > 0:
+        sigma = max(0.8, feather_radius / 2.0)
+        blurred = cv2.GaussianBlur(
+            mask,
+            (0, 0),
+            sigmaX=sigma,
+            sigmaY=sigma,
+        )
+        mask = np.where(blurred > 40, 255, 0).astype(np.uint8)
+
+    return Image.fromarray(mask, mode="L")
+
+
+def validate_polygon_mask(
+    mask: Image.Image,
+    component_code: str,
+) -> None:
+    binary = mask_to_binary(mask)
+    area = int((binary > 0).sum())
+
+    if area < SMART_POLYGON_MIN_AREA_PIXELS:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "Il poligono disegnato è troppo piccolo.",
+                "component_code": component_code,
+                "mask_area_pixels": area,
+                "minimum_area_pixels": SMART_POLYGON_MIN_AREA_PIXELS,
+            },
+        )
+
+
+def smart_polygon_component_payload(
+    source: Image.Image,
+    component_code: str,
+    points: list,
+    snap_to_edges: bool,
+    snap_radius: int,
+    smooth_polygon: bool,
+    feather_radius: int,
+    confirm_mask: bool,
+) -> dict:
+    pixel_points = polygon_points_to_pixels(
+        points,
+        source.width,
+        source.height,
+    )
+
+    if len(pixel_points) < 3:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "Servono almeno tre punti validi.",
+                "component_code": component_code,
+            },
+        )
+
+    original_points = list(pixel_points)
+    edge_map = None
+
+    if snap_to_edges:
+        edge_map = build_vehicle_edge_map(source)
+        pixel_points = snap_polygon_points(
+            pixel_points,
+            edge_map,
+            snap_radius,
+        )
+
+    if smooth_polygon:
+        pixel_points = smooth_closed_polygon(pixel_points)
+
+    mask = polygon_to_mask(
+        source.size,
+        pixel_points,
+        feather_radius=feather_radius,
+    )
+    mask = clean_component_mask(mask)
+    validate_polygon_mask(mask, component_code)
+
+    binary = mask_to_binary(mask)
+    x, y, width, height = cv2.boundingRect(binary)
+
+    return {
+        "code": component_code,
+        "label": VEHICLE_COMPONENT_CATALOG.get(
+            component_code,
+            component_code,
+        ),
+        "category": component_category(component_code),
+        "mask_base64": mask_image_to_data_url(mask),
+        "bounding_box": {
+            "x": int(x),
+            "y": int(y),
+            "width": int(width),
+            "height": int(height),
+        },
+        "polygon_points": polygon_points_to_normalized(
+            pixel_points,
+            source.width,
+            source.height,
+        ),
+        "original_polygon_points": polygon_points_to_normalized(
+            original_points,
+            source.width,
+            source.height,
+        ),
+        "mask_source": "manual_smart_polygon",
+        "requires_review": not confirm_mask,
+        "sam_match_quality": (
+            "manual_confirmed"
+            if confirm_mask
+            else "manual_review"
+        ),
+        "selection_mode": "manual_smart_polygon",
+        "snap_to_edges": snap_to_edges,
+        "snap_radius": snap_radius,
+        "smooth_polygon": smooth_polygon,
+        "feather_radius": feather_radius,
+        "analysis_version": (
+            "vehicle-segmentation-v17-manual-smart-polygon"
+        ),
+    }
+
+
 def _mask_from_manual_input(
     manual_mask_base64: str,
     source_size: tuple[int, int],
@@ -4310,42 +4660,65 @@ def normalize_vehicle_analysis(
     if vehicle_view not in VEHICLE_VIEW_LABELS:
         vehicle_view = "unknown"
 
+    raw_components = raw.get(
+        "components",
+        raw.get("visible_components", []),
+    )
+    if not isinstance(raw_components, list):
+        raw_components = []
+
+    detected_components: list[dict] = []
+
+    for component in raw_components:
+        if not isinstance(component, dict):
+            continue
+
+        code = str(component.get("code", "")).strip()
+        if code not in VEHICLE_COMPONENT_CATALOG:
+            continue
+
+        box = component_detection_box(
+            component,
+            source.width,
+            source.height,
+        )
+
+        try:
+            confidence = float(component.get("confidence", 0.70))
+        except Exception:
+            confidence = 0.70
+
+        detected_components.append({
+            "code": code,
+            "label": VEHICLE_COMPONENT_CATALOG[code],
+            "category": component_category(code),
+            "confidence": round(max(0.0, min(confidence, 1.0)), 2),
+            "detection_box": box,
+            "mask_base64": None,
+            "mask_source": None,
+            "requires_manual_polygon": True,
+            "requires_review": True,
+            "selected": False,
+        })
+
+    detected_components.sort(
+        key=lambda item: item.get("confidence", 0.0),
+        reverse=True,
+    )
+
     return {
         "view": vehicle_view,
         "view_label": VEHICLE_VIEW_LABELS[vehicle_view],
         "vehicle_view": vehicle_view,
         "vehicle_view_label": VEHICLE_VIEW_LABELS[vehicle_view],
-        "components": prompted_components,
-        "visible_components": [
-            {
-                "code": item["code"],
-                "label": item["label"],
-                "category": item["category"],
-                "confidence": item["confidence"],
-                "mask_base64": item["mask_base64"],
-                "bounding_box": item["bounding_box"],
-                "mask_source": item["mask_source"],
-            }
-            for item in prompted_components
-        ],
-        "prompted_segmentation_failures": prompted_failures,
-        "prompted_success_count": sum(
-            1
-            for item in prompted_components
-            if item.get("mask_source") == "replicate_sam2_prompted_points"
+        "components": detected_components,
+        "visible_components": detected_components,
+        "automatic_masks_are_disabled": True,
+        "manual_polygon_required_only_for_selected_components": True,
+        "segmentation_strategy": "manual_smart_polygon",
+        "analysis_version": (
+            "vehicle-segmentation-v17-manual-smart-polygon"
         ),
-        "fallback_component_count": sum(
-            1
-            for item in prompted_components
-            if item.get("requires_review") is True
-        ),
-        "refined_component_count": sum(
-            1
-            for item in prompted_components
-            if item.get("refinement", {}).get("refinement_status") == "refined"
-        ),
-        "segmentation_strategy": "assisted_selection_proposal_only",
-        "automatic_masks_are_proposals": True,
     }
 
 
@@ -4489,7 +4862,7 @@ Bounding-box rules:
                 "model": configured_model,
                 "primary_error": primary_message[:800],
                 "fallback_error": fallback_message[:800],
-                "analysis_version": "vehicle-segmentation-v16.4-assisted-selection",
+                "analysis_version": "vehicle-segmentation-v17-manual-smart-polygon",
             },
         ) from fallback_exc
 
@@ -4619,59 +4992,19 @@ def run_async_vehicle_analysis(job_id: str) -> None:
 
         set_analysis_job(
             job_id,
-            progress_stage="segmenting_components_with_prompted_sam2",
-            progress_percent=40,
+            progress_stage="preparing_manual_polygon_workspace",
+            progress_percent=88,
             current_component_index=0,
             current_component_total=len(raw_components),
             current_component_code=None,
             current_component_label=None,
         )
 
-        def update_component_progress(
-            index: int,
-            total: int,
-            code: str,
-            label: str,
-            stage: str,
-        ) -> None:
-            if stage == "local_refinement":
-                percent = 88 + round(
-                    (index / max(1, total)) * 9
-                )
-            else:
-                percent = 40 + round(
-                    (index / max(1, total)) * 45
-                )
-
-            set_analysis_job(
-                job_id,
-                progress_stage=stage,
-                progress_percent=min(97, percent),
-                current_component_index=index,
-                current_component_total=total,
-                current_component_code=code or None,
-                current_component_label=label or None,
-            )
-
-        prompted_components, prompted_failures = (
-            prompted_segment_components(
-                image_data_url,
-                source,
-                raw_components,
-                progress_callback=update_component_progress,
-            )
-        )
-
-        set_analysis_job(
-            job_id,
-            progress_stage="building_component_masks",
-            progress_percent=88,
-        )
         normalized = normalize_vehicle_analysis(
             raw_analysis,
             source,
-            prompted_components,
-            prompted_failures,
+            [],
+            [],
         )
 
         if not normalized["components"]:
@@ -4679,21 +5012,16 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                 status_code=422,
                 detail={
                     "message": (
-                        "SAM 2 guidato non ha prodotto maschere "
-                        "utilizzabili per i componenti rilevati."
+                        "Non sono stati rilevati componenti utilizzabili "
+                        "per la selezione manuale."
                     ),
                     "raw_component_count": len(raw_components),
-                    "prompted_failure_count": len(prompted_failures),
-                    "prompted_failures_preview": prompted_failures[:8],
-                    "segmentation_strategy": (
-                        "per_component_prompted_sam2_points"
-                    ),
                     "analysis_version": (
-                        "vehicle-segmentation-v16.2-"
-                        "prompted-component-segmentation"
+                        "vehicle-segmentation-v17-manual-smart-polygon"
                     ),
                 },
             )
+
 
         result = {
             **normalized,
@@ -4702,12 +5030,12 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                 "gpt-4.1-mini",
             ),
             "analysis_version": (
-                "vehicle-segmentation-v16.4-assisted-selection"
+                "vehicle-segmentation-v17-manual-smart-polygon"
             ),
             "mask_format": "data:image/png;base64",
             "mask_semantics": "white_component_black_background",
-            "segmentation_provider": "replicate/meta-sam-2-video",
-            "segmentation_strategy": "assisted_selection_proposal_only",
+            "segmentation_provider": "manual-smart-polygon",
+            "segmentation_strategy": "manual_smart_polygon",
             "component_timeout_seconds": PROMPTED_SAM_COMPONENT_TIMEOUT_SECONDS,
         }
 
@@ -4750,7 +5078,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     "error_type": type(exc).__name__,
                     "error": str(exc)[:1600],
                     "analysis_version": (
-                        "vehicle-segmentation-v16.4-assisted-selection"
+                        "vehicle-segmentation-v17-manual-smart-polygon"
                     ),
                 },
             },
@@ -4792,7 +5120,7 @@ def start_vehicle_component_analysis(
             "result": None,
             "error": None,
             "analysis_version": (
-                "vehicle-segmentation-v16.4-assisted-selection"
+                "vehicle-segmentation-v17-manual-smart-polygon"
             ),
         }
 
@@ -4810,7 +5138,7 @@ def start_vehicle_component_analysis(
             f"/v1/vehicle/analyze-components/status/{job_id}"
         ),
         "analysis_version": (
-            "vehicle-segmentation-v16.4-assisted-selection"
+            "vehicle-segmentation-v17-manual-smart-polygon"
         ),
     }
 
@@ -4870,6 +5198,67 @@ def delete_vehicle_component_analysis_job(job_id: str):
     }
 
 
+
+
+
+@app.post("/v1/vehicle/snap-polygon-points")
+def snap_vehicle_polygon_points(
+    payload: SmartPolygonSnapRequest,
+):
+    source = decode_data_url_image(
+        payload.image_base64,
+        "image_base64",
+    ).convert("RGB")
+
+    pixel_points = polygon_points_to_pixels(
+        payload.points,
+        source.width,
+        source.height,
+    )
+    edge_map = build_vehicle_edge_map(source)
+    snapped_points = snap_polygon_points(
+        pixel_points,
+        edge_map,
+        payload.snap_radius,
+    )
+
+    return {
+        "points": polygon_points_to_normalized(
+            snapped_points,
+            source.width,
+            source.height,
+        ),
+        "original_points": polygon_points_to_normalized(
+            pixel_points,
+            source.width,
+            source.height,
+        ),
+        "snap_radius": payload.snap_radius,
+        "analysis_version": (
+            "vehicle-segmentation-v17-manual-smart-polygon"
+        ),
+    }
+
+
+@app.post("/v1/vehicle/manual-smart-polygon")
+def create_vehicle_manual_smart_polygon(
+    payload: SmartPolygonRequest,
+):
+    source = decode_data_url_image(
+        payload.image_base64,
+        "image_base64",
+    ).convert("RGB")
+
+    return smart_polygon_component_payload(
+        source=source,
+        component_code=payload.component_code,
+        points=payload.points,
+        snap_to_edges=payload.snap_to_edges,
+        snap_radius=payload.snap_radius,
+        smooth_polygon=payload.smooth_polygon,
+        feather_radius=payload.feather_radius,
+        confirm_mask=payload.confirm_mask,
+    )
 
 
 @app.post("/v1/vehicle/assisted-component-selection")
@@ -5055,7 +5444,7 @@ def refine_vehicle_component(payload: ComponentRefineRequest):
         "requires_review": diagnostics.get("refinement_status") != "refined",
         "refinement": diagnostics,
         "analysis_version": (
-            "vehicle-segmentation-v16.4-assisted-selection"
+            "vehicle-segmentation-v17-manual-smart-polygon"
         ),
     }
 
@@ -5068,7 +5457,7 @@ def analyze_vehicle_components_sync_disabled(
         status_code=409,
         detail={
             "message": (
-                "La V16.4 usa l'analisi asincrona per evitare timeout. "
+                "La V17 usa l'analisi asincrona per il rilevamento dei componenti. "
                 "Usare POST /v1/vehicle/analyze-components/start e poi "
                 "GET /v1/vehicle/analyze-components/status/{job_id}."
             ),
@@ -5079,7 +5468,7 @@ def analyze_vehicle_components_sync_disabled(
                 "/v1/vehicle/analyze-components/status/{job_id}"
             ),
             "analysis_version": (
-                "vehicle-segmentation-v16.4-assisted-selection"
+                "vehicle-segmentation-v17-manual-smart-polygon"
             ),
         },
     )
@@ -5151,7 +5540,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v16.4-assisted-selection",
+        "prompt_version": "damage-v17-manual-smart-polygon",
     }
 
 
@@ -5435,7 +5824,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v16.4-assisted-selection",
+        "prompt_version": "damage-v17-manual-smart-polygon",
         "deformation_type": payload.deformation_type,
         "impact_direction": payload.impact_direction,
         "contact_traces_enabled": payload.contact_traces_enabled,
