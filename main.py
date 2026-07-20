@@ -48,7 +48,7 @@ ALLOWED_ORIGINS = [
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.6.1.4",
+    version="1.6.1.5",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -2232,7 +2232,7 @@ def _replicate_json_request(
             status_code=500,
             detail={
                 "message": "REPLICATE_API_TOKEN non configurato su Render.",
-                "analysis_version": "vehicle-segmentation-v16.1.4-sam-mask-decode-fallback",
+                "analysis_version": "vehicle-segmentation-v16.1.5-replicate-output-download-fix",
             },
         )
 
@@ -2275,7 +2275,7 @@ def _replicate_json_request(
                 "http_status": exc.code,
                 "request_url": url,
                 "replicate_detail": error_body[:2000],
-                "analysis_version": "vehicle-segmentation-v16.1.4-sam-mask-decode-fallback",
+                "analysis_version": "vehicle-segmentation-v16.1.5-replicate-output-download-fix",
             },
         ) from exc
     except Exception as exc:
@@ -2284,7 +2284,7 @@ def _replicate_json_request(
             detail={
                 "message": "Connessione a Replicate non riuscita.",
                 "error": f"{type(exc).__name__}: {str(exc)}"[:1200],
-                "analysis_version": "vehicle-segmentation-v16.1.4-sam-mask-decode-fallback",
+                "analysis_version": "vehicle-segmentation-v16.1.5-replicate-output-download-fix",
             },
         ) from exc
 
@@ -2293,23 +2293,83 @@ def _download_binary_url(url: str) -> bytes:
     request = urllib.request.Request(
         url,
         headers={
-            "Authorization": f"Bearer {REPLICATE_API_TOKEN}",
-            "Accept": "image/png,image/*;q=0.9,*/*;q=0.1",
+            "Accept": "image/png,image/webp,image/jpeg,image/*;q=0.9,*/*;q=0.1",
+            "User-Agent": "CarDamageLab/16.1.5",
         },
         method="GET",
     )
+
     try:
         with urllib.request.urlopen(
             request,
             timeout=REPLICATE_TIMEOUT_SECONDS,
         ) as response:
-            return response.read()
-    except Exception as exc:
+            content_type = (
+                response.headers.get("Content-Type", "")
+                .split(";")[0]
+                .strip()
+                .lower()
+            )
+            raw = response.read()
+
+            if not raw:
+                raise ValueError("Risposta file vuota.")
+
+            if content_type and not (
+                content_type.startswith("image/")
+                or content_type == "application/octet-stream"
+            ):
+                preview = raw[:500].decode(
+                    "utf-8",
+                    errors="replace",
+                )
+                raise ValueError(
+                    f"Content-Type inatteso: {content_type}; "
+                    f"preview={preview}"
+                )
+
+            return raw
+
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        print(
+            "REPLICATE OUTPUT FILE HTTP ERROR:",
+            exc.code,
+            url,
+            body[:1200],
+        )
         raise HTTPException(
             status_code=502,
             detail={
-                "message": "Download maschera SAM 2 non riuscito.",
-                "error": f"{type(exc).__name__}: {str(exc)}"[:800],
+                "message": "Download output Replicate non riuscito.",
+                "http_status": exc.code,
+                "output_url": url,
+                "response_preview": body[:1200],
+                "analysis_version": (
+                    "vehicle-segmentation-v16.1.5-"
+                    "replicate-output-download-fix"
+                ),
+            },
+        ) from exc
+
+    except Exception as exc:
+        print(
+            "REPLICATE OUTPUT FILE ERROR:",
+            url,
+            type(exc).__name__,
+            str(exc),
+        )
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": "Download output Replicate non riuscito.",
+                "output_url": url,
+                "error_type": type(exc).__name__,
+                "error": str(exc)[:1200],
+                "analysis_version": (
+                    "vehicle-segmentation-v16.1.5-"
+                    "replicate-output-download-fix"
+                ),
             },
         ) from exc
 
@@ -2482,6 +2542,7 @@ def load_sam_candidate_masks(
     target_size: tuple[int, int],
 ) -> list[dict]:
     candidates: list[dict] = []
+    download_errors: list[dict] = []
 
     for index, url in enumerate(mask_urls):
         try:
@@ -2509,12 +2570,16 @@ def load_sam_candidate_masks(
             })
 
         except Exception as exc:
+            error_item = {
+                "index": index,
+                "url": str(url),
+                "error_type": type(exc).__name__,
+                "error": str(exc)[:500],
+            }
+            download_errors.append(error_item)
             print(
                 "SAM2 MASK DOWNLOAD ERROR:",
-                index,
-                url,
-                type(exc).__name__,
-                str(exc),
+                error_item,
             )
 
     if not candidates:
@@ -2526,6 +2591,8 @@ def load_sam_candidate_masks(
                     "state decodificate correttamente."
                 ),
                 "mask_url_count": len(mask_urls),
+                "download_error_count": len(download_errors),
+                "download_errors_preview": download_errors[:5],
                 "analysis_version": (
                     "vehicle-segmentation-v16.1.4-"
                     "sam-mask-decode-fallback"
@@ -3065,7 +3132,7 @@ Bounding-box rules:
                 "model": configured_model,
                 "primary_error": primary_message[:800],
                 "fallback_error": fallback_message[:800],
-                "analysis_version": "vehicle-segmentation-v16.1.4-sam-mask-decode-fallback",
+                "analysis_version": "vehicle-segmentation-v16.1.5-replicate-output-download-fix",
             },
         ) from fallback_exc
 
@@ -3226,7 +3293,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     ),
                     "matching_policy": "relaxed_best_intersection",
                     "analysis_version": (
-                        "vehicle-segmentation-v16.1.4-sam-mask-decode-fallback"
+                        "vehicle-segmentation-v16.1.5-replicate-output-download-fix"
                     ),
                 },
             )
@@ -3238,7 +3305,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                 "gpt-4.1-mini",
             ),
             "analysis_version": (
-                "vehicle-segmentation-v16.1.4-sam-mask-decode-fallback"
+                "vehicle-segmentation-v16.1.5-replicate-output-download-fix"
             ),
             "mask_format": "data:image/png;base64",
             "mask_semantics": "white_component_black_background",
@@ -3284,7 +3351,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     "error_type": type(exc).__name__,
                     "error": str(exc)[:1600],
                     "analysis_version": (
-                        "vehicle-segmentation-v16.1.4-sam-mask-decode-fallback"
+                        "vehicle-segmentation-v16.1.5-replicate-output-download-fix"
                     ),
                 },
             },
@@ -3326,7 +3393,7 @@ def start_vehicle_component_analysis(
             "result": None,
             "error": None,
             "analysis_version": (
-                "vehicle-segmentation-v16.1.4-sam-mask-decode-fallback"
+                "vehicle-segmentation-v16.1.5-replicate-output-download-fix"
             ),
         }
 
@@ -3344,7 +3411,7 @@ def start_vehicle_component_analysis(
             f"/v1/vehicle/analyze-components/status/{job_id}"
         ),
         "analysis_version": (
-            "vehicle-segmentation-v16.1.4-sam-mask-decode-fallback"
+            "vehicle-segmentation-v16.1.5-replicate-output-download-fix"
         ),
     }
 
@@ -3423,7 +3490,7 @@ def analyze_vehicle_components_sync_disabled(
                 "/v1/vehicle/analyze-components/status/{job_id}"
             ),
             "analysis_version": (
-                "vehicle-segmentation-v16.1.4-sam-mask-decode-fallback"
+                "vehicle-segmentation-v16.1.5-replicate-output-download-fix"
             ),
         },
     )
@@ -3495,7 +3562,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v16.1.4-sam-mask-decode-fallback",
+        "prompt_version": "damage-v16.1.5-replicate-output-download-fix",
     }
 
 
@@ -3779,7 +3846,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v16.1.4-sam-mask-decode-fallback",
+        "prompt_version": "damage-v16.1.5-replicate-output-download-fix",
         "deformation_type": payload.deformation_type,
         "impact_direction": payload.impact_direction,
         "contact_traces_enabled": payload.contact_traces_enabled,
