@@ -48,7 +48,7 @@ ALLOWED_ORIGINS = [
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.6.1.6",
+    version="1.6.1.7",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -2232,7 +2232,7 @@ def _replicate_json_request(
             status_code=500,
             detail={
                 "message": "REPLICATE_API_TOKEN non configurato su Render.",
-                "analysis_version": "vehicle-segmentation-v16.1.6-restore-clean-component-mask",
+                "analysis_version": "vehicle-segmentation-v16.1.7-fix-openai-bounding-boxes",
             },
         )
 
@@ -2275,7 +2275,7 @@ def _replicate_json_request(
                 "http_status": exc.code,
                 "request_url": url,
                 "replicate_detail": error_body[:2000],
-                "analysis_version": "vehicle-segmentation-v16.1.6-restore-clean-component-mask",
+                "analysis_version": "vehicle-segmentation-v16.1.7-fix-openai-bounding-boxes",
             },
         ) from exc
     except Exception as exc:
@@ -2284,7 +2284,7 @@ def _replicate_json_request(
             detail={
                 "message": "Connessione a Replicate non riuscita.",
                 "error": f"{type(exc).__name__}: {str(exc)}"[:1200],
-                "analysis_version": "vehicle-segmentation-v16.1.6-restore-clean-component-mask",
+                "analysis_version": "vehicle-segmentation-v16.1.7-fix-openai-bounding-boxes",
             },
         ) from exc
 
@@ -2772,6 +2772,58 @@ def build_box_fallback_mask(
     return Image.fromarray(mask, mode="L")
 
 
+
+def component_detection_box(
+    component: dict,
+    width: int,
+    height: int,
+) -> dict | None:
+    raw_box = (
+        component.get("bounding_box")
+        or component.get("box")
+        or component.get("bbox")
+    )
+
+    box = normalize_box(raw_box, width, height)
+    if box is not None:
+        return box
+
+    # Backward compatibility: derive a box from polygon points if returned.
+    polygon = component.get("polygon")
+    if isinstance(polygon, list) and len(polygon) >= 3:
+        xs = []
+        ys = []
+
+        for point in polygon:
+            if isinstance(point, dict):
+                raw_x = point.get("x")
+                raw_y = point.get("y")
+            elif isinstance(point, (list, tuple)) and len(point) >= 2:
+                raw_x, raw_y = point[0], point[1]
+            else:
+                continue
+
+            try:
+                xs.append(float(raw_x))
+                ys.append(float(raw_y))
+            except Exception:
+                continue
+
+        if len(xs) >= 3 and len(ys) >= 3:
+            return normalize_box(
+                {
+                    "x1": min(xs),
+                    "y1": min(ys),
+                    "x2": max(xs),
+                    "y2": max(ys),
+                },
+                width,
+                height,
+            )
+
+    return None
+
+
 def assign_sam_masks_to_components(
     source: Image.Image,
     raw_components: list[dict],
@@ -2790,13 +2842,8 @@ def assign_sam_masks_to_components(
         if code not in VEHICLE_COMPONENT_CATALOG:
             continue
 
-        raw_box = (
-            component.get("bounding_box")
-            or component.get("box")
-            or component.get("bbox")
-        )
-        box = normalize_box(
-            raw_box,
+        box = component_detection_box(
+            component,
             source.width,
             source.height,
         )
@@ -2804,7 +2851,7 @@ def assign_sam_masks_to_components(
             print(
                 "SAM2 COMPONENT SKIPPED - INVALID BOX:",
                 code,
-                raw_box,
+                component,
             )
             continue
 
@@ -3083,9 +3130,12 @@ Return ONLY a valid JSON object with this exact structure:
     {{
       "code": one of {allowed_codes},
       "confidence": number from 0 to 1,
-      "polygon": [
-        {{"x": integer from 0 to 1000, "y": integer from 0 to 1000}}
-      ]
+      "bounding_box": {{
+        "x1": integer from 0 to 1000,
+        "y1": integer from 0 to 1000,
+        "x2": integer from 0 to 1000,
+        "y2": integer from 0 to 1000
+      }}
     }}
   ]
 }}
@@ -3196,7 +3246,7 @@ Bounding-box rules:
                 "model": configured_model,
                 "primary_error": primary_message[:800],
                 "fallback_error": fallback_message[:800],
-                "analysis_version": "vehicle-segmentation-v16.1.6-restore-clean-component-mask",
+                "analysis_version": "vehicle-segmentation-v16.1.7-fix-openai-bounding-boxes",
             },
         ) from fallback_exc
 
@@ -3356,8 +3406,23 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                         sam_result.get("individual_masks", [])
                     ),
                     "matching_policy": "relaxed_best_intersection",
+                    "raw_components_preview": (
+                        raw_analysis.get(
+                            "components",
+                            raw_analysis.get("visible_components", []),
+                        )[:5]
+                        if isinstance(raw_analysis, dict)
+                        and isinstance(
+                            raw_analysis.get(
+                                "components",
+                                raw_analysis.get("visible_components", []),
+                            ),
+                            list,
+                        )
+                        else []
+                    ),
                     "analysis_version": (
-                        "vehicle-segmentation-v16.1.6-restore-clean-component-mask"
+                        "vehicle-segmentation-v16.1.7-fix-openai-bounding-boxes"
                     ),
                 },
             )
@@ -3369,7 +3434,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                 "gpt-4.1-mini",
             ),
             "analysis_version": (
-                "vehicle-segmentation-v16.1.6-restore-clean-component-mask"
+                "vehicle-segmentation-v16.1.7-fix-openai-bounding-boxes"
             ),
             "mask_format": "data:image/png;base64",
             "mask_semantics": "white_component_black_background",
@@ -3415,7 +3480,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     "error_type": type(exc).__name__,
                     "error": str(exc)[:1600],
                     "analysis_version": (
-                        "vehicle-segmentation-v16.1.6-restore-clean-component-mask"
+                        "vehicle-segmentation-v16.1.7-fix-openai-bounding-boxes"
                     ),
                 },
             },
@@ -3457,7 +3522,7 @@ def start_vehicle_component_analysis(
             "result": None,
             "error": None,
             "analysis_version": (
-                "vehicle-segmentation-v16.1.6-restore-clean-component-mask"
+                "vehicle-segmentation-v16.1.7-fix-openai-bounding-boxes"
             ),
         }
 
@@ -3475,7 +3540,7 @@ def start_vehicle_component_analysis(
             f"/v1/vehicle/analyze-components/status/{job_id}"
         ),
         "analysis_version": (
-            "vehicle-segmentation-v16.1.6-restore-clean-component-mask"
+            "vehicle-segmentation-v16.1.7-fix-openai-bounding-boxes"
         ),
     }
 
@@ -3554,7 +3619,7 @@ def analyze_vehicle_components_sync_disabled(
                 "/v1/vehicle/analyze-components/status/{job_id}"
             ),
             "analysis_version": (
-                "vehicle-segmentation-v16.1.6-restore-clean-component-mask"
+                "vehicle-segmentation-v16.1.7-fix-openai-bounding-boxes"
             ),
         },
     )
@@ -3626,7 +3691,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v16.1.6-restore-clean-component-mask",
+        "prompt_version": "damage-v16.1.7-fix-openai-bounding-boxes",
     }
 
 
@@ -3910,7 +3975,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v16.1.6-restore-clean-component-mask",
+        "prompt_version": "damage-v16.1.7-fix-openai-bounding-boxes",
         "deformation_type": payload.deformation_type,
         "impact_direction": payload.impact_direction,
         "contact_traces_enabled": payload.contact_traces_enabled,
