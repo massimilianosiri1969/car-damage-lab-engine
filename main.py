@@ -45,7 +45,7 @@ ALLOWED_ORIGINS = [
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.6.1",
+    version="1.6.1.1",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -2177,7 +2177,7 @@ def _replicate_json_request(
             status_code=500,
             detail={
                 "message": "REPLICATE_API_TOKEN non configurato su Render.",
-                "analysis_version": "vehicle-segmentation-v16.1-replicate-sam2",
+                "analysis_version": "vehicle-segmentation-v16.1.1-replicate-auth-diagnostics",
             },
         )
 
@@ -2207,13 +2207,20 @@ def _replicate_json_request(
             return json.loads(content or "{}")
     except urllib.error.HTTPError as exc:
         error_body = exc.read().decode("utf-8", errors="replace")
+        print(
+            "REPLICATE HTTP ERROR:",
+            exc.code,
+            url,
+            error_body[:2000],
+        )
         raise HTTPException(
             status_code=502,
             detail={
                 "message": "Errore API Replicate.",
                 "http_status": exc.code,
-                "replicate_detail": error_body[:1200],
-                "analysis_version": "vehicle-segmentation-v16.1-replicate-sam2",
+                "request_url": url,
+                "replicate_detail": error_body[:2000],
+                "analysis_version": "vehicle-segmentation-v16.1.1-replicate-auth-diagnostics",
             },
         ) from exc
     except Exception as exc:
@@ -2222,7 +2229,7 @@ def _replicate_json_request(
             detail={
                 "message": "Connessione a Replicate non riuscita.",
                 "error": f"{type(exc).__name__}: {str(exc)}"[:1200],
-                "analysis_version": "vehicle-segmentation-v16.1-replicate-sam2",
+                "analysis_version": "vehicle-segmentation-v16.1.1-replicate-auth-diagnostics",
             },
         ) from exc
 
@@ -2230,7 +2237,10 @@ def _replicate_json_request(
 def _download_binary_url(url: str) -> bytes:
     request = urllib.request.Request(
         url,
-        headers={"Accept": "image/png,image/*;q=0.9,*/*;q=0.1"},
+        headers={
+            "Authorization": f"Bearer {REPLICATE_API_TOKEN}",
+            "Accept": "image/png,image/*;q=0.9,*/*;q=0.1",
+        },
         method="GET",
     )
     try:
@@ -2298,6 +2308,13 @@ def call_replicate_sam2(image_data_url: str) -> dict:
         )
 
     if current.get("status") != "succeeded":
+        print(
+            "REPLICATE SAM2 FAILED:",
+            prediction_id,
+            current.get("status"),
+            current.get("error"),
+            str(current.get("logs") or "")[-2000:],
+        )
         raise HTTPException(
             status_code=502,
             detail={
@@ -2305,11 +2322,39 @@ def call_replicate_sam2(image_data_url: str) -> dict:
                 "prediction_id": prediction_id,
                 "status": current.get("status"),
                 "error": current.get("error"),
+                "logs": str(current.get("logs") or "")[-1600:],
             },
         )
 
     output = current.get("output") or {}
+
+    if not isinstance(output, dict):
+        print(
+            "REPLICATE UNEXPECTED OUTPUT:",
+            prediction_id,
+            type(output).__name__,
+            repr(output)[:2000],
+        )
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": "Formato output SAM 2 non riconosciuto.",
+                "prediction_id": prediction_id,
+                "output_type": type(output).__name__,
+                "output_preview": repr(output)[:1200],
+            },
+        )
+
     individual_masks = output.get("individual_masks") or []
+
+    print(
+        "REPLICATE SAM2 SUCCEEDED:",
+        prediction_id,
+        "individual_masks=",
+        len(individual_masks) if isinstance(individual_masks, list) else -1,
+        "metrics=",
+        current.get("metrics") or {},
+    )
 
     if not isinstance(individual_masks, list) or not individual_masks:
         raise HTTPException(
@@ -2317,6 +2362,8 @@ def call_replicate_sam2(image_data_url: str) -> dict:
             detail={
                 "message": "SAM 2 non ha restituito maschere individuali.",
                 "prediction_id": prediction_id,
+                "output_keys": list(output.keys()),
+                "logs": str(current.get("logs") or "")[-1200:],
             },
         )
 
@@ -2325,6 +2372,7 @@ def call_replicate_sam2(image_data_url: str) -> dict:
         "individual_masks": individual_masks,
         "combined_mask": output.get("combined_mask"),
         "metrics": current.get("metrics") or {},
+        "logs": current.get("logs") or "",
     }
 
 
@@ -2359,9 +2407,27 @@ def load_sam_candidate_masks(
             print(
                 "SAM2 MASK DOWNLOAD ERROR:",
                 index,
+                url,
                 type(exc).__name__,
                 str(exc),
             )
+
+    if not candidates:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": (
+                    "Le maschere SAM 2 sono state create ma non è stato "
+                    "possibile scaricarle."
+                ),
+                "mask_url_count": len(mask_urls),
+                "hint": "Verificare autorizzazione Bearer per replicate.delivery.",
+                "analysis_version": (
+                    "vehicle-segmentation-v16.1.1-"
+                    "replicate-auth-diagnostics"
+                ),
+            },
+        )
 
     return candidates
 
@@ -2741,7 +2807,7 @@ Bounding-box rules:
                 "model": configured_model,
                 "primary_error": primary_message[:800],
                 "fallback_error": fallback_message[:800],
-                "analysis_version": "vehicle-segmentation-v16.1-replicate-sam2",
+                "analysis_version": "vehicle-segmentation-v16.1.1-replicate-auth-diagnostics",
             },
         ) from fallback_exc
 
@@ -2790,7 +2856,7 @@ def analyze_vehicle_components(payload: VehicleAnalyzeRequest):
                     if isinstance(raw_analysis, dict)
                     else []
                 ),
-                "analysis_version": "vehicle-segmentation-v16.1-replicate-sam2",
+                "analysis_version": "vehicle-segmentation-v16.1.1-replicate-auth-diagnostics",
             },
         )
 
@@ -2800,7 +2866,7 @@ def analyze_vehicle_components(payload: VehicleAnalyzeRequest):
             "OPENAI_VISION_MODEL",
             "gpt-4.1-mini",
         ),
-        "analysis_version": "vehicle-segmentation-v16.1-replicate-sam2",
+        "analysis_version": "vehicle-segmentation-v16.1.1-replicate-auth-diagnostics",
         "mask_format": "data:image/png;base64",
         "mask_semantics": "white_component_black_background",
         "segmentation_provider": "replicate/meta-sam-2",
@@ -2873,7 +2939,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v16.1-replicate-sam2",
+        "prompt_version": "damage-v16.1.1-replicate-auth-diagnostics",
     }
 
 
@@ -3157,7 +3223,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v16.1-replicate-sam2",
+        "prompt_version": "damage-v16.1.1-replicate-auth-diagnostics",
         "deformation_type": payload.deformation_type,
         "impact_direction": payload.impact_direction,
         "contact_traces_enabled": payload.contact_traces_enabled,
