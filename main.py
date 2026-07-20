@@ -48,7 +48,7 @@ ALLOWED_ORIGINS = [
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.6.1.5",
+    version="1.6.1.6",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -2232,7 +2232,7 @@ def _replicate_json_request(
             status_code=500,
             detail={
                 "message": "REPLICATE_API_TOKEN non configurato su Render.",
-                "analysis_version": "vehicle-segmentation-v16.1.5-replicate-output-download-fix",
+                "analysis_version": "vehicle-segmentation-v16.1.6-restore-clean-component-mask",
             },
         )
 
@@ -2275,7 +2275,7 @@ def _replicate_json_request(
                 "http_status": exc.code,
                 "request_url": url,
                 "replicate_detail": error_body[:2000],
-                "analysis_version": "vehicle-segmentation-v16.1.5-replicate-output-download-fix",
+                "analysis_version": "vehicle-segmentation-v16.1.6-restore-clean-component-mask",
             },
         ) from exc
     except Exception as exc:
@@ -2284,7 +2284,7 @@ def _replicate_json_request(
             detail={
                 "message": "Connessione a Replicate non riuscita.",
                 "error": f"{type(exc).__name__}: {str(exc)}"[:1200],
-                "analysis_version": "vehicle-segmentation-v16.1.5-replicate-output-download-fix",
+                "analysis_version": "vehicle-segmentation-v16.1.6-restore-clean-component-mask",
             },
         ) from exc
 
@@ -2489,6 +2489,70 @@ def call_replicate_sam2(image_data_url: str) -> dict:
         "metrics": current.get("metrics") or {},
         "logs": current.get("logs") or "",
     }
+
+
+
+def clean_component_mask(mask: Image.Image) -> Image.Image:
+    """
+    Pulisce una maschera binaria:
+    - converte in bianco/nero;
+    - chiude piccoli buchi;
+    - rimuove rumore e componenti troppo piccoli;
+    - conserva le aree principali.
+    """
+    binary = mask_to_binary(mask)
+    height, width = binary.shape
+
+    kernel_size = max(3, round(min(width, height) * 0.004))
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+
+    kernel = np.ones((kernel_size, kernel_size), np.uint8)
+
+    cleaned = cv2.morphologyEx(
+        binary,
+        cv2.MORPH_CLOSE,
+        kernel,
+    )
+    cleaned = cv2.morphologyEx(
+        cleaned,
+        cv2.MORPH_OPEN,
+        kernel,
+    )
+
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        np.where(cleaned > 0, 1, 0).astype(np.uint8),
+        connectivity=8,
+    )
+
+    if count <= 1:
+        return Image.fromarray(cleaned, mode="L")
+
+    minimum_area = max(
+        16,
+        round(width * height * SEGMENTATION_MIN_AREA_RATIO),
+    )
+
+    selected = np.zeros_like(cleaned)
+
+    component_areas = [
+        int(stats[index, cv2.CC_STAT_AREA])
+        for index in range(1, count)
+    ]
+    largest_area = max(component_areas, default=0)
+
+    for index in range(1, count):
+        area = int(stats[index, cv2.CC_STAT_AREA])
+
+        if area >= minimum_area or (
+            largest_area > 0 and area >= largest_area * 0.20
+        ):
+            selected[labels == index] = 255
+
+    if int((selected > 0).sum()) == 0:
+        selected = cleaned
+
+    return Image.fromarray(selected, mode="L")
 
 
 def _decode_sam_mask_image(
@@ -3132,7 +3196,7 @@ Bounding-box rules:
                 "model": configured_model,
                 "primary_error": primary_message[:800],
                 "fallback_error": fallback_message[:800],
-                "analysis_version": "vehicle-segmentation-v16.1.5-replicate-output-download-fix",
+                "analysis_version": "vehicle-segmentation-v16.1.6-restore-clean-component-mask",
             },
         ) from fallback_exc
 
@@ -3293,7 +3357,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     ),
                     "matching_policy": "relaxed_best_intersection",
                     "analysis_version": (
-                        "vehicle-segmentation-v16.1.5-replicate-output-download-fix"
+                        "vehicle-segmentation-v16.1.6-restore-clean-component-mask"
                     ),
                 },
             )
@@ -3305,7 +3369,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                 "gpt-4.1-mini",
             ),
             "analysis_version": (
-                "vehicle-segmentation-v16.1.5-replicate-output-download-fix"
+                "vehicle-segmentation-v16.1.6-restore-clean-component-mask"
             ),
             "mask_format": "data:image/png;base64",
             "mask_semantics": "white_component_black_background",
@@ -3351,7 +3415,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     "error_type": type(exc).__name__,
                     "error": str(exc)[:1600],
                     "analysis_version": (
-                        "vehicle-segmentation-v16.1.5-replicate-output-download-fix"
+                        "vehicle-segmentation-v16.1.6-restore-clean-component-mask"
                     ),
                 },
             },
@@ -3393,7 +3457,7 @@ def start_vehicle_component_analysis(
             "result": None,
             "error": None,
             "analysis_version": (
-                "vehicle-segmentation-v16.1.5-replicate-output-download-fix"
+                "vehicle-segmentation-v16.1.6-restore-clean-component-mask"
             ),
         }
 
@@ -3411,7 +3475,7 @@ def start_vehicle_component_analysis(
             f"/v1/vehicle/analyze-components/status/{job_id}"
         ),
         "analysis_version": (
-            "vehicle-segmentation-v16.1.5-replicate-output-download-fix"
+            "vehicle-segmentation-v16.1.6-restore-clean-component-mask"
         ),
     }
 
@@ -3490,7 +3554,7 @@ def analyze_vehicle_components_sync_disabled(
                 "/v1/vehicle/analyze-components/status/{job_id}"
             ),
             "analysis_version": (
-                "vehicle-segmentation-v16.1.5-replicate-output-download-fix"
+                "vehicle-segmentation-v16.1.6-restore-clean-component-mask"
             ),
         },
     )
@@ -3562,7 +3626,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v16.1.5-replicate-output-download-fix",
+        "prompt_version": "damage-v16.1.6-restore-clean-component-mask",
     }
 
 
@@ -3846,7 +3910,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v16.1.5-replicate-output-download-fix",
+        "prompt_version": "damage-v16.1.6-restore-clean-component-mask",
         "deformation_type": payload.deformation_type,
         "impact_direction": payload.impact_direction,
         "contact_traces_enabled": payload.contact_traces_enabled,
