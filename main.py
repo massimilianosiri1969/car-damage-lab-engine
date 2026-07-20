@@ -48,7 +48,7 @@ ALLOWED_ORIGINS = [
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.6.1.3",
+    version="1.6.1.4",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -2150,22 +2150,57 @@ def normalize_box(
     width: int,
     height: int,
 ) -> dict | None:
-    if not isinstance(raw_box, dict):
+    values = None
+
+    if isinstance(raw_box, dict):
+        aliases = [
+            ("x1", "y1", "x2", "y2"),
+            ("left", "top", "right", "bottom"),
+            ("xmin", "ymin", "xmax", "ymax"),
+        ]
+        for names in aliases:
+            if all(name in raw_box for name in names):
+                values = [raw_box[name] for name in names]
+                break
+
+        if values is None and all(
+            name in raw_box for name in ("x", "y", "width", "height")
+        ):
+            x = raw_box["x"]
+            y = raw_box["y"]
+            values = [
+                x,
+                y,
+                float(x) + float(raw_box["width"]),
+                float(y) + float(raw_box["height"]),
+            ]
+
+    elif isinstance(raw_box, (list, tuple)) and len(raw_box) >= 4:
+        values = list(raw_box[:4])
+
+    if values is None:
         return None
 
     try:
-        x1 = float(raw_box.get("x1"))
-        y1 = float(raw_box.get("y1"))
-        x2 = float(raw_box.get("x2"))
-        y2 = float(raw_box.get("y2"))
+        x1, y1, x2, y2 = [float(value) for value in values]
     except Exception:
         return None
 
-    # Bounding box normalizzato 0..1000.
-    x1 = round((x1 / 1000.0) * (width - 1))
-    y1 = round((y1 / 1000.0) * (height - 1))
-    x2 = round((x2 / 1000.0) * (width - 1))
-    y2 = round((y2 / 1000.0) * (height - 1))
+    maximum = max(abs(x1), abs(y1), abs(x2), abs(y2))
+
+    if maximum <= 1.5:
+        scale_x = width - 1
+        scale_y = height - 1
+    elif maximum <= 1100:
+        scale_x = (width - 1) / 1000.0
+        scale_y = (height - 1) / 1000.0
+    else:
+        scale_x = scale_y = 1.0
+
+    x1 = round(x1 * scale_x)
+    y1 = round(y1 * scale_y)
+    x2 = round(x2 * scale_x)
+    y2 = round(y2 * scale_y)
 
     left = max(0, min(width - 1, min(x1, x2)))
     top = max(0, min(height - 1, min(y1, y2)))
@@ -2197,7 +2232,7 @@ def _replicate_json_request(
             status_code=500,
             detail={
                 "message": "REPLICATE_API_TOKEN non configurato su Render.",
-                "analysis_version": "vehicle-segmentation-v16.1.3-sam-matching-relaxed",
+                "analysis_version": "vehicle-segmentation-v16.1.4-sam-mask-decode-fallback",
             },
         )
 
@@ -2240,7 +2275,7 @@ def _replicate_json_request(
                 "http_status": exc.code,
                 "request_url": url,
                 "replicate_detail": error_body[:2000],
-                "analysis_version": "vehicle-segmentation-v16.1.3-sam-matching-relaxed",
+                "analysis_version": "vehicle-segmentation-v16.1.4-sam-mask-decode-fallback",
             },
         ) from exc
     except Exception as exc:
@@ -2249,7 +2284,7 @@ def _replicate_json_request(
             detail={
                 "message": "Connessione a Replicate non riuscita.",
                 "error": f"{type(exc).__name__}: {str(exc)}"[:1200],
-                "analysis_version": "vehicle-segmentation-v16.1.3-sam-matching-relaxed",
+                "analysis_version": "vehicle-segmentation-v16.1.4-sam-mask-decode-fallback",
             },
         ) from exc
 
@@ -2396,6 +2431,52 @@ def call_replicate_sam2(image_data_url: str) -> dict:
     }
 
 
+def _decode_sam_mask_image(
+    raw: bytes,
+    target_size: tuple[int, int],
+) -> tuple[Image.Image, str]:
+    original = Image.open(io.BytesIO(raw))
+    rgba = original.convert("RGBA")
+    rgba = rgba.resize(
+        target_size,
+        Image.Resampling.NEAREST,
+    )
+
+    array = np.asarray(rgba, dtype=np.uint8)
+    rgb = array[:, :, :3]
+    alpha = array[:, :, 3]
+
+    luminance = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+
+    alpha_active = alpha > 8
+    alpha_ratio = float(alpha_active.mean())
+
+    # Prefer transparency when it clearly identifies a limited foreground.
+    if 0.0001 < alpha_ratio < 0.95:
+        binary = np.where(alpha_active, 255, 0).astype(np.uint8)
+        mode = "alpha"
+    else:
+        bright = luminance > 127
+        bright_ratio = float(bright.mean())
+
+        # SAM output variants can be white-on-black or black-on-white.
+        if bright_ratio <= 0.50:
+            binary = np.where(bright, 255, 0).astype(np.uint8)
+            mode = "bright_foreground"
+        else:
+            binary = np.where(~bright, 255, 0).astype(np.uint8)
+            mode = "dark_foreground_inverted"
+
+    # Reject an almost full-frame foreground and try the opposite polarity.
+    ratio = float((binary > 0).mean())
+    if ratio > 0.92:
+        binary = cv2.bitwise_not(binary)
+        mode += "_auto_inverted"
+
+    binary = np.where(binary > 0, 255, 0).astype(np.uint8)
+    return Image.fromarray(binary, mode="L"), mode
+
+
 def load_sam_candidate_masks(
     mask_urls: list[str],
     target_size: tuple[int, int],
@@ -2405,15 +2486,16 @@ def load_sam_candidate_masks(
     for index, url in enumerate(mask_urls):
         try:
             raw = _download_binary_url(url)
-            image = Image.open(io.BytesIO(raw)).convert("L")
-            image = image.resize(
+            image, decode_mode = _decode_sam_mask_image(
+                raw,
                 target_size,
-                Image.Resampling.NEAREST,
             )
+            image = clean_component_mask(image)
             binary = mask_to_binary(image)
             area = int((binary > 0).sum())
+            ratio = area / max(1, binary.size)
 
-            if area < 32:
+            if area < 32 or ratio > 0.95:
                 continue
 
             candidates.append({
@@ -2422,7 +2504,10 @@ def load_sam_candidate_masks(
                 "mask": image,
                 "binary": binary,
                 "area": area,
+                "area_ratio": round(ratio, 6),
+                "decode_mode": decode_mode,
             })
+
         except Exception as exc:
             print(
                 "SAM2 MASK DOWNLOAD ERROR:",
@@ -2437,17 +2522,29 @@ def load_sam_candidate_masks(
             status_code=502,
             detail={
                 "message": (
-                    "Le maschere SAM 2 sono state create ma non è stato "
-                    "possibile scaricarle."
+                    "Le maschere SAM 2 sono state create ma non sono "
+                    "state decodificate correttamente."
                 ),
                 "mask_url_count": len(mask_urls),
-                "hint": "Verificare autorizzazione Bearer per replicate.delivery.",
                 "analysis_version": (
-                    "vehicle-segmentation-v16.1.1-"
-                    "replicate-auth-diagnostics"
+                    "vehicle-segmentation-v16.1.4-"
+                    "sam-mask-decode-fallback"
                 ),
             },
         )
+
+    print(
+        "SAM2 MASKS DECODED:",
+        len(candidates),
+        [
+            {
+                "index": item["index"],
+                "mode": item["decode_mode"],
+                "ratio": item["area_ratio"],
+            }
+            for item in candidates[:10]
+        ],
+    )
 
     return candidates
 
@@ -2511,6 +2608,39 @@ def score_mask_for_box(
     }
 
 
+
+def build_box_fallback_mask(
+    source_size: tuple[int, int],
+    box: dict,
+) -> Image.Image:
+    width, height = source_size
+    mask = np.zeros((height, width), dtype=np.uint8)
+
+    margin_x = max(2, round(box["width"] * 0.04))
+    margin_y = max(2, round(box["height"] * 0.04))
+
+    x1 = max(0, box["x1"] + margin_x)
+    y1 = max(0, box["y1"] + margin_y)
+    x2 = min(width, box["x2"] - margin_x)
+    y2 = min(height, box["y2"] - margin_y)
+
+    if x2 <= x1 or y2 <= y1:
+        x1, y1, x2, y2 = (
+            box["x1"],
+            box["y1"],
+            box["x2"],
+            box["y2"],
+        )
+
+    mask[y1:y2, x1:x2] = 255
+
+    feather = max(3, round(min(box["width"], box["height"]) * 0.03))
+    mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=feather)
+    mask = np.where(mask > 32, 255, 0).astype(np.uint8)
+
+    return Image.fromarray(mask, mode="L")
+
+
 def assign_sam_masks_to_components(
     source: Image.Image,
     raw_components: list[dict],
@@ -2529,12 +2659,22 @@ def assign_sam_masks_to_components(
         if code not in VEHICLE_COMPONENT_CATALOG:
             continue
 
+        raw_box = (
+            component.get("bounding_box")
+            or component.get("box")
+            or component.get("bbox")
+        )
         box = normalize_box(
-            component.get("bounding_box"),
+            raw_box,
             source.width,
             source.height,
         )
         if box is None:
+            print(
+                "SAM2 COMPONENT SKIPPED - INVALID BOX:",
+                code,
+                raw_box,
+            )
             continue
 
         ranked: list[dict] = []
@@ -2552,42 +2692,75 @@ def assign_sam_masks_to_components(
 
         ranked.sort(key=lambda item: item["score"], reverse=True)
 
-        if not ranked:
-            continue
+        selected_mask = None
+        best = ranked[0] if ranked else None
+        match_quality = "fallback"
+        mask_source = "openai_box_fallback"
+        diagnostics = {
+            "intersection_pixels": 0,
+            "box_coverage": 0.0,
+            "mask_inside_ratio": 0.0,
+            "outside_ratio": 1.0,
+            "center_score": 0.0,
+            "size_ratio": 0.0,
+        }
+        candidate_index = None
+        match_score = 0.0
+        decode_mode = None
 
-        best = ranked[0]
-        diagnostics = best["diagnostics"]
+        if best is not None:
+            diagnostics = best["diagnostics"]
+            candidate_index = best["candidate"]["index"]
+            match_score = best["score"]
+            decode_mode = best["candidate"].get("decode_mode")
 
-        # Accept the best mask when it intersects the component box at all.
-        if diagnostics["intersection_pixels"] <= 0:
-            continue
+            if diagnostics["intersection_pixels"] > 0:
+                candidate_binary = best["candidate"]["binary"].copy()
 
-        candidate_binary = best["candidate"]["binary"].copy()
+                margin_x = max(8, round(box["width"] * 0.22))
+                margin_y = max(8, round(box["height"] * 0.22))
 
-        # Limit the mask to an expanded detection box, preventing floor/background.
-        margin_x = max(8, round(box["width"] * 0.18))
-        margin_y = max(8, round(box["height"] * 0.18))
+                crop_x1 = max(0, box["x1"] - margin_x)
+                crop_y1 = max(0, box["y1"] - margin_y)
+                crop_x2 = min(source.width, box["x2"] + margin_x)
+                crop_y2 = min(source.height, box["y2"] + margin_y)
 
-        crop_x1 = max(0, box["x1"] - margin_x)
-        crop_y1 = max(0, box["y1"] - margin_y)
-        crop_x2 = min(source.width, box["x2"] + margin_x)
-        crop_y2 = min(source.height, box["y2"] + margin_y)
+                allowed = np.zeros_like(candidate_binary)
+                allowed[crop_y1:crop_y2, crop_x1:crop_x2] = 255
+                candidate_binary = cv2.bitwise_and(
+                    candidate_binary,
+                    allowed,
+                )
 
-        allowed = np.zeros_like(candidate_binary)
-        allowed[crop_y1:crop_y2, crop_x1:crop_x2] = 255
-        candidate_binary = cv2.bitwise_and(
-            candidate_binary,
-            allowed,
-        )
+                if int((candidate_binary > 0).sum()) >= 24:
+                    candidate_mask = clean_component_mask(
+                        Image.fromarray(candidate_binary, mode="L")
+                    )
+                    candidate_pixels = int(
+                        (mask_to_binary(candidate_mask) > 0).sum()
+                    )
 
-        if int((candidate_binary > 0).sum()) < 24:
-            continue
+                    if candidate_pixels >= 24:
+                        selected_mask = candidate_mask
+                        mask_source = (
+                            "replicate_sam2_robust_decode_box_match"
+                        )
+                        match_quality = "high"
 
-        refined_mask = clean_component_mask(
-            Image.fromarray(candidate_binary, mode="L")
-        )
-        binary = mask_to_binary(refined_mask)
+                        if (
+                            diagnostics["box_coverage"] < 0.04
+                            or diagnostics["center_score"] < 0.20
+                        ):
+                            match_quality = "review"
 
+        if selected_mask is None:
+            selected_mask = build_box_fallback_mask(
+                source.size,
+                box,
+            )
+            match_quality = "manual_review_required"
+
+        binary = mask_to_binary(selected_mask)
         if int((binary > 0).sum()) < 24:
             continue
 
@@ -2598,19 +2771,12 @@ def assign_sam_masks_to_components(
         except Exception:
             confidence = 0.70
 
-        match_quality = "high"
-        if (
-            diagnostics["box_coverage"] < SAM2_MIN_BOX_COVERAGE
-            or diagnostics["outside_ratio"] > SAM2_MAX_OUTSIDE_RATIO
-        ):
-            match_quality = "review"
-
         assignments.append({
             "code": code,
             "label": VEHICLE_COMPONENT_CATALOG[code],
             "category": component_category(code),
             "confidence": round(max(0.0, min(confidence, 1.0)), 2),
-            "mask_base64": mask_image_to_data_url(refined_mask),
+            "mask_base64": mask_image_to_data_url(selected_mask),
             "bounding_box": {
                 "x": int(x),
                 "y": int(y),
@@ -2618,13 +2784,27 @@ def assign_sam_masks_to_components(
                 "height": int(height),
             },
             "detection_box": box,
-            "mask_source": "replicate_sam2_relaxed_box_match",
-            "sam_candidate_index": best["candidate"]["index"],
-            "sam_match_score": round(best["score"], 4),
+            "mask_source": mask_source,
+            "sam_candidate_index": candidate_index,
+            "sam_match_score": round(match_score, 4),
             "sam_match_quality": match_quality,
-            "requires_review": match_quality == "review",
+            "requires_review": match_quality != "high",
+            "sam_decode_mode": decode_mode,
             "sam_match_diagnostics": diagnostics,
         })
+
+    print(
+        "SAM2 COMPONENT ASSIGNMENTS:",
+        len(assignments),
+        [
+            {
+                "code": item["code"],
+                "source": item["mask_source"],
+                "quality": item["sam_match_quality"],
+            }
+            for item in assignments
+        ],
+    )
 
     return assignments
 
@@ -2885,7 +3065,7 @@ Bounding-box rules:
                 "model": configured_model,
                 "primary_error": primary_message[:800],
                 "fallback_error": fallback_message[:800],
-                "analysis_version": "vehicle-segmentation-v16.1.3-sam-matching-relaxed",
+                "analysis_version": "vehicle-segmentation-v16.1.4-sam-mask-decode-fallback",
             },
         ) from fallback_exc
 
@@ -3046,7 +3226,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     ),
                     "matching_policy": "relaxed_best_intersection",
                     "analysis_version": (
-                        "vehicle-segmentation-v16.1.3-sam-matching-relaxed"
+                        "vehicle-segmentation-v16.1.4-sam-mask-decode-fallback"
                     ),
                 },
             )
@@ -3058,7 +3238,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                 "gpt-4.1-mini",
             ),
             "analysis_version": (
-                "vehicle-segmentation-v16.1.3-sam-matching-relaxed"
+                "vehicle-segmentation-v16.1.4-sam-mask-decode-fallback"
             ),
             "mask_format": "data:image/png;base64",
             "mask_semantics": "white_component_black_background",
@@ -3104,7 +3284,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     "error_type": type(exc).__name__,
                     "error": str(exc)[:1600],
                     "analysis_version": (
-                        "vehicle-segmentation-v16.1.3-sam-matching-relaxed"
+                        "vehicle-segmentation-v16.1.4-sam-mask-decode-fallback"
                     ),
                 },
             },
@@ -3146,7 +3326,7 @@ def start_vehicle_component_analysis(
             "result": None,
             "error": None,
             "analysis_version": (
-                "vehicle-segmentation-v16.1.3-sam-matching-relaxed"
+                "vehicle-segmentation-v16.1.4-sam-mask-decode-fallback"
             ),
         }
 
@@ -3164,7 +3344,7 @@ def start_vehicle_component_analysis(
             f"/v1/vehicle/analyze-components/status/{job_id}"
         ),
         "analysis_version": (
-            "vehicle-segmentation-v16.1.3-sam-matching-relaxed"
+            "vehicle-segmentation-v16.1.4-sam-mask-decode-fallback"
         ),
     }
 
@@ -3243,7 +3423,7 @@ def analyze_vehicle_components_sync_disabled(
                 "/v1/vehicle/analyze-components/status/{job_id}"
             ),
             "analysis_version": (
-                "vehicle-segmentation-v16.1.3-sam-matching-relaxed"
+                "vehicle-segmentation-v16.1.4-sam-mask-decode-fallback"
             ),
         },
     )
@@ -3315,7 +3495,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v16.1.3-sam-matching-relaxed",
+        "prompt_version": "damage-v16.1.4-sam-mask-decode-fallback",
     }
 
 
@@ -3599,7 +3779,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v16.1.3-sam-matching-relaxed",
+        "prompt_version": "damage-v16.1.4-sam-mask-decode-fallback",
         "deformation_type": payload.deformation_type,
         "impact_direction": payload.impact_direction,
         "contact_traces_enabled": payload.contact_traces_enabled,
