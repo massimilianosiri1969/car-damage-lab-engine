@@ -8,6 +8,9 @@ import json
 import time
 import urllib.error
 import urllib.request
+import threading
+import uuid
+from datetime import datetime, timezone
 import uuid
 from pathlib import Path
 from typing import Literal
@@ -45,7 +48,7 @@ ALLOWED_ORIGINS = [
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.6.1.1",
+    version="1.6.1.2",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -482,6 +485,23 @@ SAM2_MAX_OUTSIDE_RATIO = max(
     0.05,
     min(0.95, float(os.getenv("SAM2_MAX_OUTSIDE_RATIO", "0.70"))),
 )
+
+
+ANALYSIS_JOB_TTL_SECONDS = max(
+    300,
+    min(86400, int(os.getenv("ANALYSIS_JOB_TTL_SECONDS", "3600"))),
+)
+ANALYSIS_JOB_MAX_COUNT = max(
+    10,
+    min(500, int(os.getenv("ANALYSIS_JOB_MAX_COUNT", "100"))),
+)
+ANALYSIS_JOB_DIR = Path(
+    os.getenv("ANALYSIS_JOB_DIR", "/tmp/car-damage-lab-jobs")
+)
+ANALYSIS_JOB_DIR.mkdir(parents=True, exist_ok=True)
+
+ANALYSIS_JOBS: dict[str, dict] = {}
+ANALYSIS_JOBS_LOCK = threading.Lock()
 
 DEFORMATION_INSTRUCTIONS = {
     "dent": (
@@ -2177,7 +2197,7 @@ def _replicate_json_request(
             status_code=500,
             detail={
                 "message": "REPLICATE_API_TOKEN non configurato su Render.",
-                "analysis_version": "vehicle-segmentation-v16.1.1-replicate-auth-diagnostics",
+                "analysis_version": "vehicle-segmentation-v16.1.2-async-analysis",
             },
         )
 
@@ -2220,7 +2240,7 @@ def _replicate_json_request(
                 "http_status": exc.code,
                 "request_url": url,
                 "replicate_detail": error_body[:2000],
-                "analysis_version": "vehicle-segmentation-v16.1.1-replicate-auth-diagnostics",
+                "analysis_version": "vehicle-segmentation-v16.1.2-async-analysis",
             },
         ) from exc
     except Exception as exc:
@@ -2229,7 +2249,7 @@ def _replicate_json_request(
             detail={
                 "message": "Connessione a Replicate non riuscita.",
                 "error": f"{type(exc).__name__}: {str(exc)}"[:1200],
-                "analysis_version": "vehicle-segmentation-v16.1.1-replicate-auth-diagnostics",
+                "analysis_version": "vehicle-segmentation-v16.1.2-async-analysis",
             },
         ) from exc
 
@@ -2807,70 +2827,367 @@ Bounding-box rules:
                 "model": configured_model,
                 "primary_error": primary_message[:800],
                 "fallback_error": fallback_message[:800],
-                "analysis_version": "vehicle-segmentation-v16.1.1-replicate-auth-diagnostics",
+                "analysis_version": "vehicle-segmentation-v16.1.2-async-analysis",
             },
         ) from fallback_exc
 
 
-@app.post("/v1/vehicle/analyze-components")
-def analyze_vehicle_components(payload: VehicleAnalyzeRequest):
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _safe_unlink(path_value: str | None) -> None:
+    if not path_value:
+        return
+    try:
+        Path(path_value).unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def cleanup_analysis_jobs() -> None:
+    now = datetime.now(timezone.utc).timestamp()
+
+    with ANALYSIS_JOBS_LOCK:
+        removable: list[str] = []
+
+        for job_id, job in ANALYSIS_JOBS.items():
+            age = now - float(job.get("updated_at_epoch", now))
+            if age > ANALYSIS_JOB_TTL_SECONDS:
+                removable.append(job_id)
+
+        if len(ANALYSIS_JOBS) - len(removable) > ANALYSIS_JOB_MAX_COUNT:
+            remaining = [
+                (job_id, float(job.get("updated_at_epoch", 0.0)))
+                for job_id, job in ANALYSIS_JOBS.items()
+                if job_id not in removable
+            ]
+            remaining.sort(key=lambda item: item[1])
+            overflow = (
+                len(ANALYSIS_JOBS)
+                - len(removable)
+                - ANALYSIS_JOB_MAX_COUNT
+            )
+            removable.extend(
+                job_id for job_id, _ in remaining[:max(0, overflow)]
+            )
+
+        for job_id in set(removable):
+            job = ANALYSIS_JOBS.pop(job_id, None)
+            if job:
+                _safe_unlink(job.get("image_path"))
+
+
+def set_analysis_job(job_id: str, **updates) -> None:
+    with ANALYSIS_JOBS_LOCK:
+        current = ANALYSIS_JOBS.get(job_id, {})
+        current.update(updates)
+        current["updated_at"] = utc_now_iso()
+        current["updated_at_epoch"] = datetime.now(
+            timezone.utc
+        ).timestamp()
+        ANALYSIS_JOBS[job_id] = current
+
+
+def get_analysis_job(job_id: str) -> dict | None:
+    with ANALYSIS_JOBS_LOCK:
+        job = ANALYSIS_JOBS.get(job_id)
+        return dict(job) if job is not None else None
+
+
+def _persist_analysis_source(
+    image_base64: str,
+    job_id: str,
+) -> tuple[str, tuple[int, int]]:
     source = decode_base64_image(
-        payload.image_base64,
+        image_base64,
         "image_base64",
         "RGB",
     )
 
-    analysis_source, _ = resize_image_for_processing(
-        source,
-        ANALYSIS_MAX_SIDE,
+    image_path = ANALYSIS_JOB_DIR / f"{job_id}.jpg"
+    source.save(
+        image_path,
+        format="JPEG",
+        quality=92,
+        subsampling=0,
+        optimize=True,
     )
-    image_data_url = image_to_data_url(analysis_source)
+    size = source.size
+    del source
+    return str(image_path), size
+
+
+def run_async_vehicle_analysis(job_id: str) -> None:
+    job = get_analysis_job(job_id)
+    if not job:
+        return
+
+    image_path = job.get("image_path")
 
     try:
+        set_analysis_job(
+            job_id,
+            status="processing",
+            progress_stage="loading_image",
+            progress_percent=5,
+        )
+
+        source = Image.open(image_path).convert("RGB")
+        analysis_source, _ = resize_image_for_processing(
+            source,
+            ANALYSIS_MAX_SIDE,
+        )
+        image_data_url = image_to_data_url(analysis_source)
+
+        set_analysis_job(
+            job_id,
+            progress_stage="detecting_components",
+            progress_percent=20,
+        )
         raw_analysis = call_openai_vehicle_analysis(image_data_url)
+
+        set_analysis_job(
+            job_id,
+            progress_stage="segmenting_with_sam2",
+            progress_percent=45,
+        )
         sam_result = call_replicate_sam2(image_data_url)
-    finally:
-        del analysis_source
-        del image_data_url
 
-    normalized = normalize_vehicle_analysis(
-        raw_analysis,
-        source,
-        sam_result,
-    )
+        set_analysis_job(
+            job_id,
+            progress_stage="matching_masks",
+            progress_percent=80,
+        )
+        normalized = normalize_vehicle_analysis(
+            raw_analysis,
+            source,
+            sam_result,
+        )
 
-    if not normalized["components"]:
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "message": (
-                    "Non è stato possibile ottenere maschere attendibili. "
-                    "Prova con una foto più nitida o aggiungi manualmente "
-                    "il componente."
-                ),
-                "raw_component_count": len(
-                    raw_analysis.get(
-                        "components",
-                        raw_analysis.get("visible_components", []),
-                    )
-                    if isinstance(raw_analysis, dict)
-                    else []
-                ),
-                "analysis_version": "vehicle-segmentation-v16.1.1-replicate-auth-diagnostics",
+        if not normalized["components"]:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "message": (
+                        "Non è stato possibile associare maschere SAM 2 "
+                        "attendibili ai componenti rilevati."
+                    ),
+                    "raw_component_count": len(
+                        raw_analysis.get(
+                            "components",
+                            raw_analysis.get("visible_components", []),
+                        )
+                        if isinstance(raw_analysis, dict)
+                        else []
+                    ),
+                    "sam_prediction_id": sam_result.get("prediction_id"),
+                    "sam_candidate_count": len(
+                        sam_result.get("individual_masks", [])
+                    ),
+                    "analysis_version": (
+                        "vehicle-segmentation-v16.1.2-async-analysis"
+                    ),
+                },
+            )
+
+        result = {
+            **normalized,
+            "model": os.getenv(
+                "OPENAI_VISION_MODEL",
+                "gpt-4.1-mini",
+            ),
+            "analysis_version": (
+                "vehicle-segmentation-v16.1.2-async-analysis"
+            ),
+            "mask_format": "data:image/png;base64",
+            "mask_semantics": "white_component_black_background",
+            "segmentation_provider": "replicate/meta-sam-2",
+        }
+
+        set_analysis_job(
+            job_id,
+            status="succeeded",
+            progress_stage="completed",
+            progress_percent=100,
+            result=result,
+            error=None,
+        )
+
+    except HTTPException as exc:
+        set_analysis_job(
+            job_id,
+            status="failed",
+            progress_stage="failed",
+            error={
+                "http_status": exc.status_code,
+                "detail": exc.detail,
+            },
+        )
+        print(
+            "ASYNC VEHICLE ANALYSIS HTTP ERROR:",
+            job_id,
+            exc.status_code,
+            exc.detail,
+        )
+
+    except Exception as exc:
+        traceback.print_exc()
+        set_analysis_job(
+            job_id,
+            status="failed",
+            progress_stage="failed",
+            error={
+                "http_status": 502,
+                "detail": {
+                    "message": "Errore inatteso durante l'analisi asincrona.",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc)[:1600],
+                    "analysis_version": (
+                        "vehicle-segmentation-v16.1.2-async-analysis"
+                    ),
+                },
             },
         )
 
+    finally:
+        _safe_unlink(image_path)
+        set_analysis_job(job_id, image_path=None)
+
+
+@app.post("/v1/vehicle/analyze-components/start")
+def start_vehicle_component_analysis(
+    payload: VehicleAnalyzeRequest,
+    background_tasks: BackgroundTasks,
+):
+    cleanup_analysis_jobs()
+
+    job_id = uuid.uuid4().hex
+    image_path, original_size = _persist_analysis_source(
+        payload.image_base64,
+        job_id,
+    )
+    now = datetime.now(timezone.utc)
+
+    with ANALYSIS_JOBS_LOCK:
+        ANALYSIS_JOBS[job_id] = {
+            "job_id": job_id,
+            "status": "queued",
+            "progress_stage": "queued",
+            "progress_percent": 0,
+            "created_at": now.isoformat(),
+            "updated_at": now.isoformat(),
+            "updated_at_epoch": now.timestamp(),
+            "image_path": image_path,
+            "original_size": {
+                "width": original_size[0],
+                "height": original_size[1],
+            },
+            "result": None,
+            "error": None,
+            "analysis_version": (
+                "vehicle-segmentation-v16.1.2-async-analysis"
+            ),
+        }
+
+    background_tasks.add_task(
+        run_async_vehicle_analysis,
+        job_id,
+    )
+
     return {
-        **normalized,
-        "model": os.getenv(
-            "OPENAI_VISION_MODEL",
-            "gpt-4.1-mini",
+        "job_id": job_id,
+        "status": "queued",
+        "progress_stage": "queued",
+        "progress_percent": 0,
+        "poll_url": (
+            f"/v1/vehicle/analyze-components/status/{job_id}"
         ),
-        "analysis_version": "vehicle-segmentation-v16.1.1-replicate-auth-diagnostics",
-        "mask_format": "data:image/png;base64",
-        "mask_semantics": "white_component_black_background",
-        "segmentation_provider": "replicate/meta-sam-2",
+        "analysis_version": (
+            "vehicle-segmentation-v16.1.2-async-analysis"
+        ),
     }
+
+
+@app.get("/v1/vehicle/analyze-components/status/{job_id}")
+def get_vehicle_component_analysis_status(job_id: str):
+    cleanup_analysis_jobs()
+    job = get_analysis_job(job_id)
+
+    if job is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": "Job di analisi non trovato o scaduto.",
+                "job_id": job_id,
+            },
+        )
+
+    response = {
+        "job_id": job_id,
+        "status": job.get("status"),
+        "progress_stage": job.get("progress_stage"),
+        "progress_percent": job.get("progress_percent", 0),
+        "created_at": job.get("created_at"),
+        "updated_at": job.get("updated_at"),
+        "analysis_version": job.get("analysis_version"),
+    }
+
+    if job.get("status") == "succeeded":
+        response["result"] = job.get("result")
+
+    if job.get("status") == "failed":
+        response["error"] = job.get("error")
+
+    return response
+
+
+@app.delete("/v1/vehicle/analyze-components/status/{job_id}")
+def delete_vehicle_component_analysis_job(job_id: str):
+    with ANALYSIS_JOBS_LOCK:
+        job = ANALYSIS_JOBS.pop(job_id, None)
+
+    if job is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": "Job di analisi non trovato.",
+                "job_id": job_id,
+            },
+        )
+
+    _safe_unlink(job.get("image_path"))
+
+    return {
+        "job_id": job_id,
+        "deleted": True,
+    }
+
+
+@app.post("/v1/vehicle/analyze-components")
+def analyze_vehicle_components_sync_disabled(
+    payload: VehicleAnalyzeRequest,
+):
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "message": (
+                "La V16.1.2 usa l'analisi asincrona per evitare timeout. "
+                "Usare POST /v1/vehicle/analyze-components/start e poi "
+                "GET /v1/vehicle/analyze-components/status/{job_id}."
+            ),
+            "start_endpoint": (
+                "/v1/vehicle/analyze-components/start"
+            ),
+            "status_endpoint_template": (
+                "/v1/vehicle/analyze-components/status/{job_id}"
+            ),
+            "analysis_version": (
+                "vehicle-segmentation-v16.1.2-async-analysis"
+            ),
+        },
+    )
 
 
 @app.post("/v1/damage/edit")
@@ -2939,7 +3256,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v16.1.1-replicate-auth-diagnostics",
+        "prompt_version": "damage-v16.1.2-async-analysis",
     }
 
 
@@ -3223,7 +3540,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v16.1.1-replicate-auth-diagnostics",
+        "prompt_version": "damage-v16.1.2-async-analysis",
         "deformation_type": payload.deformation_type,
         "impact_direction": payload.impact_direction,
         "contact_traces_enabled": payload.contact_traces_enabled,
