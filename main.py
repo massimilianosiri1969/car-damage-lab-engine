@@ -49,7 +49,7 @@ ALLOWED_ORIGINS = [
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.6.3.1",
+    version="1.6.3.2",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -506,7 +506,16 @@ COMPONENT_REFINEMENT_MARGIN_RATIO = max(
 )
 COMPONENT_REFINEMENT_ITERATIONS = max(
     1,
-    min(8, int(os.getenv("COMPONENT_REFINEMENT_ITERATIONS", "4"))),
+    min(8, int(os.getenv("COMPONENT_REFINEMENT_ITERATIONS", "2"))),
+)
+
+
+COMPONENT_REFINEMENT_MAX_CROP_SIDE = max(
+    320,
+    min(
+        1200,
+        int(os.getenv("COMPONENT_REFINEMENT_MAX_CROP_SIDE", "640")),
+    ),
 )
 COMPONENT_REFINEMENT_MIN_AREA_RATIO = max(
     0.00002,
@@ -2333,7 +2342,7 @@ def _replicate_json_request(
             status_code=500,
             detail={
                 "message": "REPLICATE_API_TOKEN non configurato su Render.",
-                "analysis_version": "vehicle-segmentation-v16.3.1-progress-timeout",
+                "analysis_version": "vehicle-segmentation-v16.3.2-refinement-progress-fast",
             },
         )
 
@@ -2376,7 +2385,7 @@ def _replicate_json_request(
                 "http_status": exc.code,
                 "request_url": url,
                 "replicate_detail": error_body[:2000],
-                "analysis_version": "vehicle-segmentation-v16.3.1-progress-timeout",
+                "analysis_version": "vehicle-segmentation-v16.3.2-refinement-progress-fast",
             },
         ) from exc
     except Exception as exc:
@@ -2385,7 +2394,7 @@ def _replicate_json_request(
             detail={
                 "message": "Connessione a Replicate non riuscita.",
                 "error": f"{type(exc).__name__}: {str(exc)}"[:1200],
-                "analysis_version": "vehicle-segmentation-v16.3.1-progress-timeout",
+                "analysis_version": "vehicle-segmentation-v16.3.2-refinement-progress-fast",
             },
         ) from exc
 
@@ -3280,7 +3289,7 @@ def _create_replicate_prediction(
                 "Limite Replicate ancora attivo dopo diversi tentativi."
             ),
             "analysis_version": (
-                "vehicle-segmentation-v16.3.1-progress-timeout"
+                "vehicle-segmentation-v16.3.2-refinement-progress-fast"
             ),
         },
     )
@@ -3754,56 +3763,102 @@ def refine_component_mask_local(
             "candidate_count": 0,
         }
 
-    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    gray = cv2.bilateralFilter(gray, 7, 35, 35)
+    original_crop_h, original_crop_w = crop.shape[:2]
+    max_side = max(original_crop_w, original_crop_h)
+    scale = min(
+        1.0,
+        COMPONENT_REFINEMENT_MAX_CROP_SIDE / max(1, max_side),
+    )
+
+    if scale < 0.999:
+        scaled_w = max(32, round(original_crop_w * scale))
+        scaled_h = max(32, round(original_crop_h * scale))
+        crop_work = cv2.resize(
+            crop,
+            (scaled_w, scaled_h),
+            interpolation=cv2.INTER_AREA,
+        )
+        initial_work = cv2.resize(
+            initial_crop,
+            (scaled_w, scaled_h),
+            interpolation=cv2.INTER_NEAREST,
+        )
+    else:
+        crop_work = crop
+        initial_work = initial_crop
+
+    gray = cv2.cvtColor(crop_work, cv2.COLOR_BGR2GRAY)
+    gray = cv2.bilateralFilter(gray, 5, 28, 28)
     edges = cv2.Canny(gray, 45, 135)
-    edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
+    edges = cv2.dilate(
+        edges,
+        np.ones((3, 3), np.uint8),
+        iterations=1,
+    )
 
     candidates: list[np.ndarray] = []
 
-    for erosion_size, dilation_size in ((5, 7), (9, 11), (13, 15)):
+    for erosion_size, dilation_size in ((5, 7), (9, 11)):
         gc_mask = np.full(
-            initial_crop.shape,
+            initial_work.shape,
             cv2.GC_PR_BGD,
             dtype=np.uint8,
         )
 
-        # Strong background at crop border.
         border = max(2, round(min(gc_mask.shape) * 0.02))
         gc_mask[:border, :] = cv2.GC_BGD
         gc_mask[-border:, :] = cv2.GC_BGD
         gc_mask[:, :border] = cv2.GC_BGD
         gc_mask[:, -border:] = cv2.GC_BGD
 
-        probable_fg = initial_crop > 0
+        probable_fg = initial_work > 0
         gc_mask[probable_fg] = cv2.GC_PR_FGD
 
         erode_kernel = np.ones((erosion_size, erosion_size), np.uint8)
-        core = cv2.erode(initial_crop, erode_kernel, iterations=1) > 0
+        core = cv2.erode(
+            initial_work,
+            erode_kernel,
+            iterations=1,
+        ) > 0
         gc_mask[core] = cv2.GC_FGD
 
-        # Box center is always a positive seed.
-        center_x = round((box["x1"] + box["x2"]) / 2) - crop_x1
-        center_y = round((box["y1"] + box["y2"]) / 2) - crop_y1
-        if 0 <= center_x < gc_mask.shape[1] and 0 <= center_y < gc_mask.shape[0]:
-            cv2.circle(gc_mask, (center_x, center_y), 5, cv2.GC_FGD, -1)
+        center_x = round(
+            (((box["x1"] + box["x2"]) / 2) - crop_x1) * scale
+        )
+        center_y = round(
+            (((box["y1"] + box["y2"]) / 2) - crop_y1) * scale
+        )
+
+        if (
+            0 <= center_x < gc_mask.shape[1]
+            and 0 <= center_y < gc_mask.shape[0]
+        ):
+            cv2.circle(gc_mask, (center_x, center_y), 4, cv2.GC_FGD, -1)
 
         for x, y in positive_points:
-            local_x, local_y = x - crop_x1, y - crop_y1
-            if 0 <= local_x < gc_mask.shape[1] and 0 <= local_y < gc_mask.shape[0]:
-                cv2.circle(gc_mask, (local_x, local_y), 6, cv2.GC_FGD, -1)
+            local_x = round((x - crop_x1) * scale)
+            local_y = round((y - crop_y1) * scale)
+            if (
+                0 <= local_x < gc_mask.shape[1]
+                and 0 <= local_y < gc_mask.shape[0]
+            ):
+                cv2.circle(gc_mask, (local_x, local_y), 5, cv2.GC_FGD, -1)
 
         for x, y in negative_points:
-            local_x, local_y = x - crop_x1, y - crop_y1
-            if 0 <= local_x < gc_mask.shape[1] and 0 <= local_y < gc_mask.shape[0]:
-                cv2.circle(gc_mask, (local_x, local_y), 7, cv2.GC_BGD, -1)
+            local_x = round((x - crop_x1) * scale)
+            local_y = round((y - crop_y1) * scale)
+            if (
+                0 <= local_x < gc_mask.shape[1]
+                and 0 <= local_y < gc_mask.shape[0]
+            ):
+                cv2.circle(gc_mask, (local_x, local_y), 6, cv2.GC_BGD, -1)
 
         bg_model = np.zeros((1, 65), np.float64)
         fg_model = np.zeros((1, 65), np.float64)
 
         try:
             cv2.grabCut(
-                crop,
+                crop_work,
                 gc_mask,
                 None,
                 bg_model,
@@ -3814,41 +3869,66 @@ def refine_component_mask_local(
         except cv2.error:
             continue
 
-        candidate_crop = np.where(
+        candidate_work = np.where(
             (gc_mask == cv2.GC_FGD)
             | (gc_mask == cv2.GC_PR_FGD),
             255,
             0,
         ).astype(np.uint8)
 
-        close_kernel = np.ones((dilation_size, dilation_size), np.uint8)
-        candidate_crop = cv2.morphologyEx(
-            candidate_crop,
+        candidate_work = cv2.morphologyEx(
+            candidate_work,
             cv2.MORPH_CLOSE,
-            close_kernel,
+            np.ones((dilation_size, dilation_size), np.uint8),
         )
-        candidate_crop = cv2.morphologyEx(
-            candidate_crop,
+        candidate_work = cv2.morphologyEx(
+            candidate_work,
             cv2.MORPH_OPEN,
             np.ones((3, 3), np.uint8),
         )
 
-        full = np.zeros((source.height, source.width), dtype=np.uint8)
+        if scale < 0.999:
+            candidate_crop = cv2.resize(
+                candidate_work,
+                (original_crop_w, original_crop_h),
+                interpolation=cv2.INTER_NEAREST,
+            )
+        else:
+            candidate_crop = candidate_work
+
+        full = np.zeros(
+            (source.height, source.width),
+            dtype=np.uint8,
+        )
         full[crop_y1:crop_y2, crop_x1:crop_x2] = candidate_crop
-        full = _select_refined_connected_region(full, initial, box)
+        full = _select_refined_connected_region(
+            full,
+            initial,
+            box,
+        )
         candidates.append(full)
 
     if not candidates:
         return initial_mask, {
             "refinement_status": "fallback_initial_mask",
             "candidate_count": 0,
+            "processing_scale": round(scale, 4),
         }
+
+    if scale < 0.999:
+        edges_full_crop = cv2.resize(
+            edges,
+            (original_crop_w, original_crop_h),
+            interpolation=cv2.INTER_LINEAR,
+        )
+    else:
+        edges_full_crop = edges
 
     full_edge_map = np.zeros(
         (source.height, source.width),
         dtype=np.uint8,
     )
-    full_edge_map[crop_y1:crop_y2, crop_x1:crop_x2] = edges
+    full_edge_map[crop_y1:crop_y2, crop_x1:crop_x2] = edges_full_crop
 
     scored = [
         (
@@ -3892,7 +3972,14 @@ def refine_component_mask_local(
         "selected_candidate_score": round(float(best_score), 4),
         "positive_point_count": len(positive_points),
         "negative_point_count": len(negative_points),
+        "processing_scale": round(scale, 4),
+        "processing_crop_size": [
+            int(crop_work.shape[1]),
+            int(crop_work.shape[0]),
+        ],
     }
+
+
 
 
 def apply_component_refinement(
@@ -4078,19 +4165,22 @@ def prompted_segment_components(
                 stage="fallback" if fallback is not None else "skipped",
             )
 
-    if progress_callback is not None:
-        progress_callback(
-            index=total,
-            total=total,
-            code="",
-            label="",
-            stage="local_refinement",
-        )
+    refined_results: list[dict] = []
+    refinement_total = max(1, len(results))
 
-    refined_results = [
-        apply_component_refinement(source, item)
-        for item in results
-    ]
+    for refinement_index, item in enumerate(results, start=1):
+        if progress_callback is not None:
+            progress_callback(
+                index=refinement_index,
+                total=refinement_total,
+                code=str(item.get("code", "")),
+                label=str(item.get("label", "")),
+                stage="local_refinement",
+            )
+
+        refined_results.append(
+            apply_component_refinement(source, item)
+        )
 
     refined_results.sort(
         key=lambda item: (
@@ -4297,7 +4387,7 @@ Bounding-box rules:
                 "model": configured_model,
                 "primary_error": primary_message[:800],
                 "fallback_error": fallback_message[:800],
-                "analysis_version": "vehicle-segmentation-v16.3.1-progress-timeout",
+                "analysis_version": "vehicle-segmentation-v16.3.2-refinement-progress-fast",
             },
         ) from fallback_exc
 
@@ -4443,14 +4533,18 @@ def run_async_vehicle_analysis(job_id: str) -> None:
             stage: str,
         ) -> None:
             if stage == "local_refinement":
-                percent = 88
+                percent = 88 + round(
+                    (index / max(1, total)) * 9
+                )
             else:
-                percent = 40 + round((index / max(1, total)) * 45)
+                percent = 40 + round(
+                    (index / max(1, total)) * 45
+                )
 
             set_analysis_job(
                 job_id,
                 progress_stage=stage,
-                progress_percent=min(88, percent),
+                progress_percent=min(97, percent),
                 current_component_index=index,
                 current_component_total=total,
                 current_component_code=code or None,
@@ -4506,7 +4600,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                 "gpt-4.1-mini",
             ),
             "analysis_version": (
-                "vehicle-segmentation-v16.3.1-progress-timeout"
+                "vehicle-segmentation-v16.3.2-refinement-progress-fast"
             ),
             "mask_format": "data:image/png;base64",
             "mask_semantics": "white_component_black_background",
@@ -4554,7 +4648,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     "error_type": type(exc).__name__,
                     "error": str(exc)[:1600],
                     "analysis_version": (
-                        "vehicle-segmentation-v16.3.1-progress-timeout"
+                        "vehicle-segmentation-v16.3.2-refinement-progress-fast"
                     ),
                 },
             },
@@ -4596,7 +4690,7 @@ def start_vehicle_component_analysis(
             "result": None,
             "error": None,
             "analysis_version": (
-                "vehicle-segmentation-v16.3.1-progress-timeout"
+                "vehicle-segmentation-v16.3.2-refinement-progress-fast"
             ),
         }
 
@@ -4614,7 +4708,7 @@ def start_vehicle_component_analysis(
             f"/v1/vehicle/analyze-components/status/{job_id}"
         ),
         "analysis_version": (
-            "vehicle-segmentation-v16.3.1-progress-timeout"
+            "vehicle-segmentation-v16.3.2-refinement-progress-fast"
         ),
     }
 
@@ -4759,7 +4853,7 @@ def refine_vehicle_component(payload: ComponentRefineRequest):
         "requires_review": diagnostics.get("refinement_status") != "refined",
         "refinement": diagnostics,
         "analysis_version": (
-            "vehicle-segmentation-v16.3.1-progress-timeout"
+            "vehicle-segmentation-v16.3.2-refinement-progress-fast"
         ),
     }
 
@@ -4783,7 +4877,7 @@ def analyze_vehicle_components_sync_disabled(
                 "/v1/vehicle/analyze-components/status/{job_id}"
             ),
             "analysis_version": (
-                "vehicle-segmentation-v16.3.1-progress-timeout"
+                "vehicle-segmentation-v16.3.2-refinement-progress-fast"
             ),
         },
     )
@@ -4855,7 +4949,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v16.3.1-progress-timeout",
+        "prompt_version": "damage-v16.3.2-refinement-progress-fast",
     }
 
 
@@ -5139,7 +5233,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v16.3.1-progress-timeout",
+        "prompt_version": "damage-v16.3.2-refinement-progress-fast",
         "deformation_type": payload.deformation_type,
         "impact_direction": payload.impact_direction,
         "contact_traces_enabled": payload.contact_traces_enabled,
