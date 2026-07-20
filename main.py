@@ -49,7 +49,7 @@ ALLOWED_ORIGINS = [
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.6.2",
+    version="1.6.2.1",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -466,7 +466,7 @@ REPLICATE_PROMPTED_SAM2_VERSION = os.getenv(
 )
 PROMPTED_SAM_MAX_WORKERS = max(
     1,
-    min(4, int(os.getenv("PROMPTED_SAM_MAX_WORKERS", "3"))),
+    min(2, int(os.getenv("PROMPTED_SAM_MAX_WORKERS", "1"))),
 )
 PROMPTED_SAM_BOX_INSET_RATIO = max(
     0.05,
@@ -480,6 +480,35 @@ PROMPTED_SAM_COMPONENT_LIMIT = max(
     1,
     min(20, int(os.getenv("PROMPTED_SAM_COMPONENT_LIMIT", "12"))),
 )
+
+
+REPLICATE_CREATE_MIN_INTERVAL_SECONDS = max(
+    1.0,
+    min(
+        30.0,
+        float(
+            os.getenv(
+                "REPLICATE_CREATE_MIN_INTERVAL_SECONDS",
+                "10.5",
+            )
+        ),
+    ),
+)
+REPLICATE_RATE_LIMIT_MAX_RETRIES = max(
+    1,
+    min(
+        8,
+        int(
+            os.getenv(
+                "REPLICATE_RATE_LIMIT_MAX_RETRIES",
+                "5",
+            )
+        ),
+    ),
+)
+
+REPLICATE_CREATE_LOCK = threading.Lock()
+REPLICATE_LAST_CREATE_AT = 0.0
 REPLICATE_POLL_SECONDS = max(
     0.5,
     min(5.0, float(os.getenv("REPLICATE_POLL_SECONDS", "1.0"))),
@@ -2255,7 +2284,7 @@ def _replicate_json_request(
             status_code=500,
             detail={
                 "message": "REPLICATE_API_TOKEN non configurato su Render.",
-                "analysis_version": "vehicle-segmentation-v16.2-prompted-component-segmentation",
+                "analysis_version": "vehicle-segmentation-v16.2.1-rate-limit-safe",
             },
         )
 
@@ -2298,7 +2327,7 @@ def _replicate_json_request(
                 "http_status": exc.code,
                 "request_url": url,
                 "replicate_detail": error_body[:2000],
-                "analysis_version": "vehicle-segmentation-v16.2-prompted-component-segmentation",
+                "analysis_version": "vehicle-segmentation-v16.2.1-rate-limit-safe",
             },
         ) from exc
     except Exception as exc:
@@ -2307,7 +2336,7 @@ def _replicate_json_request(
             detail={
                 "message": "Connessione a Replicate non riuscita.",
                 "error": f"{type(exc).__name__}: {str(exc)}"[:1200],
-                "analysis_version": "vehicle-segmentation-v16.2-prompted-component-segmentation",
+                "analysis_version": "vehicle-segmentation-v16.2.1-rate-limit-safe",
             },
         ) from exc
 
@@ -3070,64 +3099,139 @@ def extract_json_object(raw_text: str) -> dict:
 
 
 
+def _extract_retry_after_seconds(exc: HTTPException) -> float:
+    detail = exc.detail
+
+    if isinstance(detail, dict):
+        raw = str(detail.get("replicate_detail", ""))
+        match = re.search(r'"retry_after"\s*:\s*(\d+)', raw)
+        if match:
+            return max(1.0, float(match.group(1)))
+
+        match = re.search(r"resets in ~(\d+)s", raw)
+        if match:
+            return max(1.0, float(match.group(1)))
+
+    return REPLICATE_CREATE_MIN_INTERVAL_SECONDS
+
+
 def _create_replicate_prediction(
     version: str,
     input_payload: dict,
 ) -> dict:
-    prediction = _replicate_json_request(
-        "https://api.replicate.com/v1/predictions",
-        method="POST",
-        payload={
-            "version": version,
-            "input": input_payload,
-        },
-    )
+    global REPLICATE_LAST_CREATE_AT
 
-    prediction_id = prediction.get("id")
-    if not prediction_id:
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "message": "Replicate non ha restituito un prediction id.",
-                "response": prediction,
-            },
-        )
+    last_error: Exception | None = None
 
-    deadline = time.monotonic() + REPLICATE_TIMEOUT_SECONDS
-    current = prediction
+    for attempt in range(REPLICATE_RATE_LIMIT_MAX_RETRIES):
+        with REPLICATE_CREATE_LOCK:
+            elapsed = time.monotonic() - REPLICATE_LAST_CREATE_AT
+            wait_for = REPLICATE_CREATE_MIN_INTERVAL_SECONDS - elapsed
 
-    while current.get("status") not in {
-        "succeeded",
-        "failed",
-        "canceled",
-    }:
-        if time.monotonic() >= deadline:
+            if wait_for > 0:
+                time.sleep(wait_for)
+
+            try:
+                prediction = _replicate_json_request(
+                    "https://api.replicate.com/v1/predictions",
+                    method="POST",
+                    payload={
+                        "version": version,
+                        "input": input_payload,
+                    },
+                )
+                REPLICATE_LAST_CREATE_AT = time.monotonic()
+            except HTTPException as exc:
+                last_error = exc
+
+                detail = exc.detail
+                status = (
+                    detail.get("http_status")
+                    if isinstance(detail, dict)
+                    else None
+                )
+
+                if status != 429:
+                    raise
+
+                retry_after = _extract_retry_after_seconds(exc)
+                REPLICATE_LAST_CREATE_AT = time.monotonic()
+
+                print(
+                    "REPLICATE RATE LIMIT:",
+                    "attempt=",
+                    attempt + 1,
+                    "retry_after=",
+                    retry_after,
+                )
+
+                time.sleep(retry_after + 1.0)
+                continue
+
+        prediction_id = prediction.get("id")
+        if not prediction_id:
             raise HTTPException(
-                status_code=504,
+                status_code=502,
                 detail={
-                    "message": "Timeout durante la segmentazione guidata SAM 2.",
-                    "prediction_id": prediction_id,
+                    "message": "Replicate non ha restituito un prediction id.",
+                    "response": prediction,
                 },
             )
 
-        time.sleep(REPLICATE_POLL_SECONDS)
-        current = _replicate_json_request(
-            f"https://api.replicate.com/v1/predictions/{prediction_id}"
-        )
+        deadline = time.monotonic() + REPLICATE_TIMEOUT_SECONDS
+        current = prediction
 
-    if current.get("status") != "succeeded":
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "message": "La segmentazione guidata SAM 2 non è riuscita.",
-                "prediction_id": prediction_id,
-                "status": current.get("status"),
-                "error": current.get("error"),
-                "logs": str(current.get("logs") or "")[-1600:],
-            },
-        )
+        while current.get("status") not in {
+            "succeeded",
+            "failed",
+            "canceled",
+        }:
+            if time.monotonic() >= deadline:
+                raise HTTPException(
+                    status_code=504,
+                    detail={
+                        "message": (
+                            "Timeout durante la segmentazione guidata SAM 2."
+                        ),
+                        "prediction_id": prediction_id,
+                    },
+                )
 
-    return current
+            time.sleep(REPLICATE_POLL_SECONDS)
+            current = _replicate_json_request(
+                f"https://api.replicate.com/v1/predictions/{prediction_id}"
+            )
+
+        if current.get("status") != "succeeded":
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "message": (
+                        "La segmentazione guidata SAM 2 non è riuscita."
+                    ),
+                    "prediction_id": prediction_id,
+                    "status": current.get("status"),
+                    "error": current.get("error"),
+                    "logs": str(current.get("logs") or "")[-1600:],
+                },
+            )
+
+        return current
+
+    if isinstance(last_error, HTTPException):
+        raise last_error
+
+    raise HTTPException(
+        status_code=429,
+        detail={
+            "message": (
+                "Limite Replicate ancora attivo dopo diversi tentativi."
+            ),
+            "analysis_version": (
+                "vehicle-segmentation-v16.2.1-rate-limit-safe"
+            ),
+        },
+    )
 
 
 def prompted_points_for_box(
@@ -3401,36 +3505,25 @@ def prompted_segment_components(
     results: list[dict] = []
     failures: list[dict] = []
 
-    with ThreadPoolExecutor(
-        max_workers=PROMPTED_SAM_MAX_WORKERS
-    ) as executor:
-        future_map = {
-            executor.submit(
-                run_prompted_sam_for_component,
+    for component in valid_components:
+        try:
+            item = run_prompted_sam_for_component(
                 image_data_url,
                 source.size,
                 component,
-            ): component
-            for component in valid_components
-        }
+            )
+        except Exception as exc:
+            failures.append({
+                "code": component.get("code"),
+                "error_type": type(exc).__name__,
+                "error": str(exc)[:1200],
+            })
+            continue
 
-        for future in as_completed(future_map):
-            component = future_map[future]
-
-            try:
-                item = future.result()
-            except Exception as exc:
-                failures.append({
-                    "code": component.get("code"),
-                    "error_type": type(exc).__name__,
-                    "error": str(exc)[:1000],
-                })
-                continue
-
-            if item.get("status") == "succeeded":
-                results.append(item["component"])
-            else:
-                failures.append(item)
+        if item.get("status") == "succeeded":
+            results.append(item["component"])
+        else:
+            failures.append(item)
 
     results.sort(
         key=lambda item: item.get("confidence", 0.0),
@@ -3438,6 +3531,8 @@ def prompted_segment_components(
     )
 
     return results, failures
+
+
 
 
 def normalize_vehicle_analysis(
@@ -3616,7 +3711,7 @@ Bounding-box rules:
                 "model": configured_model,
                 "primary_error": primary_message[:800],
                 "fallback_error": fallback_message[:800],
-                "analysis_version": "vehicle-segmentation-v16.2-prompted-component-segmentation",
+                "analysis_version": "vehicle-segmentation-v16.2.1-rate-limit-safe",
             },
         ) from fallback_exc
 
@@ -3797,7 +3892,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                 "gpt-4.1-mini",
             ),
             "analysis_version": (
-                "vehicle-segmentation-v16.2-prompted-component-segmentation"
+                "vehicle-segmentation-v16.2.1-rate-limit-safe"
             ),
             "mask_format": "data:image/png;base64",
             "mask_semantics": "white_component_black_background",
@@ -3844,7 +3939,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     "error_type": type(exc).__name__,
                     "error": str(exc)[:1600],
                     "analysis_version": (
-                        "vehicle-segmentation-v16.2-prompted-component-segmentation"
+                        "vehicle-segmentation-v16.2.1-rate-limit-safe"
                     ),
                 },
             },
@@ -3886,7 +3981,7 @@ def start_vehicle_component_analysis(
             "result": None,
             "error": None,
             "analysis_version": (
-                "vehicle-segmentation-v16.2-prompted-component-segmentation"
+                "vehicle-segmentation-v16.2.1-rate-limit-safe"
             ),
         }
 
@@ -3904,7 +3999,7 @@ def start_vehicle_component_analysis(
             f"/v1/vehicle/analyze-components/status/{job_id}"
         ),
         "analysis_version": (
-            "vehicle-segmentation-v16.2-prompted-component-segmentation"
+            "vehicle-segmentation-v16.2.1-rate-limit-safe"
         ),
     }
 
@@ -3983,7 +4078,7 @@ def analyze_vehicle_components_sync_disabled(
                 "/v1/vehicle/analyze-components/status/{job_id}"
             ),
             "analysis_version": (
-                "vehicle-segmentation-v16.2-prompted-component-segmentation"
+                "vehicle-segmentation-v16.2.1-rate-limit-safe"
             ),
         },
     )
@@ -4055,7 +4150,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v16.2-prompted-component-segmentation",
+        "prompt_version": "damage-v16.2.1-rate-limit-safe",
     }
 
 
@@ -4339,7 +4434,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v16.2-prompted-component-segmentation",
+        "prompt_version": "damage-v16.2.1-rate-limit-safe",
         "deformation_type": payload.deformation_type,
         "impact_direction": payload.impact_direction,
         "contact_traces_enabled": payload.contact_traces_enabled,
