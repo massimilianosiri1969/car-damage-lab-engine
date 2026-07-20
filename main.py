@@ -49,7 +49,7 @@ ALLOWED_ORIGINS = [
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.6.2.1",
+    version="1.6.2.2",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -2284,7 +2284,7 @@ def _replicate_json_request(
             status_code=500,
             detail={
                 "message": "REPLICATE_API_TOKEN non configurato su Render.",
-                "analysis_version": "vehicle-segmentation-v16.2.1-rate-limit-safe",
+                "analysis_version": "vehicle-segmentation-v16.2.2-hybrid-all-components",
             },
         )
 
@@ -2327,7 +2327,7 @@ def _replicate_json_request(
                 "http_status": exc.code,
                 "request_url": url,
                 "replicate_detail": error_body[:2000],
-                "analysis_version": "vehicle-segmentation-v16.2.1-rate-limit-safe",
+                "analysis_version": "vehicle-segmentation-v16.2.2-hybrid-all-components",
             },
         ) from exc
     except Exception as exc:
@@ -2336,7 +2336,7 @@ def _replicate_json_request(
             detail={
                 "message": "Connessione a Replicate non riuscita.",
                 "error": f"{type(exc).__name__}: {str(exc)}"[:1200],
-                "analysis_version": "vehicle-segmentation-v16.2.1-rate-limit-safe",
+                "analysis_version": "vehicle-segmentation-v16.2.2-hybrid-all-components",
             },
         ) from exc
 
@@ -3228,7 +3228,7 @@ def _create_replicate_prediction(
                 "Limite Replicate ancora attivo dopo diversi tentativi."
             ),
             "analysis_version": (
-                "vehicle-segmentation-v16.2.1-rate-limit-safe"
+                "vehicle-segmentation-v16.2.2-hybrid-all-components"
             ),
         },
     )
@@ -3489,6 +3489,53 @@ def run_prompted_sam_for_component(
     }
 
 
+def _fallback_component_from_detection(
+    source: Image.Image,
+    component: dict,
+    failure_reason: str,
+) -> dict | None:
+    code = str(component.get("code", "")).strip()
+    box = component_detection_box(
+        component,
+        source.width,
+        source.height,
+    )
+    if not code or box is None:
+        return None
+
+    mask = build_box_fallback_mask(source.size, box)
+    binary = mask_to_binary(mask)
+
+    if int((binary > 0).sum()) < 24:
+        return None
+
+    x, y, width, height = cv2.boundingRect(binary)
+
+    try:
+        confidence = float(component.get("confidence", 0.70))
+    except Exception:
+        confidence = 0.70
+
+    return {
+        "code": code,
+        "label": VEHICLE_COMPONENT_CATALOG.get(code, code),
+        "category": component_category(code),
+        "confidence": round(max(0.0, min(confidence, 1.0)), 2),
+        "mask_base64": mask_image_to_data_url(mask),
+        "bounding_box": {
+            "x": int(x),
+            "y": int(y),
+            "width": int(width),
+            "height": int(height),
+        },
+        "detection_box": box,
+        "mask_source": "openai_box_fallback_after_prompted_sam_failure",
+        "sam_match_quality": "manual_review_required",
+        "requires_review": True,
+        "prompted_failure_reason": failure_reason[:1000],
+    }
+
+
 def prompted_segment_components(
     image_data_url: str,
     source: Image.Image,
@@ -3506,28 +3553,43 @@ def prompted_segment_components(
     failures: list[dict] = []
 
     for component in valid_components:
+        failure_reason = "prompted_sam_failed"
+
         try:
             item = run_prompted_sam_for_component(
                 image_data_url,
                 source.size,
                 component,
             )
+
+            if item.get("status") == "succeeded":
+                results.append(item["component"])
+                continue
+
+            failure_reason = str(item.get("error", failure_reason))
+            failures.append(item)
+
         except Exception as exc:
+            failure_reason = f"{type(exc).__name__}: {str(exc)[:900]}"
             failures.append({
                 "code": component.get("code"),
                 "error_type": type(exc).__name__,
                 "error": str(exc)[:1200],
             })
-            continue
 
-        if item.get("status") == "succeeded":
-            results.append(item["component"])
-        else:
-            failures.append(item)
+        fallback = _fallback_component_from_detection(
+            source,
+            component,
+            failure_reason,
+        )
+        if fallback is not None:
+            results.append(fallback)
 
     results.sort(
-        key=lambda item: item.get("confidence", 0.0),
-        reverse=True,
+        key=lambda item: (
+            bool(item.get("requires_review", False)),
+            -float(item.get("confidence", 0.0)),
+        )
     )
 
     return results, failures
@@ -3567,7 +3629,19 @@ def normalize_vehicle_analysis(
             for item in prompted_components
         ],
         "prompted_segmentation_failures": prompted_failures,
-        "segmentation_strategy": "per_component_prompted_sam2_points",
+        "prompted_success_count": sum(
+            1
+            for item in prompted_components
+            if item.get("mask_source") == "replicate_sam2_prompted_points"
+        ),
+        "fallback_component_count": sum(
+            1
+            for item in prompted_components
+            if item.get("requires_review") is True
+        ),
+        "segmentation_strategy": (
+            "hybrid_prompted_sam2_with_openai_box_fallback"
+        ),
     }
 
 
@@ -3711,7 +3785,7 @@ Bounding-box rules:
                 "model": configured_model,
                 "primary_error": primary_message[:800],
                 "fallback_error": fallback_message[:800],
-                "analysis_version": "vehicle-segmentation-v16.2.1-rate-limit-safe",
+                "analysis_version": "vehicle-segmentation-v16.2.2-hybrid-all-components",
             },
         ) from fallback_exc
 
@@ -3892,12 +3966,12 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                 "gpt-4.1-mini",
             ),
             "analysis_version": (
-                "vehicle-segmentation-v16.2.1-rate-limit-safe"
+                "vehicle-segmentation-v16.2.2-hybrid-all-components"
             ),
             "mask_format": "data:image/png;base64",
             "mask_semantics": "white_component_black_background",
             "segmentation_provider": "replicate/meta-sam-2-video",
-            "segmentation_strategy": "per_component_prompted_points",
+            "segmentation_strategy": "hybrid_prompted_sam2_with_openai_box_fallback",
         }
 
         set_analysis_job(
@@ -3939,7 +4013,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     "error_type": type(exc).__name__,
                     "error": str(exc)[:1600],
                     "analysis_version": (
-                        "vehicle-segmentation-v16.2.1-rate-limit-safe"
+                        "vehicle-segmentation-v16.2.2-hybrid-all-components"
                     ),
                 },
             },
@@ -3981,7 +4055,7 @@ def start_vehicle_component_analysis(
             "result": None,
             "error": None,
             "analysis_version": (
-                "vehicle-segmentation-v16.2.1-rate-limit-safe"
+                "vehicle-segmentation-v16.2.2-hybrid-all-components"
             ),
         }
 
@@ -3999,7 +4073,7 @@ def start_vehicle_component_analysis(
             f"/v1/vehicle/analyze-components/status/{job_id}"
         ),
         "analysis_version": (
-            "vehicle-segmentation-v16.2.1-rate-limit-safe"
+            "vehicle-segmentation-v16.2.2-hybrid-all-components"
         ),
     }
 
@@ -4078,7 +4152,7 @@ def analyze_vehicle_components_sync_disabled(
                 "/v1/vehicle/analyze-components/status/{job_id}"
             ),
             "analysis_version": (
-                "vehicle-segmentation-v16.2.1-rate-limit-safe"
+                "vehicle-segmentation-v16.2.2-hybrid-all-components"
             ),
         },
     )
@@ -4150,7 +4224,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v16.2.1-rate-limit-safe",
+        "prompt_version": "damage-v16.2.2-hybrid-all-components",
     }
 
 
@@ -4434,7 +4508,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v16.2.1-rate-limit-safe",
+        "prompt_version": "damage-v16.2.2-hybrid-all-components",
         "deformation_type": payload.deformation_type,
         "impact_direction": payload.impact_direction,
         "contact_traces_enabled": payload.contact_traces_enabled,
