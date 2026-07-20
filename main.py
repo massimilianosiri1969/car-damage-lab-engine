@@ -4,6 +4,10 @@ import json
 import os
 import re
 import traceback
+import json
+import time
+import urllib.error
+import urllib.request
 import uuid
 from pathlib import Path
 from typing import Literal
@@ -41,7 +45,7 @@ ALLOWED_ORIGINS = [
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.6.0.2",
+    version="1.6.1",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -442,6 +446,41 @@ SEGMENTATION_GRABCUT_MAX_SIDE = max(
 SMART_COMPOSITE_MAX_SIDE = max(
     720,
     min(2048, int(os.getenv("SMART_COMPOSITE_MAX_SIDE", "1400"))),
+)
+
+
+REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN", "").strip()
+REPLICATE_SAM2_VERSION = os.getenv(
+    "REPLICATE_SAM2_VERSION",
+    "fe97b453a6455861e3bac769b441ca1f1086110da7466dbb65cf1eecfd60dc83",
+)
+REPLICATE_POLL_SECONDS = max(
+    0.5,
+    min(5.0, float(os.getenv("REPLICATE_POLL_SECONDS", "1.0"))),
+)
+REPLICATE_TIMEOUT_SECONDS = max(
+    30,
+    min(300, int(os.getenv("REPLICATE_TIMEOUT_SECONDS", "180"))),
+)
+SAM2_POINTS_PER_SIDE = max(
+    16,
+    min(64, int(os.getenv("SAM2_POINTS_PER_SIDE", "32"))),
+)
+SAM2_PRED_IOU_THRESH = max(
+    0.50,
+    min(0.99, float(os.getenv("SAM2_PRED_IOU_THRESH", "0.82"))),
+)
+SAM2_STABILITY_SCORE_THRESH = max(
+    0.50,
+    min(0.99, float(os.getenv("SAM2_STABILITY_SCORE_THRESH", "0.88"))),
+)
+SAM2_MIN_BOX_COVERAGE = max(
+    0.05,
+    min(0.95, float(os.getenv("SAM2_MIN_BOX_COVERAGE", "0.18"))),
+)
+SAM2_MAX_OUTSIDE_RATIO = max(
+    0.05,
+    min(0.95, float(os.getenv("SAM2_MAX_OUTSIDE_RATIO", "0.70"))),
 )
 
 DEFORMATION_INSTRUCTIONS = {
@@ -2086,257 +2125,366 @@ def mask_image_to_data_url(mask: Image.Image) -> str:
     return f"data:image/png;base64,{encoded}"
 
 
-def normalize_polygon_points(
-    raw_polygon,
+def normalize_box(
+    raw_box,
     width: int,
     height: int,
-) -> list[tuple[int, int]]:
-    if not isinstance(raw_polygon, list):
-        return []
-
-    points: list[tuple[int, int]] = []
-
-    for item in raw_polygon:
-        if isinstance(item, dict):
-            raw_x = item.get("x")
-            raw_y = item.get("y")
-        elif isinstance(item, (list, tuple)) and len(item) >= 2:
-            raw_x, raw_y = item[0], item[1]
-        else:
-            continue
-
-        try:
-            x_value = float(raw_x)
-            y_value = float(raw_y)
-        except Exception:
-            continue
-
-        # Il modello restituisce coordinate normalizzate 0..1000.
-        x = round((x_value / SEGMENTATION_POLYGON_SCALE) * (width - 1))
-        y = round((y_value / SEGMENTATION_POLYGON_SCALE) * (height - 1))
-
-        points.append(
-            (
-                max(0, min(width - 1, x)),
-                max(0, min(height - 1, y)),
-            )
-        )
-
-    return points if len(points) >= 3 else []
-
-
-def polygon_mask(
-    image_size: tuple[int, int],
-    points: list[tuple[int, int]],
-) -> Image.Image:
-    width, height = image_size
-    mask = np.zeros((height, width), dtype=np.uint8)
-
-    if len(points) >= 3:
-        polygon = np.array(points, dtype=np.int32).reshape((-1, 1, 2))
-        cv2.fillPoly(mask, [polygon], 255)
-
-    return Image.fromarray(mask, mode="L")
-
-
-def clean_component_mask(mask: Image.Image) -> Image.Image:
-    binary = mask_to_binary(mask)
-    height, width = binary.shape
-
-    kernel_size = max(3, round(min(width, height) * 0.004))
-    if kernel_size % 2 == 0:
-        kernel_size += 1
-
-    kernel = np.ones((kernel_size, kernel_size), np.uint8)
-    cleaned = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-    cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, kernel)
-
-    count, labels, stats, _ = cv2.connectedComponentsWithStats(
-        np.where(cleaned > 0, 1, 0).astype(np.uint8),
-        connectivity=8,
-    )
-
-    if count <= 1:
-        return Image.fromarray(cleaned, mode="L")
-
-    minimum_area = max(
-        16,
-        round(width * height * SEGMENTATION_MIN_AREA_RATIO),
-    )
-    selected = np.zeros_like(cleaned)
-
-    for index in range(1, count):
-        area = int(stats[index, cv2.CC_STAT_AREA])
-        if area >= minimum_area:
-            selected[labels == index] = 255
-
-    if int((selected > 0).sum()) == 0:
-        selected = cleaned
-
-    return Image.fromarray(selected, mode="L")
-
-
-def refine_mask_with_grabcut(
-    source: Image.Image,
-    initial_mask: Image.Image,
-) -> Image.Image:
-    if not SEGMENTATION_GRABCUT_ENABLED:
-        return clean_component_mask(initial_mask)
-
-    reduced_source, scale = resize_image_for_processing(
-        source.convert("RGB"),
-        SEGMENTATION_GRABCUT_MAX_SIDE,
-    )
-
-    reduced_mask = initial_mask.convert("L")
-    if scale != 1.0:
-        reduced_mask = reduced_mask.resize(
-            reduced_source.size,
-            Image.Resampling.NEAREST,
-        )
-
-    rgb = np.asarray(reduced_source, dtype=np.uint8)
-    initial = mask_to_binary(reduced_mask)
-
-    if int((initial > 0).sum()) < 64:
-        result = clean_component_mask(reduced_mask)
-        return upscale_mask_to_original(result, source.size)
-
-    grabcut_mask = np.full(initial.shape, cv2.GC_BGD, dtype=np.uint8)
-
-    probable_fg = cv2.dilate(
-        initial,
-        np.ones((7, 7), np.uint8),
-        iterations=1,
-    )
-    sure_fg = cv2.erode(
-        initial,
-        np.ones((3, 3), np.uint8),
-        iterations=1,
-    )
-
-    grabcut_mask[probable_fg > 0] = cv2.GC_PR_FGD
-    grabcut_mask[sure_fg > 0] = cv2.GC_FGD
-
-    probable_bg = cv2.dilate(
-        probable_fg,
-        np.ones((21, 21), np.uint8),
-        iterations=1,
-    )
-    grabcut_mask[probable_bg == 0] = cv2.GC_BGD
-
-    background_model = np.zeros((1, 65), np.float64)
-    foreground_model = np.zeros((1, 65), np.float64)
-
-    try:
-        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-
-        cv2.grabCut(
-            bgr,
-            grabcut_mask,
-            None,
-            background_model,
-            foreground_model,
-            2,
-            cv2.GC_INIT_WITH_MASK,
-        )
-
-        refined = np.where(
-            (grabcut_mask == cv2.GC_FGD)
-            | (grabcut_mask == cv2.GC_PR_FGD),
-            255,
-            0,
-        ).astype(np.uint8)
-
-        allowed = cv2.dilate(
-            initial,
-            np.ones((15, 15), np.uint8),
-            iterations=1,
-        )
-        refined = cv2.bitwise_and(refined, allowed)
-
-        if int((refined > 0).sum()) < max(
-            32,
-            int((initial > 0).sum() * 0.25),
-        ):
-            refined = initial
-
-        cleaned = clean_component_mask(
-            Image.fromarray(refined, mode="L")
-        )
-        return upscale_mask_to_original(cleaned, source.size)
-
-    except Exception:
-        cleaned = clean_component_mask(reduced_mask)
-        return upscale_mask_to_original(cleaned, source.size)
-
-    finally:
-        del rgb
-        del initial
-        del grabcut_mask
-        del probable_fg
-        del sure_fg
-        del probable_bg
-        del background_model
-        del foreground_model
-        if "bgr" in locals():
-            del bgr
-
-
-def build_component_segmentation(
-    source: Image.Image,
-    component: dict,
 ) -> dict | None:
-    code = str(component.get("code", "")).strip()
-    if code not in VEHICLE_COMPONENT_CATALOG:
+    if not isinstance(raw_box, dict):
         return None
-
-    polygon = normalize_polygon_points(
-        component.get("polygon", []),
-        source.width,
-        source.height,
-    )
-
-    if not polygon:
-        return None
-
-    initial_mask = polygon_mask(source.size, polygon)
-    refined_mask = refine_mask_with_grabcut(source, initial_mask)
-
-    binary = mask_to_binary(refined_mask)
-    pixel_area = int((binary > 0).sum())
-
-    if pixel_area < max(
-        16,
-        round(source.width * source.height * SEGMENTATION_MIN_AREA_RATIO),
-    ):
-        return None
-
-    x, y, width, height = cv2.boundingRect(binary)
 
     try:
-        confidence = float(component.get("confidence", 0.70))
+        x1 = float(raw_box.get("x1"))
+        y1 = float(raw_box.get("y1"))
+        x2 = float(raw_box.get("x2"))
+        y2 = float(raw_box.get("y2"))
     except Exception:
-        confidence = 0.70
+        return None
+
+    # Bounding box normalizzato 0..1000.
+    x1 = round((x1 / 1000.0) * (width - 1))
+    y1 = round((y1 / 1000.0) * (height - 1))
+    x2 = round((x2 / 1000.0) * (width - 1))
+    y2 = round((y2 / 1000.0) * (height - 1))
+
+    left = max(0, min(width - 1, min(x1, x2)))
+    top = max(0, min(height - 1, min(y1, y2)))
+    right = max(left + 1, min(width, max(x1, x2)))
+    bottom = max(top + 1, min(height, max(y1, y2)))
+
+    if right - left < 4 or bottom - top < 4:
+        return None
 
     return {
-        "code": code,
-        "label": VEHICLE_COMPONENT_CATALOG[code],
-        "category": component_category(code),
-        "confidence": round(max(0.0, min(confidence, 1.0)), 2),
-        "mask_base64": mask_image_to_data_url(refined_mask),
-        "bounding_box": {
-            "x": int(x),
-            "y": int(y),
-            "width": int(width),
-            "height": int(height),
-        },
-        "polygon": [
-            {"x": int(point[0]), "y": int(point[1])}
-            for point in polygon
-        ],
-        "mask_source": "vision_polygon_grabcut",
+        "x1": int(left),
+        "y1": int(top),
+        "x2": int(right),
+        "y2": int(bottom),
+        "x": int(left),
+        "y": int(top),
+        "width": int(right - left),
+        "height": int(bottom - top),
     }
+
+
+def _replicate_json_request(
+    url: str,
+    method: str = "GET",
+    payload: dict | None = None,
+) -> dict:
+    if not REPLICATE_API_TOKEN:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "message": "REPLICATE_API_TOKEN non configurato su Render.",
+                "analysis_version": "vehicle-segmentation-v16.1-replicate-sam2",
+            },
+        )
+
+    body = None
+    headers = {
+        "Authorization": f"Bearer {REPLICATE_API_TOKEN}",
+        "Accept": "application/json",
+    }
+
+    if payload is not None:
+        body = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers=headers,
+        method=method,
+    )
+
+    try:
+        with urllib.request.urlopen(
+            request,
+            timeout=REPLICATE_TIMEOUT_SECONDS,
+        ) as response:
+            content = response.read().decode("utf-8")
+            return json.loads(content or "{}")
+    except urllib.error.HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="replace")
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": "Errore API Replicate.",
+                "http_status": exc.code,
+                "replicate_detail": error_body[:1200],
+                "analysis_version": "vehicle-segmentation-v16.1-replicate-sam2",
+            },
+        ) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": "Connessione a Replicate non riuscita.",
+                "error": f"{type(exc).__name__}: {str(exc)}"[:1200],
+                "analysis_version": "vehicle-segmentation-v16.1-replicate-sam2",
+            },
+        ) from exc
+
+
+def _download_binary_url(url: str) -> bytes:
+    request = urllib.request.Request(
+        url,
+        headers={"Accept": "image/png,image/*;q=0.9,*/*;q=0.1"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(
+            request,
+            timeout=REPLICATE_TIMEOUT_SECONDS,
+        ) as response:
+            return response.read()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": "Download maschera SAM 2 non riuscito.",
+                "error": f"{type(exc).__name__}: {str(exc)}"[:800],
+            },
+        ) from exc
+
+
+def call_replicate_sam2(image_data_url: str) -> dict:
+    prediction = _replicate_json_request(
+        "https://api.replicate.com/v1/predictions",
+        method="POST",
+        payload={
+            "version": REPLICATE_SAM2_VERSION,
+            "input": {
+                "image": image_data_url,
+                "points_per_side": SAM2_POINTS_PER_SIDE,
+                "pred_iou_thresh": SAM2_PRED_IOU_THRESH,
+                "stability_score_thresh": SAM2_STABILITY_SCORE_THRESH,
+                "use_m2m": True,
+            },
+        },
+    )
+
+    prediction_id = prediction.get("id")
+    if not prediction_id:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": "Replicate non ha restituito un prediction id.",
+                "response": prediction,
+            },
+        )
+
+    deadline = time.monotonic() + REPLICATE_TIMEOUT_SECONDS
+    current = prediction
+
+    while current.get("status") not in {
+        "succeeded",
+        "failed",
+        "canceled",
+    }:
+        if time.monotonic() >= deadline:
+            raise HTTPException(
+                status_code=504,
+                detail={
+                    "message": "Timeout durante la segmentazione SAM 2.",
+                    "prediction_id": prediction_id,
+                },
+            )
+
+        time.sleep(REPLICATE_POLL_SECONDS)
+        current = _replicate_json_request(
+            f"https://api.replicate.com/v1/predictions/{prediction_id}"
+        )
+
+    if current.get("status") != "succeeded":
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": "La segmentazione SAM 2 non è riuscita.",
+                "prediction_id": prediction_id,
+                "status": current.get("status"),
+                "error": current.get("error"),
+            },
+        )
+
+    output = current.get("output") or {}
+    individual_masks = output.get("individual_masks") or []
+
+    if not isinstance(individual_masks, list) or not individual_masks:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "SAM 2 non ha restituito maschere individuali.",
+                "prediction_id": prediction_id,
+            },
+        )
+
+    return {
+        "prediction_id": prediction_id,
+        "individual_masks": individual_masks,
+        "combined_mask": output.get("combined_mask"),
+        "metrics": current.get("metrics") or {},
+    }
+
+
+def load_sam_candidate_masks(
+    mask_urls: list[str],
+    target_size: tuple[int, int],
+) -> list[dict]:
+    candidates: list[dict] = []
+
+    for index, url in enumerate(mask_urls):
+        try:
+            raw = _download_binary_url(url)
+            image = Image.open(io.BytesIO(raw)).convert("L")
+            image = image.resize(
+                target_size,
+                Image.Resampling.NEAREST,
+            )
+            binary = mask_to_binary(image)
+            area = int((binary > 0).sum())
+
+            if area < 32:
+                continue
+
+            candidates.append({
+                "index": index,
+                "url": url,
+                "mask": image,
+                "binary": binary,
+                "area": area,
+            })
+        except Exception as exc:
+            print(
+                "SAM2 MASK DOWNLOAD ERROR:",
+                index,
+                type(exc).__name__,
+                str(exc),
+            )
+
+    return candidates
+
+
+def score_mask_for_box(
+    candidate_binary: np.ndarray,
+    box: dict,
+) -> tuple[float, dict]:
+    x1, y1 = box["x1"], box["y1"]
+    x2, y2 = box["x2"], box["y2"]
+
+    box_area = max(1, (x2 - x1) * (y2 - y1))
+    mask_area = max(1, int((candidate_binary > 0).sum()))
+    intersection = int(
+        (candidate_binary[y1:y2, x1:x2] > 0).sum()
+    )
+
+    box_coverage = intersection / box_area
+    mask_inside_ratio = intersection / mask_area
+    outside_ratio = 1.0 - mask_inside_ratio
+
+    # Favorisce maschere che riempiono il box senza espandersi troppo fuori.
+    score = (
+        box_coverage * 0.58
+        + mask_inside_ratio * 0.42
+        - max(0.0, outside_ratio - 0.45) * 0.45
+    )
+
+    return score, {
+        "intersection_pixels": intersection,
+        "box_coverage": round(box_coverage, 4),
+        "mask_inside_ratio": round(mask_inside_ratio, 4),
+        "outside_ratio": round(outside_ratio, 4),
+    }
+
+
+def assign_sam_masks_to_components(
+    source: Image.Image,
+    raw_components: list[dict],
+    candidates: list[dict],
+) -> list[dict]:
+    assignments: list[dict] = []
+    used_candidate_indexes: set[int] = set()
+
+    sorted_components = sorted(
+        raw_components,
+        key=lambda item: float(item.get("confidence", 0.0)),
+        reverse=True,
+    )
+
+    for component in sorted_components:
+        code = str(component.get("code", "")).strip()
+        if code not in VEHICLE_COMPONENT_CATALOG:
+            continue
+
+        box = normalize_box(
+            component.get("bounding_box"),
+            source.width,
+            source.height,
+        )
+        if box is None:
+            continue
+
+        best = None
+
+        for candidate in candidates:
+            if candidate["index"] in used_candidate_indexes:
+                continue
+
+            score, diagnostics = score_mask_for_box(
+                candidate["binary"],
+                box,
+            )
+
+            if (
+                diagnostics["box_coverage"] < SAM2_MIN_BOX_COVERAGE
+                or diagnostics["outside_ratio"] > SAM2_MAX_OUTSIDE_RATIO
+            ):
+                continue
+
+            if best is None or score > best["score"]:
+                best = {
+                    "candidate": candidate,
+                    "score": score,
+                    "diagnostics": diagnostics,
+                }
+
+        if best is None:
+            continue
+
+        used_candidate_indexes.add(best["candidate"]["index"])
+        refined_mask = clean_component_mask(
+            best["candidate"]["mask"]
+        )
+        binary = mask_to_binary(refined_mask)
+        x, y, width, height = cv2.boundingRect(binary)
+
+        try:
+            confidence = float(component.get("confidence", 0.70))
+        except Exception:
+            confidence = 0.70
+
+        assignments.append({
+            "code": code,
+            "label": VEHICLE_COMPONENT_CATALOG[code],
+            "category": component_category(code),
+            "confidence": round(max(0.0, min(confidence, 1.0)), 2),
+            "mask_base64": mask_image_to_data_url(refined_mask),
+            "bounding_box": {
+                "x": int(x),
+                "y": int(y),
+                "width": int(width),
+                "height": int(height),
+            },
+            "detection_box": box,
+            "mask_source": "replicate_sam2_automatic_matched_to_openai_box",
+            "sam_candidate_index": best["candidate"]["index"],
+            "sam_match_score": round(best["score"], 4),
+            "sam_match_diagnostics": best["diagnostics"],
+        })
+
+    return assignments
+
 
 
 def image_to_data_url(image: Image.Image) -> str:
@@ -2399,6 +2547,7 @@ def extract_json_object(raw_text: str) -> dict:
 def normalize_vehicle_analysis(
     raw: dict,
     source: Image.Image,
+    sam_result: dict,
 ) -> dict:
     vehicle_view = str(
         raw.get("vehicle_view", raw.get("view", "unknown"))
@@ -2412,24 +2561,19 @@ def normalize_vehicle_analysis(
         raw.get("visible_components", []),
     )
 
-    segmented_components: list[dict] = []
-    seen: set[str] = set()
+    if not isinstance(raw_components, list):
+        raw_components = []
 
-    if isinstance(raw_components, list):
-        for item in raw_components:
-            if not isinstance(item, dict):
-                continue
+    candidates = load_sam_candidate_masks(
+        sam_result["individual_masks"],
+        source.size,
+    )
 
-            code = str(item.get("code", "")).strip()
-            if code in seen:
-                continue
-
-            segmentation = build_component_segmentation(source, item)
-            if segmentation is None:
-                continue
-
-            seen.add(code)
-            segmented_components.append(segmentation)
+    segmented_components = assign_sam_masks_to_components(
+        source,
+        raw_components,
+        candidates,
+    )
 
     segmented_components.sort(
         key=lambda item: item["confidence"],
@@ -2442,7 +2586,6 @@ def normalize_vehicle_analysis(
         "vehicle_view": vehicle_view,
         "vehicle_view_label": VEHICLE_VIEW_LABELS[vehicle_view],
         "components": segmented_components,
-        # Compatibilità con il vecchio frontend.
         "visible_components": [
             {
                 "code": item["code"],
@@ -2451,10 +2594,15 @@ def normalize_vehicle_analysis(
                 "confidence": item["confidence"],
                 "mask_base64": item["mask_base64"],
                 "bounding_box": item["bounding_box"],
+                "mask_source": item["mask_source"],
             }
             for item in segmented_components
         ],
+        "sam_prediction_id": sam_result["prediction_id"],
+        "sam_candidate_count": len(candidates),
+        "sam_metrics": sam_result.get("metrics", {}),
     }
+
 
 
 def call_openai_vehicle_analysis(image_data_url: str) -> dict:
@@ -2487,15 +2635,14 @@ Return ONLY a valid JSON object with this exact structure:
   ]
 }}
 
-Polygon rules:
+Bounding-box rules:
 - Coordinates are normalized to the complete image: top-left is 0,0 and bottom-right is 1000,1000.
-- Trace the visible outer contour of the physical component, not an ellipse and not a generic bounding box.
-- Use 8 to 24 polygon points when possible.
-- Follow actual panel seams, lamp edges, glass edges, wheel outline and bumper boundaries.
-- Do not include the floor, workshop equipment, shadows, another vehicle or empty background.
-- Components may be partially visible; trace only the visible portion.
-- Do not overlap unrelated components unnecessarily.
+- Draw the smallest practical box containing only the visible portion of the requested physical component.
+- Follow the true location of panel seams, lamps, glass, wheels, bumpers and mirrors.
+- Do not include floor, workshop equipment, shadows, another vehicle or empty background.
+- Do not merge adjacent components into one box.
 - Return only components genuinely visible in the photograph.
+- A damaged component must still be identified by its original automotive function.
 - Do not describe damage severity, people or background.
 - Do not invent component codes.
 """.strip()
@@ -2594,7 +2741,7 @@ Polygon rules:
                 "model": configured_model,
                 "primary_error": primary_message[:800],
                 "fallback_error": fallback_message[:800],
-                "analysis_version": "vehicle-segmentation-v16.0.2",
+                "analysis_version": "vehicle-segmentation-v16.1-replicate-sam2",
             },
         ) from fallback_exc
 
@@ -2615,11 +2762,16 @@ def analyze_vehicle_components(payload: VehicleAnalyzeRequest):
 
     try:
         raw_analysis = call_openai_vehicle_analysis(image_data_url)
+        sam_result = call_replicate_sam2(image_data_url)
     finally:
         del analysis_source
         del image_data_url
 
-    normalized = normalize_vehicle_analysis(raw_analysis, source)
+    normalized = normalize_vehicle_analysis(
+        raw_analysis,
+        source,
+        sam_result,
+    )
 
     if not normalized["components"]:
         raise HTTPException(
@@ -2638,7 +2790,7 @@ def analyze_vehicle_components(payload: VehicleAnalyzeRequest):
                     if isinstance(raw_analysis, dict)
                     else []
                 ),
-                "analysis_version": "vehicle-segmentation-v16.0.2",
+                "analysis_version": "vehicle-segmentation-v16.1-replicate-sam2",
             },
         )
 
@@ -2648,9 +2800,10 @@ def analyze_vehicle_components(payload: VehicleAnalyzeRequest):
             "OPENAI_VISION_MODEL",
             "gpt-4.1-mini",
         ),
-        "analysis_version": "vehicle-segmentation-v16.0.2",
+        "analysis_version": "vehicle-segmentation-v16.1-replicate-sam2",
         "mask_format": "data:image/png;base64",
         "mask_semantics": "white_component_black_background",
+        "segmentation_provider": "replicate/meta-sam-2",
     }
 
 
@@ -2720,7 +2873,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v16.0.2-render-free-memory-optimized",
+        "prompt_version": "damage-v16.1-replicate-sam2",
     }
 
 
@@ -3004,7 +3157,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v16.0.2-render-free-memory-optimized",
+        "prompt_version": "damage-v16.1-replicate-sam2",
         "deformation_type": payload.deformation_type,
         "impact_direction": payload.impact_direction,
         "contact_traces_enabled": payload.contact_traces_enabled,
