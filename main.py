@@ -49,7 +49,7 @@ ALLOWED_ORIGINS = [
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.6.3.2",
+    version="1.6.4",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -146,6 +146,18 @@ class ComponentRefineRequest(BaseModel):
     positive_points: list[NormalizedPoint] = Field(default_factory=list)
     negative_points: list[NormalizedPoint] = Field(default_factory=list)
     iterations: int = Field(default=4, ge=1, le=8)
+
+
+class AssistedComponentSelectionRequest(BaseModel):
+    image_base64: str = Field(..., min_length=16)
+    component_code: str = Field(..., min_length=1, max_length=80)
+    detection_box: dict | None = None
+    current_mask_base64: str | None = None
+    positive_points: list[NormalizedPoint] = Field(default_factory=list)
+    negative_points: list[NormalizedPoint] = Field(default_factory=list)
+    reset_mask: bool = False
+    manual_mask_base64: str | None = None
+    confirm_manual_mask: bool = False
 
 
 class DamageFinalizeBase64Request(BaseModel):
@@ -2342,7 +2354,7 @@ def _replicate_json_request(
             status_code=500,
             detail={
                 "message": "REPLICATE_API_TOKEN non configurato su Render.",
-                "analysis_version": "vehicle-segmentation-v16.3.2-refinement-progress-fast",
+                "analysis_version": "vehicle-segmentation-v16.4-assisted-selection",
             },
         )
 
@@ -2385,7 +2397,7 @@ def _replicate_json_request(
                 "http_status": exc.code,
                 "request_url": url,
                 "replicate_detail": error_body[:2000],
-                "analysis_version": "vehicle-segmentation-v16.3.2-refinement-progress-fast",
+                "analysis_version": "vehicle-segmentation-v16.4-assisted-selection",
             },
         ) from exc
     except Exception as exc:
@@ -2394,7 +2406,7 @@ def _replicate_json_request(
             detail={
                 "message": "Connessione a Replicate non riuscita.",
                 "error": f"{type(exc).__name__}: {str(exc)}"[:1200],
-                "analysis_version": "vehicle-segmentation-v16.3.2-refinement-progress-fast",
+                "analysis_version": "vehicle-segmentation-v16.4-assisted-selection",
             },
         ) from exc
 
@@ -3289,7 +3301,7 @@ def _create_replicate_prediction(
                 "Limite Replicate ancora attivo dopo diversi tentativi."
             ),
             "analysis_version": (
-                "vehicle-segmentation-v16.3.2-refinement-progress-fast"
+                "vehicle-segmentation-v16.4-assisted-selection"
             ),
         },
     )
@@ -4029,12 +4041,102 @@ def apply_component_refinement(
             + str(component.get("mask_source", "unknown"))
         ),
         "refinement": diagnostics,
-        "requires_review": (
-            diagnostics.get("refinement_status") != "refined"
-            or component.get("requires_review", False)
-        ),
+        "requires_review": True,
+        "automatic_mask_status": "proposal_only",
     })
     return result
+
+
+
+def _mask_from_manual_input(
+    manual_mask_base64: str,
+    source_size: tuple[int, int],
+) -> Image.Image:
+    mask = decode_mask_data_url(
+        manual_mask_base64,
+        source_size,
+    )
+    return clean_component_mask(mask)
+
+
+def _build_seed_mask_from_points(
+    source: Image.Image,
+    box: dict,
+    positive_points: list[tuple[int, int]],
+    negative_points: list[tuple[int, int]],
+    current_mask: Image.Image | None,
+    reset_mask: bool,
+) -> Image.Image:
+    if current_mask is not None and not reset_mask:
+        initial = resize_mask(
+            current_mask.convert("L"),
+            source.size,
+        )
+    else:
+        initial = build_box_fallback_mask(
+            source.size,
+            box,
+        )
+
+    # Use interactive points to refine locally.
+    refined, _ = refine_component_mask_local(
+        source,
+        box,
+        initial,
+        positive_points=positive_points,
+        negative_points=negative_points,
+        iterations=COMPONENT_REFINEMENT_ITERATIONS,
+    )
+
+    return refined
+
+
+def _component_payload_from_mask(
+    component_code: str,
+    mask: Image.Image,
+    source_label: str,
+    confirmed: bool,
+    detection_box: dict | None,
+    diagnostics: dict | None = None,
+) -> dict:
+    binary = mask_to_binary(mask)
+
+    if int((binary > 0).sum()) < 24:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "La maschera del componente è vuota o troppo piccola.",
+                "component_code": component_code,
+            },
+        )
+
+    x, y, width, height = cv2.boundingRect(binary)
+
+    return {
+        "code": component_code,
+        "label": VEHICLE_COMPONENT_CATALOG.get(
+            component_code,
+            component_code,
+        ),
+        "category": component_category(component_code),
+        "mask_base64": mask_image_to_data_url(mask),
+        "bounding_box": {
+            "x": int(x),
+            "y": int(y),
+            "width": int(width),
+            "height": int(height),
+        },
+        "detection_box": detection_box,
+        "mask_source": source_label,
+        "requires_review": not confirmed,
+        "sam_match_quality": (
+            "manual_confirmed"
+            if confirmed
+            else "assisted_review"
+        ),
+        "selection_mode": "assisted",
+        "refinement": diagnostics or {},
+    }
 
 
 def _fallback_component_from_detection(
@@ -4080,6 +4182,7 @@ def _fallback_component_from_detection(
         "mask_source": "openai_box_fallback_after_prompted_sam_failure",
         "sam_match_quality": "manual_review_required",
         "requires_review": True,
+        "automatic_mask_status": "proposal_only",
         "prompted_failure_reason": failure_reason[:1000],
     }
 
@@ -4241,9 +4344,8 @@ def normalize_vehicle_analysis(
             for item in prompted_components
             if item.get("refinement", {}).get("refinement_status") == "refined"
         ),
-        "segmentation_strategy": (
-            "prompted_sam2_plus_local_multi_candidate_refinement"
-        ),
+        "segmentation_strategy": "assisted_selection_proposal_only",
+        "automatic_masks_are_proposals": True,
     }
 
 
@@ -4387,7 +4489,7 @@ Bounding-box rules:
                 "model": configured_model,
                 "primary_error": primary_message[:800],
                 "fallback_error": fallback_message[:800],
-                "analysis_version": "vehicle-segmentation-v16.3.2-refinement-progress-fast",
+                "analysis_version": "vehicle-segmentation-v16.4-assisted-selection",
             },
         ) from fallback_exc
 
@@ -4600,12 +4702,12 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                 "gpt-4.1-mini",
             ),
             "analysis_version": (
-                "vehicle-segmentation-v16.3.2-refinement-progress-fast"
+                "vehicle-segmentation-v16.4-assisted-selection"
             ),
             "mask_format": "data:image/png;base64",
             "mask_semantics": "white_component_black_background",
             "segmentation_provider": "replicate/meta-sam-2-video",
-            "segmentation_strategy": "prompted_sam2_plus_local_multi_candidate_refinement",
+            "segmentation_strategy": "assisted_selection_proposal_only",
             "component_timeout_seconds": PROMPTED_SAM_COMPONENT_TIMEOUT_SECONDS,
         }
 
@@ -4648,7 +4750,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     "error_type": type(exc).__name__,
                     "error": str(exc)[:1600],
                     "analysis_version": (
-                        "vehicle-segmentation-v16.3.2-refinement-progress-fast"
+                        "vehicle-segmentation-v16.4-assisted-selection"
                     ),
                 },
             },
@@ -4690,7 +4792,7 @@ def start_vehicle_component_analysis(
             "result": None,
             "error": None,
             "analysis_version": (
-                "vehicle-segmentation-v16.3.2-refinement-progress-fast"
+                "vehicle-segmentation-v16.4-assisted-selection"
             ),
         }
 
@@ -4708,7 +4810,7 @@ def start_vehicle_component_analysis(
             f"/v1/vehicle/analyze-components/status/{job_id}"
         ),
         "analysis_version": (
-            "vehicle-segmentation-v16.3.2-refinement-progress-fast"
+            "vehicle-segmentation-v16.4-assisted-selection"
         ),
     }
 
@@ -4767,6 +4869,106 @@ def delete_vehicle_component_analysis_job(job_id: str):
         "deleted": True,
     }
 
+
+
+
+@app.post("/v1/vehicle/assisted-component-selection")
+def assisted_component_selection(
+    payload: AssistedComponentSelectionRequest,
+):
+    source = decode_data_url_image(
+        payload.image_base64,
+        "image_base64",
+    ).convert("RGB")
+
+    box = None
+    if payload.detection_box is not None:
+        box = normalize_box(
+            payload.detection_box,
+            source.width,
+            source.height,
+        )
+
+    if payload.manual_mask_base64:
+        mask = _mask_from_manual_input(
+            payload.manual_mask_base64,
+            source.size,
+        )
+        return _component_payload_from_mask(
+            payload.component_code,
+            mask,
+            source_label="manual_component_mask",
+            confirmed=payload.confirm_manual_mask,
+            detection_box=box,
+            diagnostics={
+                "source": "manual_mask_upload",
+                "reset_mask": payload.reset_mask,
+            },
+        )
+
+    if box is None:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": (
+                    "Per la selezione assistita serve un detection_box "
+                    "oppure una manual_mask_base64."
+                ),
+                "component_code": payload.component_code,
+            },
+        )
+
+    positive_points = normalize_refinement_points(
+        payload.positive_points,
+        source.width,
+        source.height,
+    )
+    negative_points = normalize_refinement_points(
+        payload.negative_points,
+        source.width,
+        source.height,
+    )
+
+    if not positive_points and not negative_points and not payload.current_mask_base64:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": (
+                    "Indica almeno un punto positivo o negativo, "
+                    "oppure invia la maschera corrente."
+                ),
+                "component_code": payload.component_code,
+            },
+        )
+
+    current_mask = None
+    if payload.current_mask_base64:
+        current_mask = decode_mask_data_url(
+            payload.current_mask_base64,
+            source.size,
+        )
+
+    mask = _build_seed_mask_from_points(
+        source,
+        box,
+        positive_points,
+        negative_points,
+        current_mask,
+        payload.reset_mask,
+    )
+
+    return _component_payload_from_mask(
+        payload.component_code,
+        mask,
+        source_label="assisted_component_mask",
+        confirmed=False,
+        detection_box=box,
+        diagnostics={
+            "positive_point_count": len(positive_points),
+            "negative_point_count": len(negative_points),
+            "reset_mask": payload.reset_mask,
+        },
+    )
 
 
 @app.post("/v1/vehicle/refine-component")
@@ -4853,7 +5055,7 @@ def refine_vehicle_component(payload: ComponentRefineRequest):
         "requires_review": diagnostics.get("refinement_status") != "refined",
         "refinement": diagnostics,
         "analysis_version": (
-            "vehicle-segmentation-v16.3.2-refinement-progress-fast"
+            "vehicle-segmentation-v16.4-assisted-selection"
         ),
     }
 
@@ -4866,7 +5068,7 @@ def analyze_vehicle_components_sync_disabled(
         status_code=409,
         detail={
             "message": (
-                "La V16.3 usa l'analisi asincrona per evitare timeout. "
+                "La V16.4 usa l'analisi asincrona per evitare timeout. "
                 "Usare POST /v1/vehicle/analyze-components/start e poi "
                 "GET /v1/vehicle/analyze-components/status/{job_id}."
             ),
@@ -4877,7 +5079,7 @@ def analyze_vehicle_components_sync_disabled(
                 "/v1/vehicle/analyze-components/status/{job_id}"
             ),
             "analysis_version": (
-                "vehicle-segmentation-v16.3.2-refinement-progress-fast"
+                "vehicle-segmentation-v16.4-assisted-selection"
             ),
         },
     )
@@ -4949,7 +5151,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v16.3.2-refinement-progress-fast",
+        "prompt_version": "damage-v16.4-assisted-selection",
     }
 
 
@@ -5233,7 +5435,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v16.3.2-refinement-progress-fast",
+        "prompt_version": "damage-v16.4-assisted-selection",
         "deformation_type": payload.deformation_type,
         "impact_direction": payload.impact_direction,
         "contact_traces_enabled": payload.contact_traces_enabled,
