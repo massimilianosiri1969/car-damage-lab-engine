@@ -49,7 +49,7 @@ ALLOWED_ORIGINS = [
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.6.3",
+    version="1.6.3.1",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -513,6 +513,20 @@ COMPONENT_REFINEMENT_MIN_AREA_RATIO = max(
     min(
         0.02,
         float(os.getenv("COMPONENT_REFINEMENT_MIN_AREA_RATIO", "0.00015")),
+    ),
+)
+
+
+PROMPTED_SAM_COMPONENT_TIMEOUT_SECONDS = max(
+    20,
+    min(
+        180,
+        int(
+            os.getenv(
+                "PROMPTED_SAM_COMPONENT_TIMEOUT_SECONDS",
+                "75",
+            )
+        ),
     ),
 )
 
@@ -2319,7 +2333,7 @@ def _replicate_json_request(
             status_code=500,
             detail={
                 "message": "REPLICATE_API_TOKEN non configurato su Render.",
-                "analysis_version": "vehicle-segmentation-v16.3-component-refinement",
+                "analysis_version": "vehicle-segmentation-v16.3.1-progress-timeout",
             },
         )
 
@@ -2362,7 +2376,7 @@ def _replicate_json_request(
                 "http_status": exc.code,
                 "request_url": url,
                 "replicate_detail": error_body[:2000],
-                "analysis_version": "vehicle-segmentation-v16.3-component-refinement",
+                "analysis_version": "vehicle-segmentation-v16.3.1-progress-timeout",
             },
         ) from exc
     except Exception as exc:
@@ -2371,7 +2385,7 @@ def _replicate_json_request(
             detail={
                 "message": "Connessione a Replicate non riuscita.",
                 "error": f"{type(exc).__name__}: {str(exc)}"[:1200],
-                "analysis_version": "vehicle-segmentation-v16.3-component-refinement",
+                "analysis_version": "vehicle-segmentation-v16.3.1-progress-timeout",
             },
         ) from exc
 
@@ -3153,6 +3167,7 @@ def _extract_retry_after_seconds(exc: HTTPException) -> float:
 def _create_replicate_prediction(
     version: str,
     input_payload: dict,
+    timeout_seconds: int | None = None,
 ) -> dict:
     global REPLICATE_LAST_CREATE_AT
 
@@ -3213,7 +3228,9 @@ def _create_replicate_prediction(
                 },
             )
 
-        deadline = time.monotonic() + REPLICATE_TIMEOUT_SECONDS
+        deadline = time.monotonic() + (
+            timeout_seconds or REPLICATE_TIMEOUT_SECONDS
+        )
         current = prediction
 
         while current.get("status") not in {
@@ -3263,7 +3280,7 @@ def _create_replicate_prediction(
                 "Limite Replicate ancora attivo dopo diversi tentativi."
             ),
             "analysis_version": (
-                "vehicle-segmentation-v16.3-component-refinement"
+                "vehicle-segmentation-v16.3.1-progress-timeout"
             ),
         },
     )
@@ -3470,6 +3487,7 @@ def run_prompted_sam_for_component(
             "output_quality": 100,
             "output_frame_interval": 1,
         },
+        timeout_seconds=PROMPTED_SAM_COMPONENT_TIMEOUT_SECONDS,
     )
 
     output_url = _extract_prompted_output_url(
@@ -3983,6 +4001,7 @@ def prompted_segment_components(
     image_data_url: str,
     source: Image.Image,
     raw_components: list[dict],
+    progress_callback=None,
 ) -> tuple[list[dict], list[dict]]:
     valid_components = [
         component
@@ -3994,8 +4013,21 @@ def prompted_segment_components(
 
     results: list[dict] = []
     failures: list[dict] = []
+    total = max(1, len(valid_components))
 
-    for component in valid_components:
+    for index, component in enumerate(valid_components, start=1):
+        code = str(component.get("code", "")).strip()
+        label = VEHICLE_COMPONENT_CATALOG.get(code, code)
+
+        if progress_callback is not None:
+            progress_callback(
+                index=index,
+                total=total,
+                code=code,
+                label=label,
+                stage="segmenting",
+            )
+
         failure_reason = "prompted_sam_failed"
 
         try:
@@ -4007,6 +4039,15 @@ def prompted_segment_components(
 
             if item.get("status") == "succeeded":
                 results.append(item["component"])
+
+                if progress_callback is not None:
+                    progress_callback(
+                        index=index,
+                        total=total,
+                        code=code,
+                        label=label,
+                        stage="refining",
+                    )
                 continue
 
             failure_reason = str(item.get("error", failure_reason))
@@ -4027,6 +4068,24 @@ def prompted_segment_components(
         )
         if fallback is not None:
             results.append(fallback)
+
+        if progress_callback is not None:
+            progress_callback(
+                index=index,
+                total=total,
+                code=code,
+                label=label,
+                stage="fallback" if fallback is not None else "skipped",
+            )
+
+    if progress_callback is not None:
+        progress_callback(
+            index=total,
+            total=total,
+            code="",
+            label="",
+            stage="local_refinement",
+        )
 
     refined_results = [
         apply_component_refinement(source, item)
@@ -4238,7 +4297,7 @@ Bounding-box rules:
                 "model": configured_model,
                 "primary_error": primary_message[:800],
                 "fallback_error": fallback_message[:800],
-                "analysis_version": "vehicle-segmentation-v16.3-component-refinement",
+                "analysis_version": "vehicle-segmentation-v16.3.1-progress-timeout",
             },
         ) from fallback_exc
 
@@ -4370,12 +4429,40 @@ def run_async_vehicle_analysis(job_id: str) -> None:
             job_id,
             progress_stage="segmenting_components_with_prompted_sam2",
             progress_percent=40,
+            current_component_index=0,
+            current_component_total=len(raw_components),
+            current_component_code=None,
+            current_component_label=None,
         )
+
+        def update_component_progress(
+            index: int,
+            total: int,
+            code: str,
+            label: str,
+            stage: str,
+        ) -> None:
+            if stage == "local_refinement":
+                percent = 88
+            else:
+                percent = 40 + round((index / max(1, total)) * 45)
+
+            set_analysis_job(
+                job_id,
+                progress_stage=stage,
+                progress_percent=min(88, percent),
+                current_component_index=index,
+                current_component_total=total,
+                current_component_code=code or None,
+                current_component_label=label or None,
+            )
+
         prompted_components, prompted_failures = (
             prompted_segment_components(
                 image_data_url,
                 source,
                 raw_components,
+                progress_callback=update_component_progress,
             )
         )
 
@@ -4419,12 +4506,13 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                 "gpt-4.1-mini",
             ),
             "analysis_version": (
-                "vehicle-segmentation-v16.3-component-refinement"
+                "vehicle-segmentation-v16.3.1-progress-timeout"
             ),
             "mask_format": "data:image/png;base64",
             "mask_semantics": "white_component_black_background",
             "segmentation_provider": "replicate/meta-sam-2-video",
             "segmentation_strategy": "prompted_sam2_plus_local_multi_candidate_refinement",
+            "component_timeout_seconds": PROMPTED_SAM_COMPONENT_TIMEOUT_SECONDS,
         }
 
         set_analysis_job(
@@ -4466,7 +4554,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     "error_type": type(exc).__name__,
                     "error": str(exc)[:1600],
                     "analysis_version": (
-                        "vehicle-segmentation-v16.3-component-refinement"
+                        "vehicle-segmentation-v16.3.1-progress-timeout"
                     ),
                 },
             },
@@ -4508,7 +4596,7 @@ def start_vehicle_component_analysis(
             "result": None,
             "error": None,
             "analysis_version": (
-                "vehicle-segmentation-v16.3-component-refinement"
+                "vehicle-segmentation-v16.3.1-progress-timeout"
             ),
         }
 
@@ -4526,7 +4614,7 @@ def start_vehicle_component_analysis(
             f"/v1/vehicle/analyze-components/status/{job_id}"
         ),
         "analysis_version": (
-            "vehicle-segmentation-v16.3-component-refinement"
+            "vehicle-segmentation-v16.3.1-progress-timeout"
         ),
     }
 
@@ -4671,7 +4759,7 @@ def refine_vehicle_component(payload: ComponentRefineRequest):
         "requires_review": diagnostics.get("refinement_status") != "refined",
         "refinement": diagnostics,
         "analysis_version": (
-            "vehicle-segmentation-v16.3-component-refinement"
+            "vehicle-segmentation-v16.3.1-progress-timeout"
         ),
     }
 
@@ -4695,7 +4783,7 @@ def analyze_vehicle_components_sync_disabled(
                 "/v1/vehicle/analyze-components/status/{job_id}"
             ),
             "analysis_version": (
-                "vehicle-segmentation-v16.3-component-refinement"
+                "vehicle-segmentation-v16.3.1-progress-timeout"
             ),
         },
     )
@@ -4767,7 +4855,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v16.3-component-refinement",
+        "prompt_version": "damage-v16.3.1-progress-timeout",
     }
 
 
@@ -5051,7 +5139,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v16.3-component-refinement",
+        "prompt_version": "damage-v16.3.1-progress-timeout",
         "deformation_type": payload.deformation_type,
         "impact_direction": payload.impact_direction,
         "contact_traces_enabled": payload.contact_traces_enabled,
