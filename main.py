@@ -11,6 +11,7 @@ import urllib.request
 import threading
 import uuid
 from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import uuid
 from pathlib import Path
 from typing import Literal
@@ -48,7 +49,7 @@ ALLOWED_ORIGINS = [
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.6.1.7",
+    version="1.6.2",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -456,6 +457,28 @@ REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN", "").strip()
 REPLICATE_SAM2_VERSION = os.getenv(
     "REPLICATE_SAM2_VERSION",
     "fe97b453a6455861e3bac769b441ca1f1086110da7466dbb65cf1eecfd60dc83",
+)
+
+
+REPLICATE_PROMPTED_SAM2_VERSION = os.getenv(
+    "REPLICATE_PROMPTED_SAM2_VERSION",
+    "33432afdfc06a10da6b4018932893d39b0159f838b6d11dd1236dff85cc5ec1d",
+)
+PROMPTED_SAM_MAX_WORKERS = max(
+    1,
+    min(4, int(os.getenv("PROMPTED_SAM_MAX_WORKERS", "3"))),
+)
+PROMPTED_SAM_BOX_INSET_RATIO = max(
+    0.05,
+    min(0.35, float(os.getenv("PROMPTED_SAM_BOX_INSET_RATIO", "0.18"))),
+)
+PROMPTED_SAM_NEGATIVE_MARGIN_RATIO = max(
+    0.02,
+    min(0.30, float(os.getenv("PROMPTED_SAM_NEGATIVE_MARGIN_RATIO", "0.10"))),
+)
+PROMPTED_SAM_COMPONENT_LIMIT = max(
+    1,
+    min(20, int(os.getenv("PROMPTED_SAM_COMPONENT_LIMIT", "12"))),
 )
 REPLICATE_POLL_SECONDS = max(
     0.5,
@@ -2232,7 +2255,7 @@ def _replicate_json_request(
             status_code=500,
             detail={
                 "message": "REPLICATE_API_TOKEN non configurato su Render.",
-                "analysis_version": "vehicle-segmentation-v16.1.7-fix-openai-bounding-boxes",
+                "analysis_version": "vehicle-segmentation-v16.2-prompted-component-segmentation",
             },
         )
 
@@ -2275,7 +2298,7 @@ def _replicate_json_request(
                 "http_status": exc.code,
                 "request_url": url,
                 "replicate_detail": error_body[:2000],
-                "analysis_version": "vehicle-segmentation-v16.1.7-fix-openai-bounding-boxes",
+                "analysis_version": "vehicle-segmentation-v16.2-prompted-component-segmentation",
             },
         ) from exc
     except Exception as exc:
@@ -2284,7 +2307,7 @@ def _replicate_json_request(
             detail={
                 "message": "Connessione a Replicate non riuscita.",
                 "error": f"{type(exc).__name__}: {str(exc)}"[:1200],
-                "analysis_version": "vehicle-segmentation-v16.1.7-fix-openai-bounding-boxes",
+                "analysis_version": "vehicle-segmentation-v16.2-prompted-component-segmentation",
             },
         ) from exc
 
@@ -3046,10 +3069,382 @@ def extract_json_object(raw_text: str) -> dict:
     return parsed
 
 
+
+def _create_replicate_prediction(
+    version: str,
+    input_payload: dict,
+) -> dict:
+    prediction = _replicate_json_request(
+        "https://api.replicate.com/v1/predictions",
+        method="POST",
+        payload={
+            "version": version,
+            "input": input_payload,
+        },
+    )
+
+    prediction_id = prediction.get("id")
+    if not prediction_id:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": "Replicate non ha restituito un prediction id.",
+                "response": prediction,
+            },
+        )
+
+    deadline = time.monotonic() + REPLICATE_TIMEOUT_SECONDS
+    current = prediction
+
+    while current.get("status") not in {
+        "succeeded",
+        "failed",
+        "canceled",
+    }:
+        if time.monotonic() >= deadline:
+            raise HTTPException(
+                status_code=504,
+                detail={
+                    "message": "Timeout durante la segmentazione guidata SAM 2.",
+                    "prediction_id": prediction_id,
+                },
+            )
+
+        time.sleep(REPLICATE_POLL_SECONDS)
+        current = _replicate_json_request(
+            f"https://api.replicate.com/v1/predictions/{prediction_id}"
+        )
+
+    if current.get("status") != "succeeded":
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": "La segmentazione guidata SAM 2 non è riuscita.",
+                "prediction_id": prediction_id,
+                "status": current.get("status"),
+                "error": current.get("error"),
+                "logs": str(current.get("logs") or "")[-1600:],
+            },
+        )
+
+    return current
+
+
+def prompted_points_for_box(
+    box: dict,
+    image_width: int,
+    image_height: int,
+) -> tuple[str, str, str, str]:
+    x1, y1, x2, y2 = (
+        box["x1"],
+        box["y1"],
+        box["x2"],
+        box["y2"],
+    )
+    width = max(1, x2 - x1)
+    height = max(1, y2 - y1)
+
+    inset_x = width * PROMPTED_SAM_BOX_INSET_RATIO
+    inset_y = height * PROMPTED_SAM_BOX_INSET_RATIO
+
+    positive_points = [
+        ((x1 + x2) / 2.0, (y1 + y2) / 2.0),
+        (x1 + inset_x, y1 + inset_y),
+        (x2 - inset_x, y2 - inset_y),
+    ]
+
+    margin_x = max(4.0, width * PROMPTED_SAM_NEGATIVE_MARGIN_RATIO)
+    margin_y = max(4.0, height * PROMPTED_SAM_NEGATIVE_MARGIN_RATIO)
+
+    negative_points = [
+        (x1 - margin_x, y1 - margin_y),
+        (x2 + margin_x, y1 - margin_y),
+        (x1 - margin_x, y2 + margin_y),
+        (x2 + margin_x, y2 + margin_y),
+    ]
+
+    all_points = positive_points + negative_points
+
+    clipped = [
+        (
+            max(0, min(image_width - 1, round(x))),
+            max(0, min(image_height - 1, round(y))),
+        )
+        for x, y in all_points
+    ]
+
+    coordinates = ",".join(
+        f"[{x},{y}]" for x, y in clipped
+    )
+    labels = ",".join(
+        ["1"] * len(positive_points)
+        + ["0"] * len(negative_points)
+    )
+    frames = ",".join(["0"] * len(clipped))
+    object_ids = ",".join(["component"] * len(clipped))
+
+    return coordinates, labels, frames, object_ids
+
+
+def _extract_prompted_output_url(output) -> str:
+    if isinstance(output, str):
+        return output
+
+    if isinstance(output, list) and output:
+        first = output[0]
+        if isinstance(first, str):
+            return first
+
+    if isinstance(output, dict):
+        for key in (
+            "black_white_masks",
+            "masks",
+            "output",
+            "frames",
+        ):
+            value = output.get(key)
+            if isinstance(value, list) and value:
+                if isinstance(value[0], str):
+                    return value[0]
+
+        for key in (
+            "combined_mask",
+            "mask",
+            "black_white_video",
+        ):
+            value = output.get(key)
+            if isinstance(value, str):
+                return value
+
+    raise HTTPException(
+        status_code=502,
+        detail={
+            "message": "Formato output SAM 2 guidato non riconosciuto.",
+            "output_type": type(output).__name__,
+            "output_preview": repr(output)[:1200],
+        },
+    )
+
+
+def _mask_from_prompted_output(
+    output_url: str,
+    target_size: tuple[int, int],
+    box: dict,
+) -> Image.Image:
+    raw = _download_binary_url(output_url)
+    mask, _ = _decode_sam_mask_image(raw, target_size)
+    binary = mask_to_binary(mask)
+
+    # Keep only the connected component touching the positive center.
+    center_x = max(0, min(target_size[0] - 1, round((box["x1"] + box["x2"]) / 2)))
+    center_y = max(0, min(target_size[1] - 1, round((box["y1"] + box["y2"]) / 2)))
+
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        np.where(binary > 0, 1, 0).astype(np.uint8),
+        connectivity=8,
+    )
+
+    selected = np.zeros_like(binary)
+
+    if count > 1:
+        center_label = int(labels[center_y, center_x])
+
+        if center_label > 0:
+            selected[labels == center_label] = 255
+        else:
+            best_label = 0
+            best_intersection = 0
+
+            for index in range(1, count):
+                component = labels == index
+                intersection = int(
+                    component[
+                        box["y1"]:box["y2"],
+                        box["x1"]:box["x2"],
+                    ].sum()
+                )
+                if intersection > best_intersection:
+                    best_intersection = intersection
+                    best_label = index
+
+            if best_label > 0:
+                selected[labels == best_label] = 255
+    else:
+        selected = binary
+
+    if int((selected > 0).sum()) < 24:
+        selected = binary
+
+    # Hard safety crop around the detection box.
+    margin_x = max(10, round(box["width"] * 0.28))
+    margin_y = max(10, round(box["height"] * 0.28))
+    allowed = np.zeros_like(selected)
+    crop_x1 = max(0, box["x1"] - margin_x)
+    crop_y1 = max(0, box["y1"] - margin_y)
+    crop_x2 = min(target_size[0], box["x2"] + margin_x)
+    crop_y2 = min(target_size[1], box["y2"] + margin_y)
+    allowed[crop_y1:crop_y2, crop_x1:crop_x2] = 255
+    selected = cv2.bitwise_and(selected, allowed)
+
+    return clean_component_mask(
+        Image.fromarray(selected, mode="L")
+    )
+
+
+def run_prompted_sam_for_component(
+    image_data_url: str,
+    source_size: tuple[int, int],
+    component: dict,
+) -> dict:
+    code = str(component.get("code", "")).strip()
+
+    box = component_detection_box(
+        component,
+        source_size[0],
+        source_size[1],
+    )
+    if box is None:
+        return {
+            "code": code,
+            "status": "failed",
+            "error": "invalid_bounding_box",
+        }
+
+    coordinates, labels, frames, object_ids = prompted_points_for_box(
+        box,
+        source_size[0],
+        source_size[1],
+    )
+
+    prediction = _create_replicate_prediction(
+        REPLICATE_PROMPTED_SAM2_VERSION,
+        {
+            "input_video": image_data_url,
+            "click_coordinates": coordinates,
+            "click_labels": labels,
+            "click_frames": frames,
+            "click_object_ids": object_ids,
+            "mask_type": "binary",
+            "annotation_type": "mask",
+            "output_video": False,
+            "output_format": "png",
+            "output_quality": 100,
+            "output_frame_interval": 1,
+        },
+    )
+
+    output_url = _extract_prompted_output_url(
+        prediction.get("output")
+    )
+    mask = _mask_from_prompted_output(
+        output_url,
+        source_size,
+        box,
+    )
+
+    binary = mask_to_binary(mask)
+    area = int((binary > 0).sum())
+
+    if area < 24:
+        return {
+            "code": code,
+            "status": "failed",
+            "error": "empty_prompted_mask",
+            "prediction_id": prediction.get("id"),
+        }
+
+    x, y, width, height = cv2.boundingRect(binary)
+
+    try:
+        confidence = float(component.get("confidence", 0.70))
+    except Exception:
+        confidence = 0.70
+
+    return {
+        "code": code,
+        "status": "succeeded",
+        "component": {
+            "code": code,
+            "label": VEHICLE_COMPONENT_CATALOG.get(code, code),
+            "category": component_category(code),
+            "confidence": round(max(0.0, min(confidence, 1.0)), 2),
+            "mask_base64": mask_image_to_data_url(mask),
+            "bounding_box": {
+                "x": int(x),
+                "y": int(y),
+                "width": int(width),
+                "height": int(height),
+            },
+            "detection_box": box,
+            "mask_source": "replicate_sam2_prompted_points",
+            "sam_prediction_id": prediction.get("id"),
+            "sam_match_quality": "prompted",
+            "requires_review": False,
+            "prompt_coordinates": coordinates,
+        },
+    }
+
+
+def prompted_segment_components(
+    image_data_url: str,
+    source: Image.Image,
+    raw_components: list[dict],
+) -> tuple[list[dict], list[dict]]:
+    valid_components = [
+        component
+        for component in raw_components[:PROMPTED_SAM_COMPONENT_LIMIT]
+        if isinstance(component, dict)
+        and str(component.get("code", "")).strip()
+        in VEHICLE_COMPONENT_CATALOG
+    ]
+
+    results: list[dict] = []
+    failures: list[dict] = []
+
+    with ThreadPoolExecutor(
+        max_workers=PROMPTED_SAM_MAX_WORKERS
+    ) as executor:
+        future_map = {
+            executor.submit(
+                run_prompted_sam_for_component,
+                image_data_url,
+                source.size,
+                component,
+            ): component
+            for component in valid_components
+        }
+
+        for future in as_completed(future_map):
+            component = future_map[future]
+
+            try:
+                item = future.result()
+            except Exception as exc:
+                failures.append({
+                    "code": component.get("code"),
+                    "error_type": type(exc).__name__,
+                    "error": str(exc)[:1000],
+                })
+                continue
+
+            if item.get("status") == "succeeded":
+                results.append(item["component"])
+            else:
+                failures.append(item)
+
+    results.sort(
+        key=lambda item: item.get("confidence", 0.0),
+        reverse=True,
+    )
+
+    return results, failures
+
+
 def normalize_vehicle_analysis(
     raw: dict,
     source: Image.Image,
-    sam_result: dict,
+    prompted_components: list[dict],
+    prompted_failures: list[dict],
 ) -> dict:
     vehicle_view = str(
         raw.get("vehicle_view", raw.get("view", "unknown"))
@@ -3058,36 +3453,12 @@ def normalize_vehicle_analysis(
     if vehicle_view not in VEHICLE_VIEW_LABELS:
         vehicle_view = "unknown"
 
-    raw_components = raw.get(
-        "components",
-        raw.get("visible_components", []),
-    )
-
-    if not isinstance(raw_components, list):
-        raw_components = []
-
-    candidates = load_sam_candidate_masks(
-        sam_result["individual_masks"],
-        source.size,
-    )
-
-    segmented_components = assign_sam_masks_to_components(
-        source,
-        raw_components,
-        candidates,
-    )
-
-    segmented_components.sort(
-        key=lambda item: item["confidence"],
-        reverse=True,
-    )
-
     return {
         "view": vehicle_view,
         "view_label": VEHICLE_VIEW_LABELS[vehicle_view],
         "vehicle_view": vehicle_view,
         "vehicle_view_label": VEHICLE_VIEW_LABELS[vehicle_view],
-        "components": segmented_components,
+        "components": prompted_components,
         "visible_components": [
             {
                 "code": item["code"],
@@ -3098,11 +3469,10 @@ def normalize_vehicle_analysis(
                 "bounding_box": item["bounding_box"],
                 "mask_source": item["mask_source"],
             }
-            for item in segmented_components
+            for item in prompted_components
         ],
-        "sam_prediction_id": sam_result["prediction_id"],
-        "sam_candidate_count": len(candidates),
-        "sam_metrics": sam_result.get("metrics", {}),
+        "prompted_segmentation_failures": prompted_failures,
+        "segmentation_strategy": "per_component_prompted_sam2_points",
     }
 
 
@@ -3246,7 +3616,7 @@ Bounding-box rules:
                 "model": configured_model,
                 "primary_error": primary_message[:800],
                 "fallback_error": fallback_message[:800],
-                "analysis_version": "vehicle-segmentation-v16.1.7-fix-openai-bounding-boxes",
+                "analysis_version": "vehicle-segmentation-v16.2-prompted-component-segmentation",
             },
         ) from fallback_exc
 
@@ -3367,22 +3737,36 @@ def run_async_vehicle_analysis(job_id: str) -> None:
         )
         raw_analysis = call_openai_vehicle_analysis(image_data_url)
 
-        set_analysis_job(
-            job_id,
-            progress_stage="segmenting_with_sam2",
-            progress_percent=45,
+        raw_components = raw_analysis.get(
+            "components",
+            raw_analysis.get("visible_components", []),
         )
-        sam_result = call_replicate_sam2(image_data_url)
+        if not isinstance(raw_components, list):
+            raw_components = []
 
         set_analysis_job(
             job_id,
-            progress_stage="matching_masks",
-            progress_percent=80,
+            progress_stage="segmenting_components_with_prompted_sam2",
+            progress_percent=40,
+        )
+        prompted_components, prompted_failures = (
+            prompted_segment_components(
+                image_data_url,
+                source,
+                raw_components,
+            )
+        )
+
+        set_analysis_job(
+            job_id,
+            progress_stage="building_component_masks",
+            progress_percent=88,
         )
         normalized = normalize_vehicle_analysis(
             raw_analysis,
             source,
-            sam_result,
+            prompted_components,
+            prompted_failures,
         )
 
         if not normalized["components"]:
@@ -3390,39 +3774,18 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                 status_code=422,
                 detail={
                     "message": (
-                        "Non è stato possibile associare maschere SAM 2 "
-                        "attendibili ai componenti rilevati."
+                        "SAM 2 guidato non ha prodotto maschere "
+                        "utilizzabili per i componenti rilevati."
                     ),
-                    "raw_component_count": len(
-                        raw_analysis.get(
-                            "components",
-                            raw_analysis.get("visible_components", []),
-                        )
-                        if isinstance(raw_analysis, dict)
-                        else []
-                    ),
-                    "sam_prediction_id": sam_result.get("prediction_id"),
-                    "sam_candidate_count": len(
-                        sam_result.get("individual_masks", [])
-                    ),
-                    "matching_policy": "relaxed_best_intersection",
-                    "raw_components_preview": (
-                        raw_analysis.get(
-                            "components",
-                            raw_analysis.get("visible_components", []),
-                        )[:5]
-                        if isinstance(raw_analysis, dict)
-                        and isinstance(
-                            raw_analysis.get(
-                                "components",
-                                raw_analysis.get("visible_components", []),
-                            ),
-                            list,
-                        )
-                        else []
+                    "raw_component_count": len(raw_components),
+                    "prompted_failure_count": len(prompted_failures),
+                    "prompted_failures_preview": prompted_failures[:8],
+                    "segmentation_strategy": (
+                        "per_component_prompted_sam2_points"
                     ),
                     "analysis_version": (
-                        "vehicle-segmentation-v16.1.7-fix-openai-bounding-boxes"
+                        "vehicle-segmentation-v16.2-"
+                        "prompted-component-segmentation"
                     ),
                 },
             )
@@ -3434,11 +3797,12 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                 "gpt-4.1-mini",
             ),
             "analysis_version": (
-                "vehicle-segmentation-v16.1.7-fix-openai-bounding-boxes"
+                "vehicle-segmentation-v16.2-prompted-component-segmentation"
             ),
             "mask_format": "data:image/png;base64",
             "mask_semantics": "white_component_black_background",
-            "segmentation_provider": "replicate/meta-sam-2",
+            "segmentation_provider": "replicate/meta-sam-2-video",
+            "segmentation_strategy": "per_component_prompted_points",
         }
 
         set_analysis_job(
@@ -3480,7 +3844,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     "error_type": type(exc).__name__,
                     "error": str(exc)[:1600],
                     "analysis_version": (
-                        "vehicle-segmentation-v16.1.7-fix-openai-bounding-boxes"
+                        "vehicle-segmentation-v16.2-prompted-component-segmentation"
                     ),
                 },
             },
@@ -3522,7 +3886,7 @@ def start_vehicle_component_analysis(
             "result": None,
             "error": None,
             "analysis_version": (
-                "vehicle-segmentation-v16.1.7-fix-openai-bounding-boxes"
+                "vehicle-segmentation-v16.2-prompted-component-segmentation"
             ),
         }
 
@@ -3540,7 +3904,7 @@ def start_vehicle_component_analysis(
             f"/v1/vehicle/analyze-components/status/{job_id}"
         ),
         "analysis_version": (
-            "vehicle-segmentation-v16.1.7-fix-openai-bounding-boxes"
+            "vehicle-segmentation-v16.2-prompted-component-segmentation"
         ),
     }
 
@@ -3619,7 +3983,7 @@ def analyze_vehicle_components_sync_disabled(
                 "/v1/vehicle/analyze-components/status/{job_id}"
             ),
             "analysis_version": (
-                "vehicle-segmentation-v16.1.7-fix-openai-bounding-boxes"
+                "vehicle-segmentation-v16.2-prompted-component-segmentation"
             ),
         },
     )
@@ -3691,7 +4055,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v16.1.7-fix-openai-bounding-boxes",
+        "prompt_version": "damage-v16.2-prompted-component-segmentation",
     }
 
 
@@ -3975,7 +4339,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v16.1.7-fix-openai-bounding-boxes",
+        "prompt_version": "damage-v16.2-prompted-component-segmentation",
         "deformation_type": payload.deformation_type,
         "impact_direction": payload.impact_direction,
         "contact_traces_enabled": payload.contact_traces_enabled,
