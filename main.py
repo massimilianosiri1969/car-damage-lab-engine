@@ -48,7 +48,7 @@ ALLOWED_ORIGINS = [
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.6.1.2",
+    version="1.6.1.3",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -479,11 +479,11 @@ SAM2_STABILITY_SCORE_THRESH = max(
 )
 SAM2_MIN_BOX_COVERAGE = max(
     0.05,
-    min(0.95, float(os.getenv("SAM2_MIN_BOX_COVERAGE", "0.18"))),
+    min(0.95, float(os.getenv("SAM2_MIN_BOX_COVERAGE", "0.06"))),
 )
 SAM2_MAX_OUTSIDE_RATIO = max(
     0.05,
-    min(0.95, float(os.getenv("SAM2_MAX_OUTSIDE_RATIO", "0.70"))),
+    min(0.98, float(os.getenv("SAM2_MAX_OUTSIDE_RATIO", "0.90"))),
 )
 
 
@@ -2197,7 +2197,7 @@ def _replicate_json_request(
             status_code=500,
             detail={
                 "message": "REPLICATE_API_TOKEN non configurato su Render.",
-                "analysis_version": "vehicle-segmentation-v16.1.2-async-analysis",
+                "analysis_version": "vehicle-segmentation-v16.1.3-sam-matching-relaxed",
             },
         )
 
@@ -2240,7 +2240,7 @@ def _replicate_json_request(
                 "http_status": exc.code,
                 "request_url": url,
                 "replicate_detail": error_body[:2000],
-                "analysis_version": "vehicle-segmentation-v16.1.2-async-analysis",
+                "analysis_version": "vehicle-segmentation-v16.1.3-sam-matching-relaxed",
             },
         ) from exc
     except Exception as exc:
@@ -2249,7 +2249,7 @@ def _replicate_json_request(
             detail={
                 "message": "Connessione a Replicate non riuscita.",
                 "error": f"{type(exc).__name__}: {str(exc)}"[:1200],
-                "analysis_version": "vehicle-segmentation-v16.1.2-async-analysis",
+                "analysis_version": "vehicle-segmentation-v16.1.3-sam-matching-relaxed",
             },
         ) from exc
 
@@ -2469,11 +2469,36 @@ def score_mask_for_box(
     mask_inside_ratio = intersection / mask_area
     outside_ratio = 1.0 - mask_inside_ratio
 
-    # Favorisce maschere che riempiono il box senza espandersi troppo fuori.
+    ys, xs = np.where(candidate_binary > 0)
+    if len(xs) > 0:
+        cx = float(xs.mean())
+        cy = float(ys.mean())
+    else:
+        cx = cy = 0.0
+
+    box_cx = (x1 + x2) / 2.0
+    box_cy = (y1 + y2) / 2.0
+    box_diag = max(
+        1.0,
+        ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5,
+    )
+    center_distance = (
+        ((cx - box_cx) ** 2 + (cy - box_cy) ** 2) ** 0.5
+    ) / box_diag
+    center_score = max(0.0, 1.0 - center_distance)
+
+    candidate_box = cv2.boundingRect(candidate_binary)
+    candidate_box_area = max(1, candidate_box[2] * candidate_box[3])
+    size_ratio = min(box_area, candidate_box_area) / max(
+        box_area,
+        candidate_box_area,
+    )
+
     score = (
-        box_coverage * 0.58
-        + mask_inside_ratio * 0.42
-        - max(0.0, outside_ratio - 0.45) * 0.45
+        box_coverage * 0.42
+        + mask_inside_ratio * 0.24
+        + center_score * 0.22
+        + size_ratio * 0.12
     )
 
     return score, {
@@ -2481,6 +2506,8 @@ def score_mask_for_box(
         "box_coverage": round(box_coverage, 4),
         "mask_inside_ratio": round(mask_inside_ratio, 4),
         "outside_ratio": round(outside_ratio, 4),
+        "center_score": round(center_score, 4),
+        "size_ratio": round(size_ratio, 4),
     }
 
 
@@ -2490,7 +2517,6 @@ def assign_sam_masks_to_components(
     candidates: list[dict],
 ) -> list[dict]:
     assignments: list[dict] = []
-    used_candidate_indexes: set[int] = set()
 
     sorted_components = sorted(
         raw_components,
@@ -2511,44 +2537,73 @@ def assign_sam_masks_to_components(
         if box is None:
             continue
 
-        best = None
+        ranked: list[dict] = []
 
         for candidate in candidates:
-            if candidate["index"] in used_candidate_indexes:
-                continue
-
             score, diagnostics = score_mask_for_box(
                 candidate["binary"],
                 box,
             )
+            ranked.append({
+                "candidate": candidate,
+                "score": score,
+                "diagnostics": diagnostics,
+            })
 
-            if (
-                diagnostics["box_coverage"] < SAM2_MIN_BOX_COVERAGE
-                or diagnostics["outside_ratio"] > SAM2_MAX_OUTSIDE_RATIO
-            ):
-                continue
+        ranked.sort(key=lambda item: item["score"], reverse=True)
 
-            if best is None or score > best["score"]:
-                best = {
-                    "candidate": candidate,
-                    "score": score,
-                    "diagnostics": diagnostics,
-                }
-
-        if best is None:
+        if not ranked:
             continue
 
-        used_candidate_indexes.add(best["candidate"]["index"])
+        best = ranked[0]
+        diagnostics = best["diagnostics"]
+
+        # Accept the best mask when it intersects the component box at all.
+        if diagnostics["intersection_pixels"] <= 0:
+            continue
+
+        candidate_binary = best["candidate"]["binary"].copy()
+
+        # Limit the mask to an expanded detection box, preventing floor/background.
+        margin_x = max(8, round(box["width"] * 0.18))
+        margin_y = max(8, round(box["height"] * 0.18))
+
+        crop_x1 = max(0, box["x1"] - margin_x)
+        crop_y1 = max(0, box["y1"] - margin_y)
+        crop_x2 = min(source.width, box["x2"] + margin_x)
+        crop_y2 = min(source.height, box["y2"] + margin_y)
+
+        allowed = np.zeros_like(candidate_binary)
+        allowed[crop_y1:crop_y2, crop_x1:crop_x2] = 255
+        candidate_binary = cv2.bitwise_and(
+            candidate_binary,
+            allowed,
+        )
+
+        if int((candidate_binary > 0).sum()) < 24:
+            continue
+
         refined_mask = clean_component_mask(
-            best["candidate"]["mask"]
+            Image.fromarray(candidate_binary, mode="L")
         )
         binary = mask_to_binary(refined_mask)
+
+        if int((binary > 0).sum()) < 24:
+            continue
+
         x, y, width, height = cv2.boundingRect(binary)
 
         try:
             confidence = float(component.get("confidence", 0.70))
         except Exception:
             confidence = 0.70
+
+        match_quality = "high"
+        if (
+            diagnostics["box_coverage"] < SAM2_MIN_BOX_COVERAGE
+            or diagnostics["outside_ratio"] > SAM2_MAX_OUTSIDE_RATIO
+        ):
+            match_quality = "review"
 
         assignments.append({
             "code": code,
@@ -2563,13 +2618,16 @@ def assign_sam_masks_to_components(
                 "height": int(height),
             },
             "detection_box": box,
-            "mask_source": "replicate_sam2_automatic_matched_to_openai_box",
+            "mask_source": "replicate_sam2_relaxed_box_match",
             "sam_candidate_index": best["candidate"]["index"],
             "sam_match_score": round(best["score"], 4),
-            "sam_match_diagnostics": best["diagnostics"],
+            "sam_match_quality": match_quality,
+            "requires_review": match_quality == "review",
+            "sam_match_diagnostics": diagnostics,
         })
 
     return assignments
+
 
 
 
@@ -2827,7 +2885,7 @@ Bounding-box rules:
                 "model": configured_model,
                 "primary_error": primary_message[:800],
                 "fallback_error": fallback_message[:800],
-                "analysis_version": "vehicle-segmentation-v16.1.2-async-analysis",
+                "analysis_version": "vehicle-segmentation-v16.1.3-sam-matching-relaxed",
             },
         ) from fallback_exc
 
@@ -2986,8 +3044,9 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     "sam_candidate_count": len(
                         sam_result.get("individual_masks", [])
                     ),
+                    "matching_policy": "relaxed_best_intersection",
                     "analysis_version": (
-                        "vehicle-segmentation-v16.1.2-async-analysis"
+                        "vehicle-segmentation-v16.1.3-sam-matching-relaxed"
                     ),
                 },
             )
@@ -2999,7 +3058,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                 "gpt-4.1-mini",
             ),
             "analysis_version": (
-                "vehicle-segmentation-v16.1.2-async-analysis"
+                "vehicle-segmentation-v16.1.3-sam-matching-relaxed"
             ),
             "mask_format": "data:image/png;base64",
             "mask_semantics": "white_component_black_background",
@@ -3045,7 +3104,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     "error_type": type(exc).__name__,
                     "error": str(exc)[:1600],
                     "analysis_version": (
-                        "vehicle-segmentation-v16.1.2-async-analysis"
+                        "vehicle-segmentation-v16.1.3-sam-matching-relaxed"
                     ),
                 },
             },
@@ -3087,7 +3146,7 @@ def start_vehicle_component_analysis(
             "result": None,
             "error": None,
             "analysis_version": (
-                "vehicle-segmentation-v16.1.2-async-analysis"
+                "vehicle-segmentation-v16.1.3-sam-matching-relaxed"
             ),
         }
 
@@ -3105,7 +3164,7 @@ def start_vehicle_component_analysis(
             f"/v1/vehicle/analyze-components/status/{job_id}"
         ),
         "analysis_version": (
-            "vehicle-segmentation-v16.1.2-async-analysis"
+            "vehicle-segmentation-v16.1.3-sam-matching-relaxed"
         ),
     }
 
@@ -3184,7 +3243,7 @@ def analyze_vehicle_components_sync_disabled(
                 "/v1/vehicle/analyze-components/status/{job_id}"
             ),
             "analysis_version": (
-                "vehicle-segmentation-v16.1.2-async-analysis"
+                "vehicle-segmentation-v16.1.3-sam-matching-relaxed"
             ),
         },
     )
@@ -3256,7 +3315,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v16.1.2-async-analysis",
+        "prompt_version": "damage-v16.1.3-sam-matching-relaxed",
     }
 
 
@@ -3540,7 +3599,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v16.1.2-async-analysis",
+        "prompt_version": "damage-v16.1.3-sam-matching-relaxed",
         "deformation_type": payload.deformation_type,
         "impact_direction": payload.impact_direction,
         "contact_traces_enabled": payload.contact_traces_enabled,
