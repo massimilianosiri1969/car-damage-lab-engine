@@ -49,7 +49,7 @@ ALLOWED_ORIGINS = [
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.6.2.2",
+    version="1.6.3",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -131,6 +131,21 @@ class DamageEditBase64Request(BaseModel):
 
 class VehicleAnalyzeRequest(BaseModel):
     image_base64: str = Field(..., min_length=16)
+
+
+class NormalizedPoint(BaseModel):
+    x: float = Field(..., ge=0, le=1000)
+    y: float = Field(..., ge=0, le=1000)
+
+
+class ComponentRefineRequest(BaseModel):
+    image_base64: str = Field(..., min_length=16)
+    component_code: str = Field(..., min_length=1, max_length=80)
+    detection_box: dict
+    current_mask_base64: str | None = None
+    positive_points: list[NormalizedPoint] = Field(default_factory=list)
+    negative_points: list[NormalizedPoint] = Field(default_factory=list)
+    iterations: int = Field(default=4, ge=1, le=8)
 
 
 class DamageFinalizeBase64Request(BaseModel):
@@ -479,6 +494,26 @@ PROMPTED_SAM_NEGATIVE_MARGIN_RATIO = max(
 PROMPTED_SAM_COMPONENT_LIMIT = max(
     1,
     min(20, int(os.getenv("PROMPTED_SAM_COMPONENT_LIMIT", "12"))),
+)
+
+
+COMPONENT_REFINEMENT_MARGIN_RATIO = max(
+    0.08,
+    min(
+        0.45,
+        float(os.getenv("COMPONENT_REFINEMENT_MARGIN_RATIO", "0.22")),
+    ),
+)
+COMPONENT_REFINEMENT_ITERATIONS = max(
+    1,
+    min(8, int(os.getenv("COMPONENT_REFINEMENT_ITERATIONS", "4"))),
+)
+COMPONENT_REFINEMENT_MIN_AREA_RATIO = max(
+    0.00002,
+    min(
+        0.02,
+        float(os.getenv("COMPONENT_REFINEMENT_MIN_AREA_RATIO", "0.00015")),
+    ),
 )
 
 
@@ -2284,7 +2319,7 @@ def _replicate_json_request(
             status_code=500,
             detail={
                 "message": "REPLICATE_API_TOKEN non configurato su Render.",
-                "analysis_version": "vehicle-segmentation-v16.2.2-hybrid-all-components",
+                "analysis_version": "vehicle-segmentation-v16.3-component-refinement",
             },
         )
 
@@ -2327,7 +2362,7 @@ def _replicate_json_request(
                 "http_status": exc.code,
                 "request_url": url,
                 "replicate_detail": error_body[:2000],
-                "analysis_version": "vehicle-segmentation-v16.2.2-hybrid-all-components",
+                "analysis_version": "vehicle-segmentation-v16.3-component-refinement",
             },
         ) from exc
     except Exception as exc:
@@ -2336,7 +2371,7 @@ def _replicate_json_request(
             detail={
                 "message": "Connessione a Replicate non riuscita.",
                 "error": f"{type(exc).__name__}: {str(exc)}"[:1200],
-                "analysis_version": "vehicle-segmentation-v16.2.2-hybrid-all-components",
+                "analysis_version": "vehicle-segmentation-v16.3-component-refinement",
             },
         ) from exc
 
@@ -3228,7 +3263,7 @@ def _create_replicate_prediction(
                 "Limite Replicate ancora attivo dopo diversi tentativi."
             ),
             "analysis_version": (
-                "vehicle-segmentation-v16.2.2-hybrid-all-components"
+                "vehicle-segmentation-v16.3-component-refinement"
             ),
         },
     )
@@ -3489,6 +3524,414 @@ def run_prompted_sam_for_component(
     }
 
 
+
+def decode_mask_data_url(
+    data_url: str,
+    target_size: tuple[int, int],
+) -> Image.Image:
+    header, encoded = data_url.split(",", 1) if "," in data_url else ("", data_url)
+    raw = base64.b64decode(encoded)
+    image = Image.open(io.BytesIO(raw)).convert("L")
+    return resize_mask(image, target_size)
+
+
+def normalize_refinement_points(
+    points: list,
+    width: int,
+    height: int,
+) -> list[tuple[int, int]]:
+    normalized: list[tuple[int, int]] = []
+
+    for point in points:
+        if isinstance(point, BaseModel):
+            raw_x = getattr(point, "x", None)
+            raw_y = getattr(point, "y", None)
+        elif isinstance(point, dict):
+            raw_x = point.get("x")
+            raw_y = point.get("y")
+        elif isinstance(point, (list, tuple)) and len(point) >= 2:
+            raw_x, raw_y = point[0], point[1]
+        else:
+            continue
+
+        try:
+            x = float(raw_x)
+            y = float(raw_y)
+        except Exception:
+            continue
+
+        if max(abs(x), abs(y)) <= 1.5:
+            px = round(x * (width - 1))
+            py = round(y * (height - 1))
+        elif max(abs(x), abs(y)) <= 1100:
+            px = round(x * (width - 1) / 1000.0)
+            py = round(y * (height - 1) / 1000.0)
+        else:
+            px = round(x)
+            py = round(y)
+
+        normalized.append((
+            max(0, min(width - 1, px)),
+            max(0, min(height - 1, py)),
+        ))
+
+    return normalized
+
+
+def _component_crop_box(
+    box: dict,
+    image_width: int,
+    image_height: int,
+) -> tuple[int, int, int, int]:
+    margin_x = max(12, round(box["width"] * COMPONENT_REFINEMENT_MARGIN_RATIO))
+    margin_y = max(12, round(box["height"] * COMPONENT_REFINEMENT_MARGIN_RATIO))
+
+    return (
+        max(0, box["x1"] - margin_x),
+        max(0, box["y1"] - margin_y),
+        min(image_width, box["x2"] + margin_x),
+        min(image_height, box["y2"] + margin_y),
+    )
+
+
+def _select_refined_connected_region(
+    binary: np.ndarray,
+    reference_binary: np.ndarray,
+    box: dict,
+) -> np.ndarray:
+    count, labels, stats, centroids = cv2.connectedComponentsWithStats(
+        np.where(binary > 0, 1, 0).astype(np.uint8),
+        connectivity=8,
+    )
+
+    if count <= 1:
+        return binary
+
+    center_x = (box["x1"] + box["x2"]) / 2.0
+    center_y = (box["y1"] + box["y2"]) / 2.0
+
+    best_label = 0
+    best_score = -1.0
+
+    for index in range(1, count):
+        component = labels == index
+        area = int(stats[index, cv2.CC_STAT_AREA])
+        if area < 12:
+            continue
+
+        overlap = int(
+            np.logical_and(component, reference_binary > 0).sum()
+        )
+        inside_box = int(
+            component[
+                box["y1"]:box["y2"],
+                box["x1"]:box["x2"],
+            ].sum()
+        )
+        centroid_x, centroid_y = centroids[index]
+        distance = (
+            ((centroid_x - center_x) / max(1.0, box["width"])) ** 2
+            + ((centroid_y - center_y) / max(1.0, box["height"])) ** 2
+        ) ** 0.5
+        center_score = max(0.0, 1.0 - distance)
+        score = (
+            overlap * 2.0
+            + inside_box * 1.2
+            + area * 0.05
+            + center_score * max(1, area) * 0.25
+        )
+
+        if score > best_score:
+            best_score = score
+            best_label = index
+
+    selected = np.zeros_like(binary)
+
+    if best_label > 0:
+        selected[labels == best_label] = 255
+    else:
+        selected = binary
+
+    return selected
+
+
+def _score_refinement_candidate(
+    candidate: np.ndarray,
+    initial: np.ndarray,
+    box: dict,
+    edge_map: np.ndarray,
+) -> float:
+    area = int((candidate > 0).sum())
+    if area <= 0:
+        return -1e9
+
+    overlap = int(
+        np.logical_and(candidate > 0, initial > 0).sum()
+    )
+    union = int(
+        np.logical_or(candidate > 0, initial > 0).sum()
+    )
+    iou = overlap / max(1, union)
+
+    box_area = max(1, box["width"] * box["height"])
+    inside = int(
+        (candidate[
+            box["y1"]:box["y2"],
+            box["x1"]:box["x2"],
+        ] > 0).sum()
+    )
+    inside_ratio = inside / max(1, area)
+    plausible_area = min(area / box_area, box_area / max(1, area))
+
+    contour = cv2.morphologyEx(
+        candidate,
+        cv2.MORPH_GRADIENT,
+        np.ones((3, 3), np.uint8),
+    )
+    contour_pixels = contour > 0
+    edge_alignment = (
+        float(edge_map[contour_pixels].mean()) / 255.0
+        if contour_pixels.any()
+        else 0.0
+    )
+
+    return (
+        0.34 * iou
+        + 0.30 * inside_ratio
+        + 0.20 * plausible_area
+        + 0.16 * edge_alignment
+    )
+
+
+def refine_component_mask_local(
+    source: Image.Image,
+    box: dict,
+    initial_mask: Image.Image,
+    positive_points: list[tuple[int, int]] | None = None,
+    negative_points: list[tuple[int, int]] | None = None,
+    iterations: int | None = None,
+) -> tuple[Image.Image, dict]:
+    positive_points = positive_points or []
+    negative_points = negative_points or []
+    iterations = iterations or COMPONENT_REFINEMENT_ITERATIONS
+
+    rgb = np.asarray(source.convert("RGB"), dtype=np.uint8)
+    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    initial = mask_to_binary(
+        resize_mask(initial_mask.convert("L"), source.size)
+    )
+
+    crop_x1, crop_y1, crop_x2, crop_y2 = _component_crop_box(
+        box,
+        source.width,
+        source.height,
+    )
+
+    crop = bgr[crop_y1:crop_y2, crop_x1:crop_x2]
+    initial_crop = initial[crop_y1:crop_y2, crop_x1:crop_x2]
+
+    if crop.size == 0:
+        return initial_mask, {
+            "refinement_status": "skipped_invalid_crop",
+            "candidate_count": 0,
+        }
+
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    gray = cv2.bilateralFilter(gray, 7, 35, 35)
+    edges = cv2.Canny(gray, 45, 135)
+    edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
+
+    candidates: list[np.ndarray] = []
+
+    for erosion_size, dilation_size in ((5, 7), (9, 11), (13, 15)):
+        gc_mask = np.full(
+            initial_crop.shape,
+            cv2.GC_PR_BGD,
+            dtype=np.uint8,
+        )
+
+        # Strong background at crop border.
+        border = max(2, round(min(gc_mask.shape) * 0.02))
+        gc_mask[:border, :] = cv2.GC_BGD
+        gc_mask[-border:, :] = cv2.GC_BGD
+        gc_mask[:, :border] = cv2.GC_BGD
+        gc_mask[:, -border:] = cv2.GC_BGD
+
+        probable_fg = initial_crop > 0
+        gc_mask[probable_fg] = cv2.GC_PR_FGD
+
+        erode_kernel = np.ones((erosion_size, erosion_size), np.uint8)
+        core = cv2.erode(initial_crop, erode_kernel, iterations=1) > 0
+        gc_mask[core] = cv2.GC_FGD
+
+        # Box center is always a positive seed.
+        center_x = round((box["x1"] + box["x2"]) / 2) - crop_x1
+        center_y = round((box["y1"] + box["y2"]) / 2) - crop_y1
+        if 0 <= center_x < gc_mask.shape[1] and 0 <= center_y < gc_mask.shape[0]:
+            cv2.circle(gc_mask, (center_x, center_y), 5, cv2.GC_FGD, -1)
+
+        for x, y in positive_points:
+            local_x, local_y = x - crop_x1, y - crop_y1
+            if 0 <= local_x < gc_mask.shape[1] and 0 <= local_y < gc_mask.shape[0]:
+                cv2.circle(gc_mask, (local_x, local_y), 6, cv2.GC_FGD, -1)
+
+        for x, y in negative_points:
+            local_x, local_y = x - crop_x1, y - crop_y1
+            if 0 <= local_x < gc_mask.shape[1] and 0 <= local_y < gc_mask.shape[0]:
+                cv2.circle(gc_mask, (local_x, local_y), 7, cv2.GC_BGD, -1)
+
+        bg_model = np.zeros((1, 65), np.float64)
+        fg_model = np.zeros((1, 65), np.float64)
+
+        try:
+            cv2.grabCut(
+                crop,
+                gc_mask,
+                None,
+                bg_model,
+                fg_model,
+                iterations,
+                cv2.GC_INIT_WITH_MASK,
+            )
+        except cv2.error:
+            continue
+
+        candidate_crop = np.where(
+            (gc_mask == cv2.GC_FGD)
+            | (gc_mask == cv2.GC_PR_FGD),
+            255,
+            0,
+        ).astype(np.uint8)
+
+        close_kernel = np.ones((dilation_size, dilation_size), np.uint8)
+        candidate_crop = cv2.morphologyEx(
+            candidate_crop,
+            cv2.MORPH_CLOSE,
+            close_kernel,
+        )
+        candidate_crop = cv2.morphologyEx(
+            candidate_crop,
+            cv2.MORPH_OPEN,
+            np.ones((3, 3), np.uint8),
+        )
+
+        full = np.zeros((source.height, source.width), dtype=np.uint8)
+        full[crop_y1:crop_y2, crop_x1:crop_x2] = candidate_crop
+        full = _select_refined_connected_region(full, initial, box)
+        candidates.append(full)
+
+    if not candidates:
+        return initial_mask, {
+            "refinement_status": "fallback_initial_mask",
+            "candidate_count": 0,
+        }
+
+    full_edge_map = np.zeros(
+        (source.height, source.width),
+        dtype=np.uint8,
+    )
+    full_edge_map[crop_y1:crop_y2, crop_x1:crop_x2] = edges
+
+    scored = [
+        (
+            _score_refinement_candidate(
+                candidate,
+                initial,
+                box,
+                full_edge_map,
+            ),
+            candidate,
+        )
+        for candidate in candidates
+    ]
+    scored.sort(key=lambda item: item[0], reverse=True)
+
+    best_score, best = scored[0]
+
+    minimum_area = max(
+        24,
+        round(
+            source.width
+            * source.height
+            * COMPONENT_REFINEMENT_MIN_AREA_RATIO
+        ),
+    )
+
+    if int((best > 0).sum()) < minimum_area:
+        best = initial
+        best_score = 0.0
+        status = "fallback_initial_mask"
+    else:
+        status = "refined"
+
+    refined = clean_component_mask(
+        Image.fromarray(best, mode="L")
+    )
+
+    return refined, {
+        "refinement_status": status,
+        "candidate_count": len(candidates),
+        "selected_candidate_score": round(float(best_score), 4),
+        "positive_point_count": len(positive_points),
+        "negative_point_count": len(negative_points),
+    }
+
+
+def apply_component_refinement(
+    source: Image.Image,
+    component: dict,
+) -> dict:
+    box = component_detection_box(
+        component,
+        source.width,
+        source.height,
+    )
+    if box is None:
+        return component
+
+    try:
+        initial_mask = decode_mask_data_url(
+            component["mask_base64"],
+            source.size,
+        )
+    except Exception:
+        initial_mask = build_box_fallback_mask(source.size, box)
+
+    refined_mask, diagnostics = refine_component_mask_local(
+        source,
+        box,
+        initial_mask,
+    )
+
+    binary = mask_to_binary(refined_mask)
+    if int((binary > 0).sum()) < 24:
+        return component
+
+    x, y, width, height = cv2.boundingRect(binary)
+
+    result = dict(component)
+    result.update({
+        "mask_base64": mask_image_to_data_url(refined_mask),
+        "bounding_box": {
+            "x": int(x),
+            "y": int(y),
+            "width": int(width),
+            "height": int(height),
+        },
+        "pre_refinement_mask_source": component.get("mask_source"),
+        "mask_source": (
+            "opencv_component_refinement_after_"
+            + str(component.get("mask_source", "unknown"))
+        ),
+        "refinement": diagnostics,
+        "requires_review": (
+            diagnostics.get("refinement_status") != "refined"
+            or component.get("requires_review", False)
+        ),
+    })
+    return result
+
+
 def _fallback_component_from_detection(
     source: Image.Image,
     component: dict,
@@ -3585,14 +4028,19 @@ def prompted_segment_components(
         if fallback is not None:
             results.append(fallback)
 
-    results.sort(
+    refined_results = [
+        apply_component_refinement(source, item)
+        for item in results
+    ]
+
+    refined_results.sort(
         key=lambda item: (
             bool(item.get("requires_review", False)),
             -float(item.get("confidence", 0.0)),
         )
     )
 
-    return results, failures
+    return refined_results, failures
 
 
 
@@ -3639,8 +4087,13 @@ def normalize_vehicle_analysis(
             for item in prompted_components
             if item.get("requires_review") is True
         ),
+        "refined_component_count": sum(
+            1
+            for item in prompted_components
+            if item.get("refinement", {}).get("refinement_status") == "refined"
+        ),
         "segmentation_strategy": (
-            "hybrid_prompted_sam2_with_openai_box_fallback"
+            "prompted_sam2_plus_local_multi_candidate_refinement"
         ),
     }
 
@@ -3785,7 +4238,7 @@ Bounding-box rules:
                 "model": configured_model,
                 "primary_error": primary_message[:800],
                 "fallback_error": fallback_message[:800],
-                "analysis_version": "vehicle-segmentation-v16.2.2-hybrid-all-components",
+                "analysis_version": "vehicle-segmentation-v16.3-component-refinement",
             },
         ) from fallback_exc
 
@@ -3966,12 +4419,12 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                 "gpt-4.1-mini",
             ),
             "analysis_version": (
-                "vehicle-segmentation-v16.2.2-hybrid-all-components"
+                "vehicle-segmentation-v16.3-component-refinement"
             ),
             "mask_format": "data:image/png;base64",
             "mask_semantics": "white_component_black_background",
             "segmentation_provider": "replicate/meta-sam-2-video",
-            "segmentation_strategy": "hybrid_prompted_sam2_with_openai_box_fallback",
+            "segmentation_strategy": "prompted_sam2_plus_local_multi_candidate_refinement",
         }
 
         set_analysis_job(
@@ -4013,7 +4466,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     "error_type": type(exc).__name__,
                     "error": str(exc)[:1600],
                     "analysis_version": (
-                        "vehicle-segmentation-v16.2.2-hybrid-all-components"
+                        "vehicle-segmentation-v16.3-component-refinement"
                     ),
                 },
             },
@@ -4055,7 +4508,7 @@ def start_vehicle_component_analysis(
             "result": None,
             "error": None,
             "analysis_version": (
-                "vehicle-segmentation-v16.2.2-hybrid-all-components"
+                "vehicle-segmentation-v16.3-component-refinement"
             ),
         }
 
@@ -4073,7 +4526,7 @@ def start_vehicle_component_analysis(
             f"/v1/vehicle/analyze-components/status/{job_id}"
         ),
         "analysis_version": (
-            "vehicle-segmentation-v16.2.2-hybrid-all-components"
+            "vehicle-segmentation-v16.3-component-refinement"
         ),
     }
 
@@ -4133,6 +4586,96 @@ def delete_vehicle_component_analysis_job(job_id: str):
     }
 
 
+
+@app.post("/v1/vehicle/refine-component")
+def refine_vehicle_component(payload: ComponentRefineRequest):
+    source = decode_data_url_image(
+        payload.image_base64,
+        "image_base64",
+    ).convert("RGB")
+
+    box = normalize_box(
+        payload.detection_box,
+        source.width,
+        source.height,
+    )
+    if box is None:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "Bounding box del componente non valido.",
+                "component_code": payload.component_code,
+            },
+        )
+
+    if payload.current_mask_base64:
+        try:
+            initial_mask = decode_mask_data_url(
+                payload.current_mask_base64,
+                source.size,
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "message": "Maschera corrente non valida.",
+                    "error": str(exc)[:500],
+                },
+            ) from exc
+    else:
+        initial_mask = build_box_fallback_mask(source.size, box)
+
+    positive_points = normalize_refinement_points(
+        payload.positive_points,
+        source.width,
+        source.height,
+    )
+    negative_points = normalize_refinement_points(
+        payload.negative_points,
+        source.width,
+        source.height,
+    )
+
+    refined_mask, diagnostics = refine_component_mask_local(
+        source,
+        box,
+        initial_mask,
+        positive_points=positive_points,
+        negative_points=negative_points,
+        iterations=payload.iterations,
+    )
+
+    binary = mask_to_binary(refined_mask)
+    if int((binary > 0).sum()) < 24:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "La correzione non ha prodotto una maschera valida.",
+                "component_code": payload.component_code,
+                "refinement": diagnostics,
+            },
+        )
+
+    x, y, width, height = cv2.boundingRect(binary)
+
+    return {
+        "component_code": payload.component_code,
+        "mask_base64": mask_image_to_data_url(refined_mask),
+        "bounding_box": {
+            "x": int(x),
+            "y": int(y),
+            "width": int(width),
+            "height": int(height),
+        },
+        "mask_source": "opencv_interactive_component_refinement",
+        "requires_review": diagnostics.get("refinement_status") != "refined",
+        "refinement": diagnostics,
+        "analysis_version": (
+            "vehicle-segmentation-v16.3-component-refinement"
+        ),
+    }
+
+
 @app.post("/v1/vehicle/analyze-components")
 def analyze_vehicle_components_sync_disabled(
     payload: VehicleAnalyzeRequest,
@@ -4141,7 +4684,7 @@ def analyze_vehicle_components_sync_disabled(
         status_code=409,
         detail={
             "message": (
-                "La V16.1.2 usa l'analisi asincrona per evitare timeout. "
+                "La V16.3 usa l'analisi asincrona per evitare timeout. "
                 "Usare POST /v1/vehicle/analyze-components/start e poi "
                 "GET /v1/vehicle/analyze-components/status/{job_id}."
             ),
@@ -4152,7 +4695,7 @@ def analyze_vehicle_components_sync_disabled(
                 "/v1/vehicle/analyze-components/status/{job_id}"
             ),
             "analysis_version": (
-                "vehicle-segmentation-v16.2.2-hybrid-all-components"
+                "vehicle-segmentation-v16.3-component-refinement"
             ),
         },
     )
@@ -4224,7 +4767,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v16.2.2-hybrid-all-components",
+        "prompt_version": "damage-v16.3-component-refinement",
     }
 
 
@@ -4508,7 +5051,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v16.2.2-hybrid-all-components",
+        "prompt_version": "damage-v16.3-component-refinement",
         "deformation_type": payload.deformation_type,
         "impact_direction": payload.impact_direction,
         "contact_traces_enabled": payload.contact_traces_enabled,
