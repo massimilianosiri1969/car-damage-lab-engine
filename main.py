@@ -1,4 +1,5 @@
 import base64
+import gc
 import io
 import json
 import os
@@ -21,9 +22,27 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from openai import OpenAI
 from PIL import Image, ImageEnhance, ImageFile, ImageFilter
+
+try:
+    from pillow_heif import register_heif_opener
+
+    register_heif_opener()
+    HEIC_SUPPORT_ENABLED = True
+except Exception:
+    HEIC_SUPPORT_ENABLED = False
 from pydantic import BaseModel, Field
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+MAX_PROCESSING_SIDE = max(
+    768,
+    min(1600, int(os.getenv("MAX_PROCESSING_SIDE", "1280"))),
+)
+MAX_INPUT_PIXELS = max(
+    4_000_000,
+    int(os.getenv("MAX_INPUT_PIXELS", "30000000")),
+)
+Image.MAX_IMAGE_PIXELS = MAX_INPUT_PIXELS
 
 APP_NAME = "Car Damage Lab API"
 OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "outputs"))
@@ -47,7 +66,7 @@ ALLOWED_ORIGINS = [
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.7.0.11",
+    version="1.7.0.12",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -1566,6 +1585,121 @@ def _open_image_bytes(raw: bytes, mode: str) -> Image.Image | None:
     return None
 
 
+
+def _looks_like_heic(raw: bytes) -> bool:
+    """
+    Riconosce i principali brand HEIC/HEIF/AVIF nel box ISO-BMFF.
+    """
+    if len(raw) < 16:
+        return False
+
+    head = raw[:64]
+    return (
+        b"ftypheic" in head
+        or b"ftypheix" in head
+        or b"ftyphevc" in head
+        or b"ftyphevx" in head
+        or b"ftypmif1" in head
+        or b"ftypmsf1" in head
+        or b"ftypavif" in head
+    )
+
+
+def resize_in_place_for_memory(
+    image: Image.Image,
+    max_side: int = MAX_PROCESSING_SIDE,
+) -> tuple[Image.Image, tuple[int, int], float]:
+    """
+    Riduce immediatamente l'immagine per limitare la RAM.
+
+    Usa thumbnail in-place per evitare di mantenere contemporaneamente
+    due copie complete dell'immagine.
+    """
+    original_size = image.size
+    width, height = original_size
+    longest = max(width, height)
+
+    if longest <= max_side:
+        return image, original_size, 1.0
+
+    scale = max_side / float(longest)
+    image.thumbnail(
+        (
+            max(1, round(width * scale)),
+            max(1, round(height * scale)),
+        ),
+        Image.Resampling.LANCZOS,
+    )
+    return image, original_size, scale
+
+
+def resize_mask_to_processing_size(
+    mask: Image.Image,
+    target_size: tuple[int, int],
+) -> Image.Image:
+    if mask.size == target_size:
+        return mask.convert("L")
+
+    resized = mask.convert("L").resize(
+        target_size,
+        Image.Resampling.NEAREST,
+    )
+    try:
+        mask.close()
+    except Exception:
+        pass
+    return resized
+
+
+def lightweight_full_frame_validation(
+    source: Image.Image,
+    candidate_bytes: bytes,
+) -> tuple[bytes, dict[str, object]]:
+    """
+    Validazione leggera per il fallback senza maschera.
+    Evita array NumPy multipli e compositing.
+    """
+    try:
+        candidate = Image.open(io.BytesIO(candidate_bytes))
+        candidate.load()
+        candidate = candidate.convert("RGB")
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Il motore non ha restituito un'immagine valida.",
+        ) from exc
+
+    if candidate.size != source.size:
+        candidate = candidate.resize(
+            source.size,
+            Image.Resampling.LANCZOS,
+        )
+
+    output = io.BytesIO()
+    candidate.save(
+        output,
+        format="JPEG",
+        quality=94,
+        subsampling=0,
+        optimize=False,
+    )
+
+    diagnostics = {
+        "result_is_full_frame": True,
+        "result_size": list(candidate.size),
+        "direct_model_output_used": True,
+        "post_composite_applied": False,
+        "lightweight_validation": True,
+    }
+
+    try:
+        candidate.close()
+    except Exception:
+        pass
+
+    return output.getvalue(), diagnostics
+
+
 def _looks_like_hex_image(value: str) -> bool:
     cleaned = "".join(value.strip().lower().split())
     return (
@@ -1633,6 +1767,18 @@ def decode_base64_image(value: str, label: str, mode: str) -> Image.Image:
     image = _open_image_bytes(raw, mode)
     if image is not None:
         return image
+
+    if _looks_like_heic(raw) and not HEIC_SUPPORT_ENABLED:
+        raise HTTPException(
+            status_code=415,
+            detail={
+                "message": (
+                    "Immagine HEIC/HEIF riconosciuta, ma il supporto HEIC "
+                    "non è installato sul server."
+                ),
+                "required_dependency": "pillow-heif",
+            },
+        )
 
     try:
         nested_text = raw.decode("utf-8").strip().strip('"').strip("'")
@@ -2928,6 +3074,16 @@ def call_openai_image_edit(
                 "request_id": request_id,
             },
         ) from exc
+    finally:
+        try:
+            source_file.close()
+        except Exception:
+            pass
+        try:
+            mask_file.close()
+        except Exception:
+            pass
+        gc.collect()
 
 
 @app.get("/")
@@ -2951,6 +3107,9 @@ def health():
             else "ai"
         ),
         "model": os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-2"),
+        "memory_optimized": True,
+        "max_processing_side": MAX_PROCESSING_SIDE,
+        "heic_support_enabled": HEIC_SUPPORT_ENABLED,
     }
 
 
@@ -3104,7 +3263,7 @@ def _replicate_json_request(
             status_code=500,
             detail={
                 "message": "REPLICATE_API_TOKEN non configurato su Render.",
-                "analysis_version": "vehicle-segmentation-v17.0.11-balanced-continuity",
+                "analysis_version": "vehicle-segmentation-v17.0.12-memory-heic",
             },
         )
 
@@ -3147,7 +3306,7 @@ def _replicate_json_request(
                 "http_status": exc.code,
                 "request_url": url,
                 "replicate_detail": error_body[:2000],
-                "analysis_version": "vehicle-segmentation-v17.0.11-balanced-continuity",
+                "analysis_version": "vehicle-segmentation-v17.0.12-memory-heic",
             },
         ) from exc
     except Exception as exc:
@@ -3156,7 +3315,7 @@ def _replicate_json_request(
             detail={
                 "message": "Connessione a Replicate non riuscita.",
                 "error": f"{type(exc).__name__}: {str(exc)}"[:1200],
-                "analysis_version": "vehicle-segmentation-v17.0.11-balanced-continuity",
+                "analysis_version": "vehicle-segmentation-v17.0.12-memory-heic",
             },
         ) from exc
 
@@ -4051,7 +4210,7 @@ def _create_replicate_prediction(
                 "Limite Replicate ancora attivo dopo diversi tentativi."
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.11-balanced-continuity"
+                "vehicle-segmentation-v17.0.12-memory-heic"
             ),
         },
     )
@@ -5103,7 +5262,7 @@ def smart_polygon_component_payload(
         "smooth_polygon": smooth_polygon,
         "feather_radius": feather_radius,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.11-balanced-continuity"
+            "vehicle-segmentation-v17.0.12-memory-heic"
         ),
     }
 
@@ -5427,7 +5586,7 @@ def normalize_vehicle_analysis(
         "manual_polygon_required_only_for_selected_components": True,
         "segmentation_strategy": "manual_smart_polygon",
         "analysis_version": (
-            "vehicle-segmentation-v17.0.11-balanced-continuity"
+            "vehicle-segmentation-v17.0.12-memory-heic"
         ),
     }
 
@@ -5572,7 +5731,7 @@ Bounding-box rules:
                 "model": configured_model,
                 "primary_error": primary_message[:800],
                 "fallback_error": fallback_message[:800],
-                "analysis_version": "vehicle-segmentation-v17.0.11-balanced-continuity",
+                "analysis_version": "vehicle-segmentation-v17.0.12-memory-heic",
             },
         ) from fallback_exc
 
@@ -5727,7 +5886,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     ),
                     "raw_component_count": len(raw_components),
                     "analysis_version": (
-                        "vehicle-segmentation-v17.0.11-balanced-continuity"
+                        "vehicle-segmentation-v17.0.12-memory-heic"
                     ),
                 },
             )
@@ -5740,7 +5899,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                 "gpt-4.1-mini",
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.11-balanced-continuity"
+                "vehicle-segmentation-v17.0.12-memory-heic"
             ),
             "mask_format": "data:image/png;base64",
             "mask_semantics": "white_component_black_background",
@@ -5788,7 +5947,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     "error_type": type(exc).__name__,
                     "error": str(exc)[:1600],
                     "analysis_version": (
-                        "vehicle-segmentation-v17.0.11-balanced-continuity"
+                        "vehicle-segmentation-v17.0.12-memory-heic"
                     ),
                 },
             },
@@ -5830,7 +5989,7 @@ def start_vehicle_component_analysis(
             "result": None,
             "error": None,
             "analysis_version": (
-                "vehicle-segmentation-v17.0.11-balanced-continuity"
+                "vehicle-segmentation-v17.0.12-memory-heic"
             ),
         }
 
@@ -5848,7 +6007,7 @@ def start_vehicle_component_analysis(
             f"/v1/vehicle/analyze-components/status/{job_id}"
         ),
         "analysis_version": (
-            "vehicle-segmentation-v17.0.11-balanced-continuity"
+            "vehicle-segmentation-v17.0.12-memory-heic"
         ),
     }
 
@@ -5946,7 +6105,7 @@ def snap_vehicle_polygon_points(
         ),
         "snap_radius": payload.snap_radius,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.11-balanced-continuity"
+            "vehicle-segmentation-v17.0.12-memory-heic"
         ),
     }
 
@@ -6158,7 +6317,7 @@ def refine_vehicle_component(payload: ComponentRefineRequest):
         "requires_review": diagnostics.get("refinement_status") != "refined",
         "refinement": diagnostics,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.11-balanced-continuity"
+            "vehicle-segmentation-v17.0.12-memory-heic"
         ),
     }
 
@@ -6182,7 +6341,7 @@ def analyze_vehicle_components_sync_disabled(
                 "/v1/vehicle/analyze-components/status/{job_id}"
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.11-balanced-continuity"
+                "vehicle-segmentation-v17.0.12-memory-heic"
             ),
         },
     )
@@ -6265,7 +6424,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v17.0.11-balanced-continuity",
+        "prompt_version": "damage-v17.0.12-memory-heic",
         "result_kind": "full_frame_jpeg",
         "full_frame_guard": full_frame_diagnostics,
     }
@@ -6274,7 +6433,7 @@ async def edit_damage(
 @app.post("/v1/damage/edit-base64")
 def edit_damage_base64(payload: DamageEditBase64Request):
     """
-    V17.0.11 Balanced Continuity
+    V17.0.12 Memory Optimized + HEIC
 
     - con maschera manuale: foto completa + perimetro reale + prompt naturale,
       output diretto del modello e validazione anti-cambio-auto;
@@ -6295,6 +6454,14 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         "image_base64",
         "RGB",
     )
+    source, original_source_size, processing_scale = (
+        resize_in_place_for_memory(
+            source,
+            MAX_PROCESSING_SIDE,
+        )
+    )
+    processing_size = source.size
+    gc.collect()
 
     guided_mode = payload.damage_mode in {
         "simple_guided",
@@ -6323,6 +6490,10 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 payload.mask_base64,
                 "mask_base64",
                 "L",
+            )
+            raw_manual_mask = resize_mask_to_processing_size(
+                raw_manual_mask,
+                source.size,
             )
             guided_mask, api_mask, mask_diagnostics = (
                 prepare_hybrid_guided_api_mask(
@@ -6470,12 +6641,11 @@ Final output rules:
             else:
                 # Senza perimetro non possiamo misurare in modo affidabile
                 # le modifiche fuori componente; controlliamo solo il full frame.
-                result_bytes, result_diagnostics = enforce_full_frame_result(
-                    source=source,
-                    candidate_bytes=generated_bytes,
-                    edit_mask=guided_mask,
-                    protect_mask=None,
-                    feather_px=0,
+                result_bytes, result_diagnostics = (
+                    lightweight_full_frame_validation(
+                        source=source,
+                        candidate_bytes=generated_bytes,
+                    )
                 )
                 result_diagnostics.update({
                     "direct_model_output_used": True,
@@ -6496,7 +6666,7 @@ Final output rules:
             ).decode("ascii"),
             "mime_type": "image/jpeg",
             "prompt_version": (
-                "damage-v17.0.11-balanced-continuity"
+                "damage-v17.0.12-memory-heic"
             ),
             "result_kind": "full_frame_jpeg",
             "deformation_type": payload.deformation_type,
@@ -6521,6 +6691,12 @@ Final output rules:
             "mask_edge_margin_px": (
                 mask_diagnostics.get("edge_margin_px")
             ),
+            "memory_optimized": True,
+            "max_processing_side": MAX_PROCESSING_SIDE,
+            "original_source_size": list(original_source_size),
+            "processing_size": list(processing_size),
+            "processing_scale": round(processing_scale, 6),
+            "heic_support_enabled": HEIC_SUPPORT_ENABLED,
         }
 
     # --------------------------------------------------------------
@@ -6799,7 +6975,7 @@ Final output rules:
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v17.0.11-balanced-continuity",
+        "prompt_version": "damage-v17.0.12-memory-heic",
         "result_kind": "full_frame_jpeg",
         "full_frame_guard": full_frame_diagnostics,
         "deformation_type": payload.deformation_type,
