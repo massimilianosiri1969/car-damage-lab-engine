@@ -47,7 +47,7 @@ ALLOWED_ORIGINS = [
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.7.0.9",
+    version="1.7.0.10",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -2365,6 +2365,205 @@ def validate_protected_components_unchanged(
     }
 
 
+
+def build_deformation_quality_prompt(
+    severity_percent: int,
+    area_percent: int,
+    deformation_type: str,
+) -> str:
+    """
+    V17.0.10 - Regole qualitative e meccaniche per evitare deformazioni
+    troppo diffuse, radiali, decorative o artificialmente scolpite.
+    """
+    severity = max(0, min(100, abs(int(severity_percent))))
+    area = max(0, min(100, abs(int(area_percent))))
+
+    if area <= 25:
+        spread_rule = (
+            "Keep the deformation tightly localized around the selected "
+            "impact origin. It must weaken very quickly away from that point."
+        )
+    elif area <= 50:
+        spread_rule = (
+            "Allow a limited propagation across the nearby portion of the "
+            "selected panel, but preserve most of the panel geometry."
+        )
+    else:
+        spread_rule = (
+            "A broader deformation is allowed, but it must still have one "
+            "clear mechanical origin and must not form decorative radial folds."
+        )
+
+    if severity <= 30:
+        intensity_rule = (
+            "Use a shallow localized dent with subtle tension lines. "
+            "Do not create a deep buckle."
+        )
+    elif severity <= 65:
+        intensity_rule = (
+            "Use one dominant realistic buckle with one or two restrained "
+            "secondary tension lines."
+        )
+    else:
+        intensity_rule = (
+            "Use a strong localized crush or buckle, but keep the force flow "
+            "mechanically coherent and concentrated near the impact origin."
+        )
+
+    type_rules = {
+        "dent": (
+            "The main effect must be a localized inward dent with restrained "
+            "edge tension and no ornamental ridges."
+        ),
+        "crease": (
+            "Create one principal short crease. Secondary creases must be "
+            "fewer, shorter and visibly weaker."
+        ),
+        "crush": (
+            "Create localized compression and buckling. Do not spread many "
+            "long folds across the full panel."
+        ),
+        "sideswipe": (
+            "Create directional scraping deformation and one dominant force "
+            "path, not a star-shaped or radial pattern."
+        ),
+        "multiple": (
+            "Use a small number of mechanically related deformations that "
+            "share the same collision logic."
+        ),
+    }
+    deformation_rule = type_rules.get(
+        str(deformation_type),
+        type_rules["dent"],
+    )
+
+    return f"""
+PHYSICAL DEFORMATION QUALITY RULES — STRICT
+
+The result must look like real stamped automotive sheet metal after a
+collision, not like a digitally sculpted or artistically folded surface.
+
+{spread_rule}
+{intensity_rule}
+{deformation_rule}
+
+Required physical behaviour:
+- one dominant deformation close to the selected impact point;
+- at most one or two smaller secondary tension lines;
+- localized compression or buckling near the damaged panel edge;
+- rapid reduction of deformation intensity away from the impact origin;
+- mechanically plausible force propagation in the selected direction;
+- preservation of the original geometry where collision force would not
+  realistically reach.
+
+Forbidden deformation patterns:
+- radial or star-shaped folds;
+- several long creases spreading across the panel;
+- decorative, sinusoidal or wave-like ridges;
+- repeated parallel folds;
+- broad soft swelling;
+- inflated, melted or rubber-like metal;
+- smooth sculpted surfaces;
+- excessive propagation toward the centre or rear of the panel;
+- copying the exact deformation shape of an adjacent damaged panel.
+
+The strongest crease or buckle must remain close to the impact origin.
+The central and distant portions of the selected panel must remain as close
+as possible to the original photograph unless the requested area explicitly
+requires otherwise.
+
+Panel gaps must remain mechanically plausible.
+Protected adjacent parts must remain completely unchanged.
+""".strip()
+
+
+def validate_deformation_locality(
+    source: Image.Image,
+    candidate_bytes: bytes,
+    guided_mask: Image.Image,
+    area_percent: int,
+) -> dict[str, object]:
+    """
+    Controllo prudente della diffusione del cambiamento dentro la maschera.
+
+    Non tenta di riconoscere il numero di pieghe. Misura soltanto se una quota
+    eccessiva dell'intero componente è stata modificata rispetto
+    all'estensione richiesta.
+    """
+    source_rgb = source.convert("RGB")
+    width, height = source_rgb.size
+
+    try:
+        candidate = Image.open(io.BytesIO(candidate_bytes))
+        candidate.load()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Il risultato non è un'immagine valida.",
+        ) from exc
+
+    candidate_rgb = candidate.convert("RGB")
+    if candidate_rgb.size != (width, height):
+        candidate_rgb = candidate_rgb.resize(
+            (width, height),
+            Image.Resampling.LANCZOS,
+        )
+
+    source_array = np.asarray(source_rgb, dtype=np.uint8)
+    candidate_array = np.asarray(candidate_rgb, dtype=np.uint8)
+    mask = mask_to_binary(
+        resize_mask(guided_mask.convert("L"), (width, height))
+    ) > 0
+
+    selected_pixels = int(mask.sum())
+    if selected_pixels == 0:
+        return {
+            "deformation_locality_validation_applied": False,
+            "reason": "empty_guided_mask",
+        }
+
+    difference = np.mean(
+        np.abs(
+            candidate_array.astype(np.int16)
+            - source_array.astype(np.int16)
+        ),
+        axis=2,
+    )
+
+    changed_inside = (difference > 14.0) & mask
+    changed_ratio = float(changed_inside.sum()) / float(selected_pixels)
+
+    requested_area = max(0, min(100, abs(int(area_percent)))) / 100.0
+
+    # Tolleranza larga per riflessi e variazioni del modello.
+    allowed_ratio = min(
+        0.92,
+        max(0.28, requested_area + 0.30),
+    )
+
+    if changed_ratio > allowed_ratio:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": (
+                    "La deformazione si è estesa su una porzione troppo ampia "
+                    "del componente rispetto all'estensione richiesta."
+                ),
+                "changed_component_ratio": round(changed_ratio, 4),
+                "allowed_component_ratio": round(allowed_ratio, 4),
+                "requested_area_percent": int(area_percent),
+            },
+        )
+
+    return {
+        "deformation_locality_validation_applied": True,
+        "changed_component_ratio": round(changed_ratio, 4),
+        "allowed_component_ratio": round(allowed_ratio, 4),
+        "requested_area_percent": int(area_percent),
+        "deformation_locality_validation_passed": True,
+    }
+
+
 def prepare_hybrid_guided_api_mask(
     manual_mask: Image.Image,
     target_size: tuple[int, int],
@@ -2798,7 +2997,7 @@ def _replicate_json_request(
             status_code=500,
             detail={
                 "message": "REPLICATE_API_TOKEN non configurato su Render.",
-                "analysis_version": "vehicle-segmentation-v17.0.9-protected-components",
+                "analysis_version": "vehicle-segmentation-v17.0.10-deformation-quality",
             },
         )
 
@@ -2841,7 +3040,7 @@ def _replicate_json_request(
                 "http_status": exc.code,
                 "request_url": url,
                 "replicate_detail": error_body[:2000],
-                "analysis_version": "vehicle-segmentation-v17.0.9-protected-components",
+                "analysis_version": "vehicle-segmentation-v17.0.10-deformation-quality",
             },
         ) from exc
     except Exception as exc:
@@ -2850,7 +3049,7 @@ def _replicate_json_request(
             detail={
                 "message": "Connessione a Replicate non riuscita.",
                 "error": f"{type(exc).__name__}: {str(exc)}"[:1200],
-                "analysis_version": "vehicle-segmentation-v17.0.9-protected-components",
+                "analysis_version": "vehicle-segmentation-v17.0.10-deformation-quality",
             },
         ) from exc
 
@@ -3745,7 +3944,7 @@ def _create_replicate_prediction(
                 "Limite Replicate ancora attivo dopo diversi tentativi."
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.9-protected-components"
+                "vehicle-segmentation-v17.0.10-deformation-quality"
             ),
         },
     )
@@ -4797,7 +4996,7 @@ def smart_polygon_component_payload(
         "smooth_polygon": smooth_polygon,
         "feather_radius": feather_radius,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.9-protected-components"
+            "vehicle-segmentation-v17.0.10-deformation-quality"
         ),
     }
 
@@ -5121,7 +5320,7 @@ def normalize_vehicle_analysis(
         "manual_polygon_required_only_for_selected_components": True,
         "segmentation_strategy": "manual_smart_polygon",
         "analysis_version": (
-            "vehicle-segmentation-v17.0.9-protected-components"
+            "vehicle-segmentation-v17.0.10-deformation-quality"
         ),
     }
 
@@ -5266,7 +5465,7 @@ Bounding-box rules:
                 "model": configured_model,
                 "primary_error": primary_message[:800],
                 "fallback_error": fallback_message[:800],
-                "analysis_version": "vehicle-segmentation-v17.0.9-protected-components",
+                "analysis_version": "vehicle-segmentation-v17.0.10-deformation-quality",
             },
         ) from fallback_exc
 
@@ -5421,7 +5620,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     ),
                     "raw_component_count": len(raw_components),
                     "analysis_version": (
-                        "vehicle-segmentation-v17.0.9-protected-components"
+                        "vehicle-segmentation-v17.0.10-deformation-quality"
                     ),
                 },
             )
@@ -5434,7 +5633,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                 "gpt-4.1-mini",
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.9-protected-components"
+                "vehicle-segmentation-v17.0.10-deformation-quality"
             ),
             "mask_format": "data:image/png;base64",
             "mask_semantics": "white_component_black_background",
@@ -5482,7 +5681,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     "error_type": type(exc).__name__,
                     "error": str(exc)[:1600],
                     "analysis_version": (
-                        "vehicle-segmentation-v17.0.9-protected-components"
+                        "vehicle-segmentation-v17.0.10-deformation-quality"
                     ),
                 },
             },
@@ -5524,7 +5723,7 @@ def start_vehicle_component_analysis(
             "result": None,
             "error": None,
             "analysis_version": (
-                "vehicle-segmentation-v17.0.9-protected-components"
+                "vehicle-segmentation-v17.0.10-deformation-quality"
             ),
         }
 
@@ -5542,7 +5741,7 @@ def start_vehicle_component_analysis(
             f"/v1/vehicle/analyze-components/status/{job_id}"
         ),
         "analysis_version": (
-            "vehicle-segmentation-v17.0.9-protected-components"
+            "vehicle-segmentation-v17.0.10-deformation-quality"
         ),
     }
 
@@ -5640,7 +5839,7 @@ def snap_vehicle_polygon_points(
         ),
         "snap_radius": payload.snap_radius,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.9-protected-components"
+            "vehicle-segmentation-v17.0.10-deformation-quality"
         ),
     }
 
@@ -5852,7 +6051,7 @@ def refine_vehicle_component(payload: ComponentRefineRequest):
         "requires_review": diagnostics.get("refinement_status") != "refined",
         "refinement": diagnostics,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.9-protected-components"
+            "vehicle-segmentation-v17.0.10-deformation-quality"
         ),
     }
 
@@ -5876,7 +6075,7 @@ def analyze_vehicle_components_sync_disabled(
                 "/v1/vehicle/analyze-components/status/{job_id}"
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.9-protected-components"
+                "vehicle-segmentation-v17.0.10-deformation-quality"
             ),
         },
     )
@@ -5959,7 +6158,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v17.0.9-protected-components",
+        "prompt_version": "damage-v17.0.10-deformation-quality",
         "result_kind": "full_frame_jpeg",
         "full_frame_guard": full_frame_diagnostics,
     }
@@ -5968,7 +6167,7 @@ async def edit_damage(
 @app.post("/v1/damage/edit-base64")
 def edit_damage_base64(payload: DamageEditBase64Request):
     """
-    V17.0.8 Hybrid Guided Edit
+    V17.0.10 Deformation Quality
 
     - con maschera manuale: foto completa + perimetro reale + prompt naturale,
       output diretto del modello e validazione anti-cambio-auto;
@@ -6050,6 +6249,12 @@ def edit_damage_base64(payload: DamageEditBase64Request):
             )
         )
 
+        deformation_quality_prompt = build_deformation_quality_prompt(
+            severity_percent=severity_percent,
+            area_percent=area_percent,
+            deformation_type=payload.deformation_type,
+        )
+
         strict_identity_prompt = f"""
 STRICT CONSERVATIVE IMAGE EDIT OF THE PROVIDED ORIGINAL PHOTOGRAPH.
 
@@ -6084,6 +6289,10 @@ Editing rules:
 - return the complete edited original photograph with the same dimensions;
 
 {protected_components_prompt}
+
+{deformation_quality_prompt}
+
+Final output rules:
 - do not return a crop, isolated component, transparent layer, mask or black
   background;
 - the output must look like this exact photograph after a local automotive
@@ -6125,6 +6334,14 @@ Editing rules:
                     )
                 )
 
+                locality_validation = validate_deformation_locality(
+                    source=source,
+                    candidate_bytes=result_bytes,
+                    guided_mask=guided_mask,
+                    area_percent=area_percent,
+                )
+                result_diagnostics.update(locality_validation)
+
                 protected_validation = (
                     validate_protected_components_unchanged(
                         source=source,
@@ -6164,7 +6381,7 @@ Editing rules:
             ).decode("ascii"),
             "mime_type": "image/jpeg",
             "prompt_version": (
-                "damage-v17.0.9-protected-components"
+                "damage-v17.0.10-deformation-quality"
             ),
             "result_kind": "full_frame_jpeg",
             "deformation_type": payload.deformation_type,
@@ -6181,6 +6398,9 @@ Editing rules:
             "strict_vehicle_identity_prompt": True,
             "protected_components": payload.protected_components,
             "protected_components_prompt_applied": True,
+            "deformation_quality_prompt_applied": True,
+            "deformation_quality_profile": "localized_mechanical",
+            "max_secondary_tension_lines_requested": 2,
             "mask_edge_margin_px": (
                 mask_diagnostics.get("edge_margin_px")
             ),
@@ -6462,7 +6682,7 @@ Editing rules:
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v17.0.9-protected-components",
+        "prompt_version": "damage-v17.0.10-deformation-quality",
         "result_kind": "full_frame_jpeg",
         "full_frame_guard": full_frame_diagnostics,
         "deformation_type": payload.deformation_type,
