@@ -47,7 +47,7 @@ ALLOWED_ORIGINS = [
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.7.0.6",
+    version="1.7.0.7",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -65,7 +65,7 @@ app.add_middleware(
 
 class DamageEditBase64Request(BaseModel):
     image_base64: str = Field(..., min_length=16)
-    mask_base64: str = Field(..., min_length=16)
+    mask_base64: str | None = Field(default=None, min_length=16)
     protect_mask_base64: str | None = None
 
     # Maschere evolute, usate soprattutto in modalità mixed:
@@ -80,6 +80,7 @@ class DamageEditBase64Request(BaseModel):
 
     damage_mode: Literal[
         "auto",
+        "simple_guided",
         "bodywork",
         "component_only",
         "mixed",
@@ -124,7 +125,7 @@ class DamageEditBase64Request(BaseModel):
     contact_trace_direction: str | None = None
 
     # Compatibilità temporanea con vecchie versioni Base44.
-    user_instructions: str = Field(default="", max_length=500)
+    user_instructions: str = Field(default="", max_length=4000)
 
 
 class VehicleAnalyzeRequest(BaseModel):
@@ -2378,7 +2379,7 @@ def _replicate_json_request(
             status_code=500,
             detail={
                 "message": "REPLICATE_API_TOKEN non configurato su Render.",
-                "analysis_version": "vehicle-segmentation-v17.0.6-manual-smart-polygon",
+                "analysis_version": "vehicle-segmentation-v17.0.7-simple-guided",
             },
         )
 
@@ -2421,7 +2422,7 @@ def _replicate_json_request(
                 "http_status": exc.code,
                 "request_url": url,
                 "replicate_detail": error_body[:2000],
-                "analysis_version": "vehicle-segmentation-v17.0.6-manual-smart-polygon",
+                "analysis_version": "vehicle-segmentation-v17.0.7-simple-guided",
             },
         ) from exc
     except Exception as exc:
@@ -2430,7 +2431,7 @@ def _replicate_json_request(
             detail={
                 "message": "Connessione a Replicate non riuscita.",
                 "error": f"{type(exc).__name__}: {str(exc)}"[:1200],
-                "analysis_version": "vehicle-segmentation-v17.0.6-manual-smart-polygon",
+                "analysis_version": "vehicle-segmentation-v17.0.7-simple-guided",
             },
         ) from exc
 
@@ -3325,7 +3326,7 @@ def _create_replicate_prediction(
                 "Limite Replicate ancora attivo dopo diversi tentativi."
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.6-manual-smart-polygon"
+                "vehicle-segmentation-v17.0.7-simple-guided"
             ),
         },
     )
@@ -4377,7 +4378,7 @@ def smart_polygon_component_payload(
         "smooth_polygon": smooth_polygon,
         "feather_radius": feather_radius,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.6-manual-smart-polygon"
+            "vehicle-segmentation-v17.0.7-simple-guided"
         ),
     }
 
@@ -4701,7 +4702,7 @@ def normalize_vehicle_analysis(
         "manual_polygon_required_only_for_selected_components": True,
         "segmentation_strategy": "manual_smart_polygon",
         "analysis_version": (
-            "vehicle-segmentation-v17.0.6-manual-smart-polygon"
+            "vehicle-segmentation-v17.0.7-simple-guided"
         ),
     }
 
@@ -4846,7 +4847,7 @@ Bounding-box rules:
                 "model": configured_model,
                 "primary_error": primary_message[:800],
                 "fallback_error": fallback_message[:800],
-                "analysis_version": "vehicle-segmentation-v17.0.6-manual-smart-polygon",
+                "analysis_version": "vehicle-segmentation-v17.0.7-simple-guided",
             },
         ) from fallback_exc
 
@@ -5001,7 +5002,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     ),
                     "raw_component_count": len(raw_components),
                     "analysis_version": (
-                        "vehicle-segmentation-v17.0.6-manual-smart-polygon"
+                        "vehicle-segmentation-v17.0.7-simple-guided"
                     ),
                 },
             )
@@ -5014,7 +5015,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                 "gpt-4.1-mini",
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.6-manual-smart-polygon"
+                "vehicle-segmentation-v17.0.7-simple-guided"
             ),
             "mask_format": "data:image/png;base64",
             "mask_semantics": "white_component_black_background",
@@ -5062,7 +5063,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     "error_type": type(exc).__name__,
                     "error": str(exc)[:1600],
                     "analysis_version": (
-                        "vehicle-segmentation-v17.0.6-manual-smart-polygon"
+                        "vehicle-segmentation-v17.0.7-simple-guided"
                     ),
                 },
             },
@@ -5104,7 +5105,7 @@ def start_vehicle_component_analysis(
             "result": None,
             "error": None,
             "analysis_version": (
-                "vehicle-segmentation-v17.0.6-manual-smart-polygon"
+                "vehicle-segmentation-v17.0.7-simple-guided"
             ),
         }
 
@@ -5122,7 +5123,7 @@ def start_vehicle_component_analysis(
             f"/v1/vehicle/analyze-components/status/{job_id}"
         ),
         "analysis_version": (
-            "vehicle-segmentation-v17.0.6-manual-smart-polygon"
+            "vehicle-segmentation-v17.0.7-simple-guided"
         ),
     }
 
@@ -5220,7 +5221,7 @@ def snap_vehicle_polygon_points(
         ),
         "snap_radius": payload.snap_radius,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.6-manual-smart-polygon"
+            "vehicle-segmentation-v17.0.7-simple-guided"
         ),
     }
 
@@ -5432,7 +5433,7 @@ def refine_vehicle_component(payload: ComponentRefineRequest):
         "requires_review": diagnostics.get("refinement_status") != "refined",
         "refinement": diagnostics,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.6-manual-smart-polygon"
+            "vehicle-segmentation-v17.0.7-simple-guided"
         ),
     }
 
@@ -5456,7 +5457,7 @@ def analyze_vehicle_components_sync_disabled(
                 "/v1/vehicle/analyze-components/status/{job_id}"
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.6-manual-smart-polygon"
+                "vehicle-segmentation-v17.0.7-simple-guided"
             ),
         },
     )
@@ -5539,7 +5540,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v17.0.6-single-composite",
+        "prompt_version": "damage-v17.0.7-simple-guided",
         "result_kind": "full_frame_jpeg",
         "full_frame_guard": full_frame_diagnostics,
     }
@@ -5547,6 +5548,15 @@ async def edit_damage(
 
 @app.post("/v1/damage/edit-base64")
 def edit_damage_base64(payload: DamageEditBase64Request):
+    """
+    V17.0.7
+
+    Due flussi distinti:
+    - simple_guided / auto senza mask_base64:
+      foto completa + prompt naturale, nessun compositing a maschera;
+    - modalità storiche con mask_base64:
+      comportamento V17 precedente.
+    """
     if payload.component_masks_base64 is None:
         payload = copy_request_model(
             payload,
@@ -5561,6 +5571,125 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         "image_base64",
         "RGB",
     )
+
+    simple_guided_mode = (
+        payload.damage_mode == "simple_guided"
+        or (
+            payload.damage_mode == "auto"
+            and not payload.mask_base64
+        )
+    )
+
+    job_id = str(uuid.uuid4())
+
+    if simple_guided_mode:
+        if not payload.user_instructions.strip():
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "La modalità guidata richiede user_instructions "
+                    "con la descrizione completa del danno."
+                ),
+            )
+
+        # Tutta la fotografia è tecnicamente editabile.
+        # Il componente, il punto di impatto, la direzione e le protezioni
+        # vengono descritti nel prompt naturale.
+        full_edit_mask = Image.new(
+            "L",
+            source.size,
+            color=255,
+        )
+        api_mask = alter_damage_area(full_edit_mask, 0)
+
+        simple_prompt = f"""
+Realistic automotive collision-damage photo edit.
+
+Follow the user's instructions precisely:
+{payload.user_instructions.strip()}
+
+Mandatory output rules:
+- return the complete edited photograph with the same framing and dimensions;
+- preserve the same vehicle, paint colour, camera angle, lighting, reflections
+  and workshop background;
+- modify the requested vehicle component in a physically plausible way;
+- make the deformation consistent with nearby existing damage when requested;
+- preserve all components explicitly identified as protected;
+- do not return a crop, isolated component, mask, transparent layer or black
+  background;
+- do not erase body panels or replace them with black or featureless areas;
+- produce a coherent photorealistic result suitable for an automotive
+  repair-estimate simulation.
+""".strip()
+
+        if os.getenv("MOCK_MODE", "false").lower() == "true":
+            output = io.BytesIO()
+            source.save(
+                output,
+                format="JPEG",
+                quality=95,
+                subsampling=0,
+            )
+            result_bytes = output.getvalue()
+        else:
+            generated_bytes = call_openai_image_edit(
+                source,
+                api_mask,
+                simple_prompt,
+                payload.output_quality,
+            )
+
+            # Nessun ritaglio e nessun compositing con maschera:
+            # il motore deve restituire direttamente la fotografia completa.
+            result_bytes, full_frame_diagnostics = enforce_full_frame_result(
+                source=source,
+                candidate_bytes=generated_bytes,
+                edit_mask=full_edit_mask,
+                protect_mask=None,
+                feather_px=0,
+            )
+
+        if os.getenv("MOCK_MODE", "false").lower() == "true":
+            full_frame_diagnostics = {
+                "result_is_full_frame": True,
+                "original_size": list(source.size),
+                "result_size": list(source.size),
+                "full_frame_validator_applied": True,
+                "second_composite_applied": False,
+                "simple_guided_mode": True,
+            }
+
+        return {
+            "job_id": job_id,
+            "status": "completed",
+            "mode": "ai",
+            "severity_percent": severity_percent,
+            "area_percent": area_percent,
+            "result_base64": base64.b64encode(result_bytes).decode("ascii"),
+            "mime_type": "image/jpeg",
+            "prompt_version": "damage-v17.0.7-simple-guided",
+            "result_kind": "full_frame_jpeg",
+            "full_frame_guard": full_frame_diagnostics,
+            "deformation_type": payload.deformation_type,
+            "impact_direction": payload.impact_direction,
+            "damage_mode": "simple_guided",
+            "mask_required": False,
+            "mask_received": False,
+            "composite_strategy": "none_direct_full_frame_edit",
+            "user_instructions_used": True,
+        }
+
+    # --------------------------------------------------------------
+    # Flusso storico con maschera obbligatoria.
+    # --------------------------------------------------------------
+    if not payload.mask_base64:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "mask_base64 è obbligatoria nelle modalità bodywork, "
+                "component_only e mixed."
+            ),
+        )
 
     raw_edit_mask = decode_base64_image(
         payload.mask_base64,
@@ -5584,7 +5713,6 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         source.size,
     )
 
-    job_id = str(uuid.uuid4())
     resolved_damage_mode = infer_damage_mode(payload)
 
     if os.getenv("MOCK_MODE", "false").lower() == "true":
@@ -5613,7 +5741,6 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         result_bytes = buffer.getvalue()
 
     elif resolved_damage_mode != "mixed":
-        # Modalità singola: controllo geometrico reale della superficie.
         effective_mask = apply_area_percent_to_edit_mask(
             source_mask,
             area_percent,
@@ -5650,8 +5777,6 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         )
 
     else:
-        # Modalità mista evoluta: un passaggio per la lamiera e uno per ogni
-        # componente non-lamiera, con maschere indipendenti.
         bodywork_codes = selected_bodywork_component_codes(payload)
         component_codes = selected_non_body_component_codes(payload)
 
@@ -5681,7 +5806,6 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         current_image = source
         sequential_steps: list[str] = []
 
-        # Passaggio 1: sola lamiera.
         if bodywork_codes:
             raw_bodywork_mask = decode_base64_image(
                 payload.bodywork_mask_base64,
@@ -5756,7 +5880,6 @@ def edit_damage_base64(payload: DamageEditBase64Request):
             current_image = jpeg_bytes_to_rgb_image(bodywork_result)
             sequential_steps.append("bodywork")
 
-        # Passaggi successivi: un componente per volta.
         for component_code in component_codes:
             raw_component_mask = decode_base64_image(
                 (payload.component_masks_base64 or {})[component_code],
@@ -5768,11 +5891,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 raw_protect_mask,
                 source.size,
             )
-
-            # La superficie danneggiata riguarda la lamiera: non altera
-            # geometricamente fari, vetri, specchietti, ruote o paraurti.
             api_component_mask = alter_damage_area(component_mask, 0)
-
             component_payload = payload_for_single_component(
                 payload,
                 component_code,
@@ -5836,7 +5955,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v17.0.6-single-composite",
+        "prompt_version": "damage-v17.0.7-simple-guided",
         "result_kind": "full_frame_jpeg",
         "full_frame_guard": full_frame_diagnostics,
         "deformation_type": payload.deformation_type,
