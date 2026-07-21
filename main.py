@@ -47,7 +47,7 @@ ALLOWED_ORIGINS = [
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.7.0.7",
+    version="1.7.0.8",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -81,6 +81,7 @@ class DamageEditBase64Request(BaseModel):
     damage_mode: Literal[
         "auto",
         "simple_guided",
+        "hybrid_guided",
         "bodywork",
         "component_only",
         "mixed",
@@ -2152,6 +2153,213 @@ def enforce_full_frame_result(
 
 
 
+
+def prepare_hybrid_guided_api_mask(
+    manual_mask: Image.Image,
+    target_size: tuple[int, int],
+    edge_margin_px: int = 3,
+) -> tuple[Image.Image, Image.Image, dict[str, object]]:
+    """
+    V17.0.8 - Prepara la maschera corretta dall'utente come guida reale
+    dell'image edit.
+
+    Base44:
+      bianco = componente modificabile
+      nero   = area protetta
+
+    OpenAI:
+      alpha 0   = zona modificabile
+      alpha 255 = zona protetta
+
+    Viene applicato soltanto un margine minimo di pochi pixel per consentire
+    continuità naturale sul bordo del pannello, senza trasformare la maschera
+    in un ritaglio o in un compositing successivo.
+    """
+    resized = resize_mask(manual_mask.convert("L"), target_size)
+    binary = mask_to_binary(resized)
+
+    selected_pixels = int((binary > 0).sum())
+    if selected_pixels == 0:
+        raise HTTPException(
+            status_code=422,
+            detail="La maschera guidata è vuota.",
+        )
+
+    margin = max(0, min(6, int(edge_margin_px)))
+    expanded = binary.copy()
+
+    if margin > 0:
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (margin * 2 + 1, margin * 2 + 1),
+        )
+        expanded = cv2.dilate(binary, kernel, iterations=1)
+
+    guided_mask = Image.fromarray(expanded, mode="L")
+    api_mask = alter_damage_area(guided_mask, 0)
+
+    diagnostics = {
+        "manual_mask_pixels": selected_pixels,
+        "guided_mask_pixels": int((expanded > 0).sum()),
+        "edge_margin_px": margin,
+        "mask_geometry_source": "manual_smart_polygon",
+    }
+    return guided_mask, api_mask, diagnostics
+
+
+def validate_hybrid_guided_result(
+    source: Image.Image,
+    candidate_bytes: bytes,
+    guided_mask: Image.Image,
+) -> tuple[bytes, dict[str, object]]:
+    """
+    V17.0.8 - Verifica che il risultato:
+    - sia un fotogramma completo;
+    - non introduca grandi aree nere;
+    - mantenga quasi invariata la zona esterna alla maschera;
+    - contenga una modifica effettiva dentro la maschera.
+
+    Non applica compositing: valida soltanto l'output diretto del modello.
+    """
+    source_rgb = source.convert("RGB")
+    width, height = source_rgb.size
+
+    try:
+        candidate_raw = Image.open(io.BytesIO(candidate_bytes))
+        candidate_raw.load()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Il risultato ibrido non è un'immagine valida.",
+        ) from exc
+
+    candidate_rgb = candidate_raw.convert("RGB")
+    original_candidate_size = candidate_rgb.size
+
+    if candidate_rgb.size != (width, height):
+        candidate_rgb = candidate_rgb.resize(
+            (width, height),
+            Image.Resampling.LANCZOS,
+        )
+
+    source_array = np.asarray(source_rgb, dtype=np.uint8)
+    candidate_array = np.asarray(candidate_rgb, dtype=np.uint8)
+    mask = mask_to_binary(
+        resize_mask(guided_mask.convert("L"), (width, height))
+    )
+
+    inside = mask > 0
+    outside = ~inside
+
+    diff = np.mean(
+        np.abs(
+            candidate_array.astype(np.int16)
+            - source_array.astype(np.int16)
+        ),
+        axis=2,
+    )
+
+    inside_mean_difference = (
+        float(diff[inside].mean())
+        if int(inside.sum()) > 0
+        else 0.0
+    )
+    outside_mean_difference = (
+        float(diff[outside].mean())
+        if int(outside.sum()) > 0
+        else 0.0
+    )
+
+    outside_changed_ratio = (
+        float((diff[outside] > 18.0).sum()) / float(outside.sum())
+        if int(outside.sum()) > 0
+        else 0.0
+    )
+
+    black_pixels = np.all(candidate_array < 8, axis=2)
+    black_ratio = float(black_pixels.sum()) / float(width * height)
+
+    # Rifiuta output evidentemente corrotti o completamente reinventati.
+    if black_ratio > 0.08:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": "Il motore ha restituito grandi aree nere.",
+                "black_ratio": round(black_ratio, 4),
+            },
+        )
+
+    if outside_mean_difference > 20.0 and outside_changed_ratio > 0.20:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": (
+                    "Il motore ha modificato troppo la fotografia fuori "
+                    "dal componente selezionato."
+                ),
+                "outside_mean_difference": round(
+                    outside_mean_difference,
+                    3,
+                ),
+                "outside_changed_ratio": round(
+                    outside_changed_ratio,
+                    4,
+                ),
+            },
+        )
+
+    if inside_mean_difference < 1.2:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": (
+                    "Il motore non ha prodotto una modifica visibile "
+                    "nel componente selezionato."
+                ),
+                "inside_mean_difference": round(
+                    inside_mean_difference,
+                    3,
+                ),
+            },
+        )
+
+    output = io.BytesIO()
+    candidate_rgb.save(
+        output,
+        format="JPEG",
+        quality=96,
+        subsampling=0,
+        optimize=True,
+    )
+
+    diagnostics = {
+        "result_is_full_frame": True,
+        "original_size": [width, height],
+        "candidate_original_size": [
+            int(original_candidate_size[0]),
+            int(original_candidate_size[1]),
+        ],
+        "result_size": [width, height],
+        "inside_mean_difference": round(
+            inside_mean_difference,
+            3,
+        ),
+        "outside_mean_difference": round(
+            outside_mean_difference,
+            3,
+        ),
+        "outside_changed_ratio": round(
+            outside_changed_ratio,
+            4,
+        ),
+        "black_ratio": round(black_ratio, 4),
+        "direct_model_output_used": True,
+        "post_composite_applied": False,
+        "hybrid_result_validation_passed": True,
+    }
+    return output.getvalue(), diagnostics
+
+
 def call_openai_image_edit(
     source: Image.Image,
     api_mask: Image.Image,
@@ -2379,7 +2587,7 @@ def _replicate_json_request(
             status_code=500,
             detail={
                 "message": "REPLICATE_API_TOKEN non configurato su Render.",
-                "analysis_version": "vehicle-segmentation-v17.0.7-simple-guided",
+                "analysis_version": "vehicle-segmentation-v17.0.8-hybrid-guided-edit",
             },
         )
 
@@ -2422,7 +2630,7 @@ def _replicate_json_request(
                 "http_status": exc.code,
                 "request_url": url,
                 "replicate_detail": error_body[:2000],
-                "analysis_version": "vehicle-segmentation-v17.0.7-simple-guided",
+                "analysis_version": "vehicle-segmentation-v17.0.8-hybrid-guided-edit",
             },
         ) from exc
     except Exception as exc:
@@ -2431,7 +2639,7 @@ def _replicate_json_request(
             detail={
                 "message": "Connessione a Replicate non riuscita.",
                 "error": f"{type(exc).__name__}: {str(exc)}"[:1200],
-                "analysis_version": "vehicle-segmentation-v17.0.7-simple-guided",
+                "analysis_version": "vehicle-segmentation-v17.0.8-hybrid-guided-edit",
             },
         ) from exc
 
@@ -3326,7 +3534,7 @@ def _create_replicate_prediction(
                 "Limite Replicate ancora attivo dopo diversi tentativi."
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.7-simple-guided"
+                "vehicle-segmentation-v17.0.8-hybrid-guided-edit"
             ),
         },
     )
@@ -4378,7 +4586,7 @@ def smart_polygon_component_payload(
         "smooth_polygon": smooth_polygon,
         "feather_radius": feather_radius,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.7-simple-guided"
+            "vehicle-segmentation-v17.0.8-hybrid-guided-edit"
         ),
     }
 
@@ -4702,7 +4910,7 @@ def normalize_vehicle_analysis(
         "manual_polygon_required_only_for_selected_components": True,
         "segmentation_strategy": "manual_smart_polygon",
         "analysis_version": (
-            "vehicle-segmentation-v17.0.7-simple-guided"
+            "vehicle-segmentation-v17.0.8-hybrid-guided-edit"
         ),
     }
 
@@ -4847,7 +5055,7 @@ Bounding-box rules:
                 "model": configured_model,
                 "primary_error": primary_message[:800],
                 "fallback_error": fallback_message[:800],
-                "analysis_version": "vehicle-segmentation-v17.0.7-simple-guided",
+                "analysis_version": "vehicle-segmentation-v17.0.8-hybrid-guided-edit",
             },
         ) from fallback_exc
 
@@ -5002,7 +5210,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     ),
                     "raw_component_count": len(raw_components),
                     "analysis_version": (
-                        "vehicle-segmentation-v17.0.7-simple-guided"
+                        "vehicle-segmentation-v17.0.8-hybrid-guided-edit"
                     ),
                 },
             )
@@ -5015,7 +5223,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                 "gpt-4.1-mini",
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.7-simple-guided"
+                "vehicle-segmentation-v17.0.8-hybrid-guided-edit"
             ),
             "mask_format": "data:image/png;base64",
             "mask_semantics": "white_component_black_background",
@@ -5063,7 +5271,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     "error_type": type(exc).__name__,
                     "error": str(exc)[:1600],
                     "analysis_version": (
-                        "vehicle-segmentation-v17.0.7-simple-guided"
+                        "vehicle-segmentation-v17.0.8-hybrid-guided-edit"
                     ),
                 },
             },
@@ -5105,7 +5313,7 @@ def start_vehicle_component_analysis(
             "result": None,
             "error": None,
             "analysis_version": (
-                "vehicle-segmentation-v17.0.7-simple-guided"
+                "vehicle-segmentation-v17.0.8-hybrid-guided-edit"
             ),
         }
 
@@ -5123,7 +5331,7 @@ def start_vehicle_component_analysis(
             f"/v1/vehicle/analyze-components/status/{job_id}"
         ),
         "analysis_version": (
-            "vehicle-segmentation-v17.0.7-simple-guided"
+            "vehicle-segmentation-v17.0.8-hybrid-guided-edit"
         ),
     }
 
@@ -5221,7 +5429,7 @@ def snap_vehicle_polygon_points(
         ),
         "snap_radius": payload.snap_radius,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.7-simple-guided"
+            "vehicle-segmentation-v17.0.8-hybrid-guided-edit"
         ),
     }
 
@@ -5433,7 +5641,7 @@ def refine_vehicle_component(payload: ComponentRefineRequest):
         "requires_review": diagnostics.get("refinement_status") != "refined",
         "refinement": diagnostics,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.7-simple-guided"
+            "vehicle-segmentation-v17.0.8-hybrid-guided-edit"
         ),
     }
 
@@ -5457,7 +5665,7 @@ def analyze_vehicle_components_sync_disabled(
                 "/v1/vehicle/analyze-components/status/{job_id}"
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.7-simple-guided"
+                "vehicle-segmentation-v17.0.8-hybrid-guided-edit"
             ),
         },
     )
@@ -5540,7 +5748,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v17.0.7-simple-guided",
+        "prompt_version": "damage-v17.0.8-hybrid-guided-edit",
         "result_kind": "full_frame_jpeg",
         "full_frame_guard": full_frame_diagnostics,
     }
@@ -5549,13 +5757,12 @@ async def edit_damage(
 @app.post("/v1/damage/edit-base64")
 def edit_damage_base64(payload: DamageEditBase64Request):
     """
-    V17.0.7
+    V17.0.8 Hybrid Guided Edit
 
-    Due flussi distinti:
-    - simple_guided / auto senza mask_base64:
-      foto completa + prompt naturale, nessun compositing a maschera;
-    - modalità storiche con mask_base64:
-      comportamento V17 precedente.
+    - con maschera manuale: foto completa + perimetro reale + prompt naturale,
+      output diretto del modello e validazione anti-cambio-auto;
+    - senza maschera: fallback guidato full-frame;
+    - modalità storiche: comportamento precedente.
     """
     if payload.component_masks_base64 is None:
         payload = copy_request_model(
@@ -5572,17 +5779,17 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         "RGB",
     )
 
-    simple_guided_mode = (
-        payload.damage_mode == "simple_guided"
-        or (
-            payload.damage_mode == "auto"
-            and not payload.mask_base64
-        )
+    guided_mode = payload.damage_mode in {
+        "simple_guided",
+        "hybrid_guided",
+    } or (
+        payload.damage_mode == "auto"
+        and bool(payload.user_instructions.strip())
     )
 
     job_id = str(uuid.uuid4())
 
-    if simple_guided_mode:
+    if guided_mode:
         if not payload.user_instructions.strip():
             raise HTTPException(
                 status_code=422,
@@ -5592,34 +5799,73 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 ),
             )
 
-        # Tutta la fotografia è tecnicamente editabile.
-        # Il componente, il punto di impatto, la direzione e le protezioni
-        # vengono descritti nel prompt naturale.
-        full_edit_mask = Image.new(
-            "L",
-            source.size,
-            color=255,
-        )
-        api_mask = alter_damage_area(full_edit_mask, 0)
+        has_manual_mask = bool(payload.mask_base64)
 
-        simple_prompt = f"""
-Realistic automotive collision-damage photo edit.
+        if has_manual_mask:
+            raw_manual_mask = decode_base64_image(
+                payload.mask_base64,
+                "mask_base64",
+                "L",
+            )
+            guided_mask, api_mask, mask_diagnostics = (
+                prepare_hybrid_guided_api_mask(
+                    manual_mask=raw_manual_mask,
+                    target_size=source.size,
+                    edge_margin_px=3,
+                )
+            )
+            resolved_guided_mode = "hybrid_guided"
+        else:
+            # Fallback semplice: resta disponibile, ma è meno protetto.
+            guided_mask = Image.new(
+                "L",
+                source.size,
+                color=255,
+            )
+            api_mask = alter_damage_area(guided_mask, 0)
+            mask_diagnostics = {
+                "manual_mask_pixels": 0,
+                "guided_mask_pixels": int(
+                    source.size[0] * source.size[1]
+                ),
+                "edge_margin_px": 0,
+                "mask_geometry_source": "full_frame_fallback",
+            }
+            resolved_guided_mode = "simple_guided"
 
-Follow the user's instructions precisely:
+        strict_identity_prompt = f"""
+STRICT CONSERVATIVE IMAGE EDIT OF THE PROVIDED ORIGINAL PHOTOGRAPH.
+
+This is not a new image generation task.
+
+Keep exactly the same:
+- vehicle identity, make, model and body shape;
+- paint colour and surface finish;
+- headlights, grille, bumper, wheels, tyres, mirrors, glass and doors;
+- workshop environment, floor, lift, surrounding vehicles and background;
+- camera angle, perspective, framing, lighting and reflections.
+
+Never replace the vehicle.
+Never create a different make or model.
+Never redesign unrelated panels.
+Never change the workshop or viewpoint.
+
+User-guided damage instructions:
 {payload.user_instructions.strip()}
 
-Mandatory output rules:
-- return the complete edited photograph with the same framing and dimensions;
-- preserve the same vehicle, paint colour, camera angle, lighting, reflections
-  and workshop background;
-- modify the requested vehicle component in a physically plausible way;
-- make the deformation consistent with nearby existing damage when requested;
-- preserve all components explicitly identified as protected;
-- do not return a crop, isolated component, mask, transparent layer or black
+Editing rules:
+- modify only the requested component of this exact vehicle;
+- begin the deformation near the selected impact point;
+- propagate the metal deformation according to the requested impact direction;
+- make it physically consistent with existing adjacent damage when requested;
+- preserve every explicitly protected component;
+- when a manual perimeter is supplied, use it as the real editable component
+  region and keep the rest of the photograph unchanged;
+- return the complete edited original photograph with the same dimensions;
+- do not return a crop, isolated component, transparent layer, mask or black
   background;
-- do not erase body panels or replace them with black or featureless areas;
-- produce a coherent photorealistic result suitable for an automotive
-  repair-estimate simulation.
+- the output must look like this exact photograph after a local automotive
+  collision deformation.
 """.strip()
 
         if os.getenv("MOCK_MODE", "false").lower() == "true":
@@ -5631,33 +5877,47 @@ Mandatory output rules:
                 subsampling=0,
             )
             result_bytes = output.getvalue()
+            result_diagnostics = {
+                "result_is_full_frame": True,
+                "original_size": list(source.size),
+                "result_size": list(source.size),
+                "direct_model_output_used": True,
+                "post_composite_applied": False,
+                "hybrid_result_validation_passed": True,
+                "mock": True,
+            }
         else:
             generated_bytes = call_openai_image_edit(
                 source,
                 api_mask,
-                simple_prompt,
+                strict_identity_prompt,
                 payload.output_quality,
             )
 
-            # Nessun ritaglio e nessun compositing con maschera:
-            # il motore deve restituire direttamente la fotografia completa.
-            result_bytes, full_frame_diagnostics = enforce_full_frame_result(
-                source=source,
-                candidate_bytes=generated_bytes,
-                edit_mask=full_edit_mask,
-                protect_mask=None,
-                feather_px=0,
-            )
-
-        if os.getenv("MOCK_MODE", "false").lower() == "true":
-            full_frame_diagnostics = {
-                "result_is_full_frame": True,
-                "original_size": list(source.size),
-                "result_size": list(source.size),
-                "full_frame_validator_applied": True,
-                "second_composite_applied": False,
-                "simple_guided_mode": True,
-            }
+            if has_manual_mask:
+                result_bytes, result_diagnostics = (
+                    validate_hybrid_guided_result(
+                        source=source,
+                        candidate_bytes=generated_bytes,
+                        guided_mask=guided_mask,
+                    )
+                )
+            else:
+                # Senza perimetro non possiamo misurare in modo affidabile
+                # le modifiche fuori componente; controlliamo solo il full frame.
+                result_bytes, result_diagnostics = enforce_full_frame_result(
+                    source=source,
+                    candidate_bytes=generated_bytes,
+                    edit_mask=guided_mask,
+                    protect_mask=None,
+                    feather_px=0,
+                )
+                result_diagnostics.update({
+                    "direct_model_output_used": True,
+                    "post_composite_applied": False,
+                    "hybrid_result_validation_passed": False,
+                    "manual_mask_missing": True,
+                })
 
         return {
             "job_id": job_id,
@@ -5665,18 +5925,26 @@ Mandatory output rules:
             "mode": "ai",
             "severity_percent": severity_percent,
             "area_percent": area_percent,
-            "result_base64": base64.b64encode(result_bytes).decode("ascii"),
+            "result_base64": base64.b64encode(
+                result_bytes
+            ).decode("ascii"),
             "mime_type": "image/jpeg",
-            "prompt_version": "damage-v17.0.7-simple-guided",
+            "prompt_version": (
+                "damage-v17.0.8-hybrid-guided-edit"
+            ),
             "result_kind": "full_frame_jpeg",
-            "full_frame_guard": full_frame_diagnostics,
             "deformation_type": payload.deformation_type,
             "impact_direction": payload.impact_direction,
-            "damage_mode": "simple_guided",
+            "damage_mode": resolved_guided_mode,
             "mask_required": False,
-            "mask_received": False,
-            "composite_strategy": "none_direct_full_frame_edit",
+            "mask_received": has_manual_mask,
+            "mask_used_as_api_edit_region": has_manual_mask,
+            "mask_diagnostics": mask_diagnostics,
+            "result_diagnostics": result_diagnostics,
+            "composite_strategy": "none_direct_model_output",
+            "post_composite_applied": False,
             "user_instructions_used": True,
+            "strict_vehicle_identity_prompt": True,
         }
 
     # --------------------------------------------------------------
@@ -5955,7 +6223,7 @@ Mandatory output rules:
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v17.0.7-simple-guided",
+        "prompt_version": "damage-v17.0.8-hybrid-guided-edit",
         "result_kind": "full_frame_jpeg",
         "full_frame_guard": full_frame_diagnostics,
         "deformation_type": payload.deformation_type,
