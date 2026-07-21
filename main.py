@@ -47,7 +47,7 @@ ALLOWED_ORIGINS = [
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.7.0.3",
+    version="1.7.0.4",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -264,38 +264,68 @@ def apply_area_percent_to_edit_mask(
     area_percent: int,
 ) -> Image.Image:
     """
-    Applica geometricamente il parametro Superficie danneggiata.
+    V17.0.4 - Estensione rigorosamente interna al componente.
 
-    - valori negativi: restringono realmente la zona modificabile;
-    - 0: mantengono la maschera originale;
-    - valori positivi: espandono realmente la zona modificabile.
+    La maschera manuale definisce il limite massimo invalicabile:
+    - 0: usa tutta la maschera, per compatibilità con le vecchie richieste;
+    - 1..100: usa circa quella percentuale dell'area interna alla maschera;
+    - valori negativi legacy: restringono la maschera, senza mai espanderla.
 
-    Il risultato viene usato sia per la generazione sia per il compositing,
-    così l'estensione non rimane una semplice istruzione testuale.
+    Non viene mai aggiunto un pixel fuori dal perimetro manuale.
     """
     area_percent = clamp_percentage(area_percent)
     binary = mask_to_binary(mask)
 
-    if area_percent == 0:
+    selected_count = int((binary > 0).sum())
+    if selected_count == 0:
+        raise HTTPException(
+            status_code=422,
+            detail="La maschera del componente è vuota.",
+        )
+
+    if area_percent == 0 or area_percent >= 100:
         return Image.fromarray(binary, mode="L")
 
-    height, width = binary.shape
-    reference = max(3, round(min(width, height) * 0.10))
-    radius = max(1, round(reference * abs(area_percent) / 100))
-    kernel_size = radius * 2 + 1
-
-    kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE,
-        (kernel_size, kernel_size),
-    )
-
-    if area_percent > 0:
-        adjusted = cv2.dilate(binary, kernel, iterations=1)
-    else:
+    if area_percent < 0:
+        height, width = binary.shape
+        reference = max(3, round(min(width, height) * 0.08))
+        radius = max(1, round(reference * abs(area_percent) / 100))
+        kernel_size = radius * 2 + 1
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (kernel_size, kernel_size),
+        )
         adjusted = cv2.erode(binary, kernel, iterations=1)
+        if int((adjusted > 0).sum()) == 0:
+            adjusted = binary
+        return Image.fromarray(adjusted, mode="L")
 
-    if int((adjusted >= 128).sum()) == 0:
-        # Non lasciamo che una forte erosione cancelli completamente la zona.
+    # Percentuale positiva: seleziona la parte più interna della maschera.
+    # La soglia sulla distance transform produce un sottoinsieme compatto
+    # e non può invadere pannelli adiacenti.
+    target_fraction = max(0.01, min(1.0, area_percent / 100.0))
+    distance = cv2.distanceTransform(binary, cv2.DIST_L2, 5)
+    positive_distances = distance[binary > 0]
+
+    if positive_distances.size == 0:
+        return Image.fromarray(binary, mode="L")
+
+    threshold = float(
+        np.quantile(
+            positive_distances,
+            max(0.0, min(0.99, 1.0 - target_fraction)),
+        )
+    )
+    adjusted = np.where(
+        (binary > 0) & (distance >= threshold),
+        255,
+        0,
+    ).astype(np.uint8)
+
+    # Evita maschere eccessivamente piccole o vuote.
+    adjusted_count = int((adjusted > 0).sum())
+    minimum_count = max(64, round(selected_count * 0.05))
+    if adjusted_count < minimum_count:
         adjusted = binary
 
     return Image.fromarray(adjusted, mode="L")
@@ -2012,156 +2042,124 @@ def smart_component_composite(
     expansion_px: int = COMPOSITE_EXPANSION_PX,
     feather_px: int = SOFT_COMPOSITE_FEATHER_PX,
 ) -> bytes:
-    if not SMART_COMPOSITE_ENABLED:
-        return protected_soft_composite(
-            source=source,
-            generated_bytes=generated_bytes,
-            source_mask=source_mask,
-            protect_mask=protect_mask,
-            expansion_px=expansion_px,
-            feather_px=feather_px,
-        )
+    """
+    V17.0.4 - Strict Mask Composite.
 
-    generated = _open_image_bytes(generated_bytes, "RGB")
-    if generated is None:
+    Regole:
+    - fuori dalla maschera manuale: pixel identici all'originale;
+    - dentro la maschera: risultato generato con sfumatura solo interna;
+    - nessuna dilatazione oltre il perimetro;
+    - eventuale trasparenza o nero esterno del risultato AI non contamina
+      la fotografia finale.
+    """
+    try:
+        generated_raw = Image.open(io.BytesIO(generated_bytes))
+        generated_raw.load()
+    except Exception as exc:
         raise HTTPException(
             status_code=502,
             detail="Il risultato generato non è un'immagine valida.",
-        )
+        ) from exc
 
-    original_size = source.size
+    source_rgb_image = source.convert("RGB")
+    original_size = source_rgb_image.size
 
-    work_source, scale = resize_image_for_processing(
-        source.convert("RGB"),
-        SMART_COMPOSITE_MAX_SIDE,
-    )
-    work_generated = generated.resize(
-        work_source.size,
-        Image.Resampling.LANCZOS,
-    )
-    work_mask = resize_mask(
-        source_mask.convert("L"),
-        work_source.size,
+    # Se il motore restituisce un PNG con alpha, ricomponilo prima sull'originale.
+    if "A" in generated_raw.getbands():
+        generated_rgba = generated_raw.convert("RGBA")
+        if generated_rgba.size != original_size:
+            generated_rgba = generated_rgba.resize(
+                original_size,
+                Image.Resampling.LANCZOS,
+            )
+        generated_image = Image.alpha_composite(
+            source_rgb_image.convert("RGBA"),
+            generated_rgba,
+        ).convert("RGB")
+    else:
+        generated_image = generated_raw.convert("RGB")
+        if generated_image.size != original_size:
+            generated_image = generated_image.resize(
+                original_size,
+                Image.Resampling.LANCZOS,
+            )
+
+    source_array = np.asarray(source_rgb_image, dtype=np.uint8)
+    generated_array = np.asarray(generated_image, dtype=np.uint8)
+
+    editable = mask_to_binary(
+        resize_mask(source_mask.convert("L"), original_size)
     )
 
     if protect_mask is not None:
-        work_protect = resize_mask(
-            protect_mask.convert("L"),
-            work_source.size,
+        protected = mask_to_binary(
+            resize_mask(protect_mask.convert("L"), original_size)
+        )
+        editable = cv2.bitwise_and(
+            editable,
+            cv2.bitwise_not(protected),
         )
     else:
-        work_protect = None
+        protected = np.zeros_like(editable)
 
-    adjusted_expansion = max(
-        0,
-        round(expansion_px * scale),
-    )
-    adjusted_feather = max(
-        2,
-        round(feather_px * scale),
-    )
-
-    source_rgb = np.asarray(work_source, dtype=np.uint8)
-    generated_rgb = np.asarray(work_generated, dtype=np.uint8)
-
-    mask_binary = mask_to_binary(work_mask)
-
-    if work_protect is not None:
-        protect_binary = mask_to_binary(work_protect)
-        mask_binary = cv2.bitwise_and(
-            mask_binary,
-            cv2.bitwise_not(protect_binary),
-        )
-    else:
-        protect_binary = np.zeros_like(mask_binary)
-
-    if adjusted_expansion > 0:
-        kernel_size = max(3, adjusted_expansion * 2 + 1)
-        expanded = cv2.dilate(
-            mask_binary,
-            np.ones((kernel_size, kernel_size), np.uint8),
-            iterations=1,
-        )
-    else:
-        expanded = mask_binary.copy()
-
-    expanded = cv2.bitwise_and(
-        expanded,
-        cv2.bitwise_not(protect_binary),
-    )
-
-    if int((expanded > 0).sum()) == 0:
+    editable_count = int((editable > 0).sum())
+    if editable_count == 0:
         raise HTTPException(
             status_code=422,
             detail="La maschera effettiva del compositing è vuota.",
         )
 
+    # Margine di sicurezza interno: mai espandere verso pannelli vicini.
+    min_side = min(original_size)
+    safety_px = max(1, min(6, round(min_side * 0.0025)))
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (safety_px * 2 + 1, safety_px * 2 + 1),
+    )
+    safe_editable = cv2.erode(editable, kernel, iterations=1)
+
+    if int((safe_editable > 0).sum()) < max(64, round(editable_count * 0.65)):
+        safe_editable = editable.copy()
+
+    # Color match solo nella zona modificabile.
     corrected_generated = _lab_color_match_inside_mask(
-        source_rgb,
-        generated_rgb,
-        expanded,
+        source_array,
+        generated_array,
+        safe_editable,
     )
 
+    # Feather esclusivamente verso l'interno.
     distance_inside = cv2.distanceTransform(
-        np.where(expanded > 0, 255, 0).astype(np.uint8),
+        np.where(safe_editable > 0, 255, 0).astype(np.uint8),
         cv2.DIST_L2,
         5,
     )
+    inward_feather = max(2.0, min(18.0, float(feather_px)))
+    alpha = np.clip(distance_inside / inward_feather, 0.0, 1.0)
+    alpha[safe_editable == 0] = 0.0
+    alpha[protected > 0] = 0.0
+    alpha3 = alpha[:, :, None]
 
-    feather = max(2.0, float(adjusted_feather))
-    alpha = np.clip(distance_inside / feather, 0.0, 1.0)
-
-    alpha[mask_binary > 0] = np.maximum(
-        alpha[mask_binary > 0],
-        0.92,
+    # Blend diretto: niente piramidi che possano diffondere il nero fuori maschera.
+    blended = (
+        corrected_generated.astype(np.float32) * alpha3
+        + source_array.astype(np.float32) * (1.0 - alpha3)
     )
+    blended = np.clip(blended, 0, 255).astype(np.uint8)
 
-    alpha = cv2.GaussianBlur(
-        alpha,
-        (0, 0),
-        sigmaX=1.0,
-    )
-    alpha[protect_binary > 0] = 0.0
+    # Garanzia assoluta: fuori dalla maschera manuale il pixel è l'originale.
+    blended[editable == 0] = source_array[editable == 0]
+    blended[protected > 0] = source_array[protected > 0]
 
-    blended = _laplacian_pyramid_blend(
-        source_rgb,
-        corrected_generated,
-        alpha,
-        levels=SMART_COMPOSITE_PYRAMID_LEVELS,
-    )
-    blended[protect_binary > 0] = source_rgb[protect_binary > 0]
-
-    work_result = Image.fromarray(blended, mode="RGB")
-
-    if work_result.size != original_size:
-        work_result = work_result.resize(
-            original_size,
-            Image.Resampling.LANCZOS,
-        )
-
+    final_image = Image.fromarray(blended, mode="RGB")
     output = io.BytesIO()
-    work_result.save(
+    final_image.save(
         output,
         format="JPEG",
-        quality=94,
+        quality=95,
         subsampling=0,
+        optimize=True,
     )
-
-    del generated
-    del work_source
-    del work_generated
-    del work_mask
-    del source_rgb
-    del generated_rgb
-    del mask_binary
-    del protect_binary
-    del expanded
-    del corrected_generated
-    del distance_inside
-    del alpha
-    del blended
-    del work_result
-
     return output.getvalue()
 
 
@@ -2392,7 +2390,7 @@ def _replicate_json_request(
             status_code=500,
             detail={
                 "message": "REPLICATE_API_TOKEN non configurato su Render.",
-                "analysis_version": "vehicle-segmentation-v17.0.3-manual-smart-polygon",
+                "analysis_version": "vehicle-segmentation-v17.0.4-manual-smart-polygon",
             },
         )
 
@@ -2435,7 +2433,7 @@ def _replicate_json_request(
                 "http_status": exc.code,
                 "request_url": url,
                 "replicate_detail": error_body[:2000],
-                "analysis_version": "vehicle-segmentation-v17.0.3-manual-smart-polygon",
+                "analysis_version": "vehicle-segmentation-v17.0.4-manual-smart-polygon",
             },
         ) from exc
     except Exception as exc:
@@ -2444,7 +2442,7 @@ def _replicate_json_request(
             detail={
                 "message": "Connessione a Replicate non riuscita.",
                 "error": f"{type(exc).__name__}: {str(exc)}"[:1200],
-                "analysis_version": "vehicle-segmentation-v17.0.3-manual-smart-polygon",
+                "analysis_version": "vehicle-segmentation-v17.0.4-manual-smart-polygon",
             },
         ) from exc
 
@@ -3339,7 +3337,7 @@ def _create_replicate_prediction(
                 "Limite Replicate ancora attivo dopo diversi tentativi."
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.3-manual-smart-polygon"
+                "vehicle-segmentation-v17.0.4-manual-smart-polygon"
             ),
         },
     )
@@ -4391,7 +4389,7 @@ def smart_polygon_component_payload(
         "smooth_polygon": smooth_polygon,
         "feather_radius": feather_radius,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.3-manual-smart-polygon"
+            "vehicle-segmentation-v17.0.4-manual-smart-polygon"
         ),
     }
 
@@ -4715,7 +4713,7 @@ def normalize_vehicle_analysis(
         "manual_polygon_required_only_for_selected_components": True,
         "segmentation_strategy": "manual_smart_polygon",
         "analysis_version": (
-            "vehicle-segmentation-v17.0.3-manual-smart-polygon"
+            "vehicle-segmentation-v17.0.4-manual-smart-polygon"
         ),
     }
 
@@ -4860,7 +4858,7 @@ Bounding-box rules:
                 "model": configured_model,
                 "primary_error": primary_message[:800],
                 "fallback_error": fallback_message[:800],
-                "analysis_version": "vehicle-segmentation-v17.0.3-manual-smart-polygon",
+                "analysis_version": "vehicle-segmentation-v17.0.4-manual-smart-polygon",
             },
         ) from fallback_exc
 
@@ -5015,7 +5013,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     ),
                     "raw_component_count": len(raw_components),
                     "analysis_version": (
-                        "vehicle-segmentation-v17.0.3-manual-smart-polygon"
+                        "vehicle-segmentation-v17.0.4-manual-smart-polygon"
                     ),
                 },
             )
@@ -5028,7 +5026,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                 "gpt-4.1-mini",
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.3-manual-smart-polygon"
+                "vehicle-segmentation-v17.0.4-manual-smart-polygon"
             ),
             "mask_format": "data:image/png;base64",
             "mask_semantics": "white_component_black_background",
@@ -5076,7 +5074,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     "error_type": type(exc).__name__,
                     "error": str(exc)[:1600],
                     "analysis_version": (
-                        "vehicle-segmentation-v17.0.3-manual-smart-polygon"
+                        "vehicle-segmentation-v17.0.4-manual-smart-polygon"
                     ),
                 },
             },
@@ -5118,7 +5116,7 @@ def start_vehicle_component_analysis(
             "result": None,
             "error": None,
             "analysis_version": (
-                "vehicle-segmentation-v17.0.3-manual-smart-polygon"
+                "vehicle-segmentation-v17.0.4-manual-smart-polygon"
             ),
         }
 
@@ -5136,7 +5134,7 @@ def start_vehicle_component_analysis(
             f"/v1/vehicle/analyze-components/status/{job_id}"
         ),
         "analysis_version": (
-            "vehicle-segmentation-v17.0.3-manual-smart-polygon"
+            "vehicle-segmentation-v17.0.4-manual-smart-polygon"
         ),
     }
 
@@ -5234,7 +5232,7 @@ def snap_vehicle_polygon_points(
         ),
         "snap_radius": payload.snap_radius,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.3-manual-smart-polygon"
+            "vehicle-segmentation-v17.0.4-manual-smart-polygon"
         ),
     }
 
@@ -5446,7 +5444,7 @@ def refine_vehicle_component(payload: ComponentRefineRequest):
         "requires_review": diagnostics.get("refinement_status") != "refined",
         "refinement": diagnostics,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.3-manual-smart-polygon"
+            "vehicle-segmentation-v17.0.4-manual-smart-polygon"
         ),
     }
 
@@ -5470,7 +5468,7 @@ def analyze_vehicle_components_sync_disabled(
                 "/v1/vehicle/analyze-components/status/{job_id}"
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.3-manual-smart-polygon"
+                "vehicle-segmentation-v17.0.4-manual-smart-polygon"
             ),
         },
     )
@@ -5542,7 +5540,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v17.0.3-manual-smart-polygon",
+        "prompt_version": "damage-v17.0.4-strict-mask-composite",
     }
 
 
@@ -5826,19 +5824,22 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v17.0.3-manual-smart-polygon",
+        "prompt_version": "damage-v17.0.4-strict-mask-composite",
         "deformation_type": payload.deformation_type,
         "impact_direction": payload.impact_direction,
         "contact_traces_enabled": payload.contact_traces_enabled,
         "involved_components": payload.involved_components,
         "damage_mode": resolved_damage_mode,
-        "area_control": "geometric_mask_transform_smart_composite",
+        "area_control": "internal_mask_fraction_strict_boundary",
         "area_transition_feather_px": area_transition_feather_px(
             source.size,
             area_percent,
         ),
-        "composite_strategy": "lab_color_match_multiband",
+        "composite_strategy": "strict_mask_inward_feather",
         "segmentation_contract": "per_component_png_masks",
+        "strict_mask_boundary": True,
+        "outside_mask_preserved": True,
+        "mask_expansion_outside_component": False,
         "mixed_strategy": (
             "sequential_per_component"
             if resolved_damage_mode == "mixed"
