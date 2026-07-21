@@ -5,3 +5,4 @@ pillow>=11.3,<13
 opencv-python-headless>=4.12,<5
 numpy>=2.2,<3
 openai>=1.95,<3
+pillow-heif>=0.18.0,<2
