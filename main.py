@@ -47,7 +47,7 @@ ALLOWED_ORIGINS = [
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.7.0.10",
+    version="1.7.0.11",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -2564,6 +2564,113 @@ def validate_deformation_locality(
     }
 
 
+
+def build_balanced_continuity_prompt(
+    damage_continuity_text: str,
+    area_percent: int,
+    severity_percent: int,
+) -> str:
+    """
+    V17.0.11 - Evita sia la deformazione troppo diffusa sia il danno
+    eccessivamente puntiforme, favorendo un raccordo realistico con
+    il pannello adiacente già danneggiato.
+    """
+    continuity_text = (damage_continuity_text or "").strip().lower()
+    area = max(0, min(100, abs(int(area_percent))))
+    severity = max(0, min(100, abs(int(severity_percent))))
+
+    continuity_requested = any(
+        token in continuity_text
+        for token in (
+            "continue",
+            "continuity",
+            "existing",
+            "adjacent",
+            "prosegue",
+            "continua",
+            "esistente",
+            "adiacente",
+        )
+    )
+
+    if area <= 30:
+        width_rule = (
+            "Use a compact but not point-like deformation: one short dominant "
+            "crease surrounded by a slightly wider shallow depression."
+        )
+    elif area <= 55:
+        width_rule = (
+            "Use one dominant crease with a moderate surrounding depression, "
+            "keeping the deformation clearly localized."
+        )
+    else:
+        width_rule = (
+            "Allow a broader depression, but preserve one dominant mechanical "
+            "force path and avoid radial spreading."
+        )
+
+    if severity <= 30:
+        depth_rule = (
+            "Keep the depression shallow and avoid a sharp pinched centre."
+        )
+    elif severity <= 65:
+        depth_rule = (
+            "Use a moderate buckle with rounded sheet-metal compression around "
+            "the main crease, not a puncture-like centre."
+        )
+    else:
+        depth_rule = (
+            "Use a stronger local buckle, but keep the centre blunt and "
+            "collision-like rather than punctured."
+        )
+
+    if continuity_requested:
+        continuity_rule = """
+The deformation must connect naturally to the already damaged adjacent panel
+through the nearest shared edge.
+
+Slightly deform the selected panel edge closest to the adjacent damage,
+while keeping the protected adjacent component itself unchanged.
+
+The result must look like collision force transferred from the neighbouring
+damaged panel, not like a separate object struck the middle of the panel.
+""".strip()
+    else:
+        continuity_rule = (
+            "Do not invent continuity with adjacent panels unless requested."
+        )
+
+    return f"""
+BALANCED COLLISION CONTINUITY RULES — STRICT
+
+{width_rule}
+{depth_rule}
+{continuity_rule}
+
+Required shape:
+- one short dominant crease or buckle;
+- one moderately wider shallow depression around it;
+- soft but mechanically credible compression around the main crease;
+- a blunt collision centre, never a sharp puncture;
+- limited secondary tension lines;
+- deformation intensity that reduces quickly away from the impact origin.
+
+Avoid:
+- a tiny isolated dent;
+- a sharp pinched centre;
+- puncture-like geometry;
+- star-shaped or radial folds;
+- long decorative creases;
+- broad swelling;
+- deformation spreading toward the centre of the panel without a clear
+  mechanical reason.
+
+If continuity with an adjacent damaged panel is requested, the selected
+panel edge nearest that damage may deform slightly, but protected components
+and their geometry must remain unchanged.
+""".strip()
+
+
 def prepare_hybrid_guided_api_mask(
     manual_mask: Image.Image,
     target_size: tuple[int, int],
@@ -2997,7 +3104,7 @@ def _replicate_json_request(
             status_code=500,
             detail={
                 "message": "REPLICATE_API_TOKEN non configurato su Render.",
-                "analysis_version": "vehicle-segmentation-v17.0.10-deformation-quality",
+                "analysis_version": "vehicle-segmentation-v17.0.11-balanced-continuity",
             },
         )
 
@@ -3040,7 +3147,7 @@ def _replicate_json_request(
                 "http_status": exc.code,
                 "request_url": url,
                 "replicate_detail": error_body[:2000],
-                "analysis_version": "vehicle-segmentation-v17.0.10-deformation-quality",
+                "analysis_version": "vehicle-segmentation-v17.0.11-balanced-continuity",
             },
         ) from exc
     except Exception as exc:
@@ -3049,7 +3156,7 @@ def _replicate_json_request(
             detail={
                 "message": "Connessione a Replicate non riuscita.",
                 "error": f"{type(exc).__name__}: {str(exc)}"[:1200],
-                "analysis_version": "vehicle-segmentation-v17.0.10-deformation-quality",
+                "analysis_version": "vehicle-segmentation-v17.0.11-balanced-continuity",
             },
         ) from exc
 
@@ -3944,7 +4051,7 @@ def _create_replicate_prediction(
                 "Limite Replicate ancora attivo dopo diversi tentativi."
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.10-deformation-quality"
+                "vehicle-segmentation-v17.0.11-balanced-continuity"
             ),
         },
     )
@@ -4996,7 +5103,7 @@ def smart_polygon_component_payload(
         "smooth_polygon": smooth_polygon,
         "feather_radius": feather_radius,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.10-deformation-quality"
+            "vehicle-segmentation-v17.0.11-balanced-continuity"
         ),
     }
 
@@ -5320,7 +5427,7 @@ def normalize_vehicle_analysis(
         "manual_polygon_required_only_for_selected_components": True,
         "segmentation_strategy": "manual_smart_polygon",
         "analysis_version": (
-            "vehicle-segmentation-v17.0.10-deformation-quality"
+            "vehicle-segmentation-v17.0.11-balanced-continuity"
         ),
     }
 
@@ -5465,7 +5572,7 @@ Bounding-box rules:
                 "model": configured_model,
                 "primary_error": primary_message[:800],
                 "fallback_error": fallback_message[:800],
-                "analysis_version": "vehicle-segmentation-v17.0.10-deformation-quality",
+                "analysis_version": "vehicle-segmentation-v17.0.11-balanced-continuity",
             },
         ) from fallback_exc
 
@@ -5620,7 +5727,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     ),
                     "raw_component_count": len(raw_components),
                     "analysis_version": (
-                        "vehicle-segmentation-v17.0.10-deformation-quality"
+                        "vehicle-segmentation-v17.0.11-balanced-continuity"
                     ),
                 },
             )
@@ -5633,7 +5740,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                 "gpt-4.1-mini",
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.10-deformation-quality"
+                "vehicle-segmentation-v17.0.11-balanced-continuity"
             ),
             "mask_format": "data:image/png;base64",
             "mask_semantics": "white_component_black_background",
@@ -5681,7 +5788,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     "error_type": type(exc).__name__,
                     "error": str(exc)[:1600],
                     "analysis_version": (
-                        "vehicle-segmentation-v17.0.10-deformation-quality"
+                        "vehicle-segmentation-v17.0.11-balanced-continuity"
                     ),
                 },
             },
@@ -5723,7 +5830,7 @@ def start_vehicle_component_analysis(
             "result": None,
             "error": None,
             "analysis_version": (
-                "vehicle-segmentation-v17.0.10-deformation-quality"
+                "vehicle-segmentation-v17.0.11-balanced-continuity"
             ),
         }
 
@@ -5741,7 +5848,7 @@ def start_vehicle_component_analysis(
             f"/v1/vehicle/analyze-components/status/{job_id}"
         ),
         "analysis_version": (
-            "vehicle-segmentation-v17.0.10-deformation-quality"
+            "vehicle-segmentation-v17.0.11-balanced-continuity"
         ),
     }
 
@@ -5839,7 +5946,7 @@ def snap_vehicle_polygon_points(
         ),
         "snap_radius": payload.snap_radius,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.10-deformation-quality"
+            "vehicle-segmentation-v17.0.11-balanced-continuity"
         ),
     }
 
@@ -6051,7 +6158,7 @@ def refine_vehicle_component(payload: ComponentRefineRequest):
         "requires_review": diagnostics.get("refinement_status") != "refined",
         "refinement": diagnostics,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.10-deformation-quality"
+            "vehicle-segmentation-v17.0.11-balanced-continuity"
         ),
     }
 
@@ -6075,7 +6182,7 @@ def analyze_vehicle_components_sync_disabled(
                 "/v1/vehicle/analyze-components/status/{job_id}"
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.10-deformation-quality"
+                "vehicle-segmentation-v17.0.11-balanced-continuity"
             ),
         },
     )
@@ -6158,7 +6265,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v17.0.10-deformation-quality",
+        "prompt_version": "damage-v17.0.11-balanced-continuity",
         "result_kind": "full_frame_jpeg",
         "full_frame_guard": full_frame_diagnostics,
     }
@@ -6167,7 +6274,7 @@ async def edit_damage(
 @app.post("/v1/damage/edit-base64")
 def edit_damage_base64(payload: DamageEditBase64Request):
     """
-    V17.0.10 Deformation Quality
+    V17.0.11 Balanced Continuity
 
     - con maschera manuale: foto completa + perimetro reale + prompt naturale,
       output diretto del modello e validazione anti-cambio-auto;
@@ -6255,6 +6362,12 @@ def edit_damage_base64(payload: DamageEditBase64Request):
             deformation_type=payload.deformation_type,
         )
 
+        balanced_continuity_prompt = build_balanced_continuity_prompt(
+            damage_continuity_text=payload.user_instructions,
+            area_percent=area_percent,
+            severity_percent=severity_percent,
+        )
+
         strict_identity_prompt = f"""
 STRICT CONSERVATIVE IMAGE EDIT OF THE PROVIDED ORIGINAL PHOTOGRAPH.
 
@@ -6291,6 +6404,8 @@ Editing rules:
 {protected_components_prompt}
 
 {deformation_quality_prompt}
+
+{balanced_continuity_prompt}
 
 Final output rules:
 - do not return a crop, isolated component, transparent layer, mask or black
@@ -6381,7 +6496,7 @@ Final output rules:
             ).decode("ascii"),
             "mime_type": "image/jpeg",
             "prompt_version": (
-                "damage-v17.0.10-deformation-quality"
+                "damage-v17.0.11-balanced-continuity"
             ),
             "result_kind": "full_frame_jpeg",
             "deformation_type": payload.deformation_type,
@@ -6399,8 +6514,10 @@ Final output rules:
             "protected_components": payload.protected_components,
             "protected_components_prompt_applied": True,
             "deformation_quality_prompt_applied": True,
-            "deformation_quality_profile": "localized_mechanical",
+            "deformation_quality_profile": "balanced_local_continuity",
+            "balanced_continuity_prompt_applied": True,
             "max_secondary_tension_lines_requested": 2,
+            "point_like_dent_forbidden": True,
             "mask_edge_margin_px": (
                 mask_diagnostics.get("edge_margin_px")
             ),
@@ -6682,7 +6799,7 @@ Final output rules:
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v17.0.10-deformation-quality",
+        "prompt_version": "damage-v17.0.11-balanced-continuity",
         "result_kind": "full_frame_jpeg",
         "full_frame_guard": full_frame_diagnostics,
         "deformation_type": payload.deformation_type,
