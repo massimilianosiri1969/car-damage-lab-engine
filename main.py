@@ -47,7 +47,7 @@ ALLOWED_ORIGINS = [
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.7.0.8",
+    version="1.7.0.9",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -127,6 +127,10 @@ class DamageEditBase64Request(BaseModel):
 
     # Compatibilità temporanea con vecchie versioni Base44.
     user_instructions: str = Field(default="", max_length=4000)
+    protected_components: list[str] = Field(default_factory=list)
+    protected_component_masks_base64: dict[str, str] = Field(
+        default_factory=dict
+    )
 
 
 class VehicleAnalyzeRequest(BaseModel):
@@ -2154,10 +2158,217 @@ def enforce_full_frame_result(
 
 
 
+
+PROTECTED_COMPONENT_LABELS: dict[str, str] = {
+    "headlight": "front headlight",
+    "front_headlight": "front headlight",
+    "left_headlight": "left front headlight",
+    "right_headlight": "right front headlight",
+    "windshield": "windshield",
+    "windscreen": "windshield",
+    "front_bumper": "front bumper",
+    "bumper_front": "front bumper",
+    "bumper": "bumper",
+    "wheel": "wheel",
+    "front_wheel": "front wheel",
+    "wheel_arch": "wheel arch",
+    "fender_front": "front fender",
+    "front_fender": "front fender",
+    "door_front": "front door",
+    "front_door": "front door",
+    "mirror": "side mirror",
+    "side_mirror": "side mirror",
+    "grille": "front grille",
+    "license_plate": "license plate",
+}
+
+
+def protected_component_names(
+    protected_components: list[str] | None,
+) -> list[str]:
+    """
+    Normalizza i codici dei componenti protetti in etichette chiare
+    per il prompt.
+    """
+    result: list[str] = []
+    for code in protected_components or []:
+        normalized = str(code).strip().lower()
+        label = PROTECTED_COMPONENT_LABELS.get(
+            normalized,
+            normalized.replace("_", " "),
+        )
+        if label and label not in result:
+            result.append(label)
+    return result
+
+
+def build_strict_protected_components_prompt(
+    protected_components: list[str] | None,
+) -> str:
+    """
+    Genera una sezione prompt vincolante per i componenti protetti.
+    """
+    names = protected_component_names(protected_components)
+
+    if not names:
+        return (
+            "Preserve all surrounding components that are not explicitly "
+            "selected for deformation."
+        )
+
+    protected_list = "\n".join(f"- {name}" for name in names)
+
+    specific_rules: list[str] = []
+
+    if any("headlight" in name for name in names):
+        specific_rules.append(
+            """
+HEADLIGHT PROTECTION IS ABSOLUTE:
+- preserve the exact headlight lens outline;
+- preserve the exact internal light geometry;
+- preserve the housing position and panel gaps;
+- preserve the original reflections on the lens;
+- do not reshape, move, stretch, blur or regenerate the headlight.
+""".strip()
+        )
+
+    if any("windshield" in name for name in names):
+        specific_rules.append(
+            """
+WINDSHIELD PROTECTION IS ABSOLUTE:
+- preserve its exact outline, reflections and transparency;
+- do not bend, crack, move or regenerate the glass.
+""".strip()
+        )
+
+    if any("wheel" in name for name in names):
+        specific_rules.append(
+            """
+WHEEL PROTECTION IS ABSOLUTE:
+- preserve the exact rim design, tyre shape, position and reflections;
+- do not alter wheel alignment unless explicitly requested.
+""".strip()
+        )
+
+    extras = "\n\n".join(specific_rules)
+
+    return f"""
+STRICTLY PRESERVE THESE COMPONENTS WITHOUT ANY VISUAL OR GEOMETRIC CHANGE:
+{protected_list}
+
+Do not modify their outline, dimensions, position, reflections, textures,
+panel gaps, internal details or identity.
+
+The selected deformation may approach these parts, but must stop before
+altering them.
+
+{extras}
+""".strip()
+
+
+def validate_protected_components_unchanged(
+    source: Image.Image,
+    candidate_bytes: bytes,
+    protected_masks_base64: dict[str, str] | None,
+) -> dict[str, object]:
+    """
+    Verifica facoltativamente le aree protette quando Base44 invia
+    protected_component_masks_base64.
+
+    Non modifica l'immagine. Se una zona protetta cambia troppo, rifiuta
+    il risultato.
+    """
+    if not protected_masks_base64:
+        return {
+            "protected_masks_received": 0,
+            "protected_components_validation_applied": False,
+        }
+
+    source_rgb = source.convert("RGB")
+    width, height = source_rgb.size
+    source_array = np.asarray(source_rgb, dtype=np.uint8)
+
+    try:
+        candidate = Image.open(io.BytesIO(candidate_bytes))
+        candidate.load()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Il risultato non è un'immagine valida.",
+        ) from exc
+
+    candidate_rgb = candidate.convert("RGB")
+    if candidate_rgb.size != (width, height):
+        candidate_rgb = candidate_rgb.resize(
+            (width, height),
+            Image.Resampling.LANCZOS,
+        )
+
+    candidate_array = np.asarray(candidate_rgb, dtype=np.uint8)
+
+    validated: dict[str, object] = {}
+
+    for component_code, mask_base64 in protected_masks_base64.items():
+        if not mask_base64:
+            continue
+
+        mask_image = decode_base64_image(
+            mask_base64,
+            f"protected_component_masks_base64[{component_code}]",
+            "L",
+        )
+        mask = mask_to_binary(
+            resize_mask(mask_image, (width, height))
+        ) > 0
+
+        pixel_count = int(mask.sum())
+        if pixel_count == 0:
+            continue
+
+        difference = np.mean(
+            np.abs(
+                candidate_array.astype(np.int16)
+                - source_array.astype(np.int16)
+            ),
+            axis=2,
+        )
+
+        mean_difference = float(difference[mask].mean())
+        changed_ratio = float((difference[mask] > 16.0).sum()) / float(
+            pixel_count
+        )
+
+        validated[component_code] = {
+            "mean_difference": round(mean_difference, 3),
+            "changed_ratio": round(changed_ratio, 4),
+            "pixel_count": pixel_count,
+        }
+
+        if mean_difference > 12.0 and changed_ratio > 0.10:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "message": (
+                        f"Il componente protetto '{component_code}' "
+                        "è stato modificato troppo dal motore."
+                    ),
+                    "component": component_code,
+                    "mean_difference": round(mean_difference, 3),
+                    "changed_ratio": round(changed_ratio, 4),
+                },
+            )
+
+    return {
+        "protected_masks_received": len(validated),
+        "protected_components_validation_applied": bool(validated),
+        "protected_components_validation": validated,
+    }
+
+
 def prepare_hybrid_guided_api_mask(
     manual_mask: Image.Image,
     target_size: tuple[int, int],
-    edge_margin_px: int = 3,
+    edge_margin_px: int = 1,
 ) -> tuple[Image.Image, Image.Image, dict[str, object]]:
     """
     V17.0.8 - Prepara la maschera corretta dall'utente come guida reale
@@ -2587,7 +2798,7 @@ def _replicate_json_request(
             status_code=500,
             detail={
                 "message": "REPLICATE_API_TOKEN non configurato su Render.",
-                "analysis_version": "vehicle-segmentation-v17.0.8-hybrid-guided-edit",
+                "analysis_version": "vehicle-segmentation-v17.0.9-protected-components",
             },
         )
 
@@ -2630,7 +2841,7 @@ def _replicate_json_request(
                 "http_status": exc.code,
                 "request_url": url,
                 "replicate_detail": error_body[:2000],
-                "analysis_version": "vehicle-segmentation-v17.0.8-hybrid-guided-edit",
+                "analysis_version": "vehicle-segmentation-v17.0.9-protected-components",
             },
         ) from exc
     except Exception as exc:
@@ -2639,7 +2850,7 @@ def _replicate_json_request(
             detail={
                 "message": "Connessione a Replicate non riuscita.",
                 "error": f"{type(exc).__name__}: {str(exc)}"[:1200],
-                "analysis_version": "vehicle-segmentation-v17.0.8-hybrid-guided-edit",
+                "analysis_version": "vehicle-segmentation-v17.0.9-protected-components",
             },
         ) from exc
 
@@ -3534,7 +3745,7 @@ def _create_replicate_prediction(
                 "Limite Replicate ancora attivo dopo diversi tentativi."
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.8-hybrid-guided-edit"
+                "vehicle-segmentation-v17.0.9-protected-components"
             ),
         },
     )
@@ -4586,7 +4797,7 @@ def smart_polygon_component_payload(
         "smooth_polygon": smooth_polygon,
         "feather_radius": feather_radius,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.8-hybrid-guided-edit"
+            "vehicle-segmentation-v17.0.9-protected-components"
         ),
     }
 
@@ -4910,7 +5121,7 @@ def normalize_vehicle_analysis(
         "manual_polygon_required_only_for_selected_components": True,
         "segmentation_strategy": "manual_smart_polygon",
         "analysis_version": (
-            "vehicle-segmentation-v17.0.8-hybrid-guided-edit"
+            "vehicle-segmentation-v17.0.9-protected-components"
         ),
     }
 
@@ -5055,7 +5266,7 @@ Bounding-box rules:
                 "model": configured_model,
                 "primary_error": primary_message[:800],
                 "fallback_error": fallback_message[:800],
-                "analysis_version": "vehicle-segmentation-v17.0.8-hybrid-guided-edit",
+                "analysis_version": "vehicle-segmentation-v17.0.9-protected-components",
             },
         ) from fallback_exc
 
@@ -5210,7 +5421,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     ),
                     "raw_component_count": len(raw_components),
                     "analysis_version": (
-                        "vehicle-segmentation-v17.0.8-hybrid-guided-edit"
+                        "vehicle-segmentation-v17.0.9-protected-components"
                     ),
                 },
             )
@@ -5223,7 +5434,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                 "gpt-4.1-mini",
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.8-hybrid-guided-edit"
+                "vehicle-segmentation-v17.0.9-protected-components"
             ),
             "mask_format": "data:image/png;base64",
             "mask_semantics": "white_component_black_background",
@@ -5271,7 +5482,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     "error_type": type(exc).__name__,
                     "error": str(exc)[:1600],
                     "analysis_version": (
-                        "vehicle-segmentation-v17.0.8-hybrid-guided-edit"
+                        "vehicle-segmentation-v17.0.9-protected-components"
                     ),
                 },
             },
@@ -5313,7 +5524,7 @@ def start_vehicle_component_analysis(
             "result": None,
             "error": None,
             "analysis_version": (
-                "vehicle-segmentation-v17.0.8-hybrid-guided-edit"
+                "vehicle-segmentation-v17.0.9-protected-components"
             ),
         }
 
@@ -5331,7 +5542,7 @@ def start_vehicle_component_analysis(
             f"/v1/vehicle/analyze-components/status/{job_id}"
         ),
         "analysis_version": (
-            "vehicle-segmentation-v17.0.8-hybrid-guided-edit"
+            "vehicle-segmentation-v17.0.9-protected-components"
         ),
     }
 
@@ -5429,7 +5640,7 @@ def snap_vehicle_polygon_points(
         ),
         "snap_radius": payload.snap_radius,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.8-hybrid-guided-edit"
+            "vehicle-segmentation-v17.0.9-protected-components"
         ),
     }
 
@@ -5641,7 +5852,7 @@ def refine_vehicle_component(payload: ComponentRefineRequest):
         "requires_review": diagnostics.get("refinement_status") != "refined",
         "refinement": diagnostics,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.8-hybrid-guided-edit"
+            "vehicle-segmentation-v17.0.9-protected-components"
         ),
     }
 
@@ -5665,7 +5876,7 @@ def analyze_vehicle_components_sync_disabled(
                 "/v1/vehicle/analyze-components/status/{job_id}"
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.8-hybrid-guided-edit"
+                "vehicle-segmentation-v17.0.9-protected-components"
             ),
         },
     )
@@ -5748,7 +5959,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v17.0.8-hybrid-guided-edit",
+        "prompt_version": "damage-v17.0.9-protected-components",
         "result_kind": "full_frame_jpeg",
         "full_frame_guard": full_frame_diagnostics,
     }
@@ -5811,7 +6022,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 prepare_hybrid_guided_api_mask(
                     manual_mask=raw_manual_mask,
                     target_size=source.size,
-                    edge_margin_px=3,
+                    edge_margin_px=1,
                 )
             )
             resolved_guided_mode = "hybrid_guided"
@@ -5832,6 +6043,12 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 "mask_geometry_source": "full_frame_fallback",
             }
             resolved_guided_mode = "simple_guided"
+
+        protected_components_prompt = (
+            build_strict_protected_components_prompt(
+                payload.protected_components
+            )
+        )
 
         strict_identity_prompt = f"""
 STRICT CONSERVATIVE IMAGE EDIT OF THE PROVIDED ORIGINAL PHOTOGRAPH.
@@ -5861,7 +6078,12 @@ Editing rules:
 - preserve every explicitly protected component;
 - when a manual perimeter is supplied, use it as the real editable component
   region and keep the rest of the photograph unchanged;
+- do not let the deformation cross the selected panel boundary into a
+  protected component;
+- preserve original panel gaps around protected components;
 - return the complete edited original photograph with the same dimensions;
+
+{protected_components_prompt}
 - do not return a crop, isolated component, transparent layer, mask or black
   background;
 - the output must look like this exact photograph after a local automotive
@@ -5902,6 +6124,17 @@ Editing rules:
                         guided_mask=guided_mask,
                     )
                 )
+
+                protected_validation = (
+                    validate_protected_components_unchanged(
+                        source=source,
+                        candidate_bytes=result_bytes,
+                        protected_masks_base64=(
+                            payload.protected_component_masks_base64
+                        ),
+                    )
+                )
+                result_diagnostics.update(protected_validation)
             else:
                 # Senza perimetro non possiamo misurare in modo affidabile
                 # le modifiche fuori componente; controlliamo solo il full frame.
@@ -5917,6 +6150,7 @@ Editing rules:
                     "post_composite_applied": False,
                     "hybrid_result_validation_passed": False,
                     "manual_mask_missing": True,
+                    "protected_components_validation_applied": False,
                 })
 
         return {
@@ -5930,7 +6164,7 @@ Editing rules:
             ).decode("ascii"),
             "mime_type": "image/jpeg",
             "prompt_version": (
-                "damage-v17.0.8-hybrid-guided-edit"
+                "damage-v17.0.9-protected-components"
             ),
             "result_kind": "full_frame_jpeg",
             "deformation_type": payload.deformation_type,
@@ -5945,6 +6179,11 @@ Editing rules:
             "post_composite_applied": False,
             "user_instructions_used": True,
             "strict_vehicle_identity_prompt": True,
+            "protected_components": payload.protected_components,
+            "protected_components_prompt_applied": True,
+            "mask_edge_margin_px": (
+                mask_diagnostics.get("edge_margin_px")
+            ),
         }
 
     # --------------------------------------------------------------
@@ -6223,7 +6462,7 @@ Editing rules:
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v17.0.8-hybrid-guided-edit",
+        "prompt_version": "damage-v17.0.9-protected-components",
         "result_kind": "full_frame_jpeg",
         "full_frame_guard": full_frame_diagnostics,
         "deformation_type": payload.deformation_type,
