@@ -66,7 +66,7 @@ ALLOWED_ORIGINS = [
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.7.0.12",
+    version="1.7.0.13",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -122,6 +122,7 @@ class DamageEditBase64Request(BaseModel):
         "diagonal_right",
         "diagonal_left",
         "frontal",
+        "rear_to_front",
     ] = "frontal"
 
     involved_components: dict[str, bool] = Field(
@@ -2512,6 +2513,74 @@ def validate_protected_components_unchanged(
 
 
 
+
+def build_impact_direction_prompt(
+    impact_direction: str,
+) -> str:
+    """
+    V17.0.13 - Traduce la direzione selezionata in una regola fisica
+    non ambigua per il motore immagini.
+    """
+    rules = {
+        "frontal": (
+            "The collision force originates from the front of the vehicle "
+            "and propagates toward the rear."
+        ),
+        "rear_to_front": (
+            "The collision force originates from the rear of the vehicle "
+            "and propagates toward the front. This represents a rear-end "
+            "impact or compression from behind."
+        ),
+        "left_to_right": (
+            "The collision force propagates from the left side toward "
+            "the right side."
+        ),
+        "right_to_left": (
+            "The collision force propagates from the right side toward "
+            "the left side."
+        ),
+        "top_to_bottom": (
+            "The collision force propagates from the top toward the bottom."
+        ),
+        "bottom_to_top": (
+            "The collision force propagates from the bottom toward the top."
+        ),
+        "diagonal_right": (
+            "The collision force follows a diagonal path toward the right."
+        ),
+        "diagonal_left": (
+            "The collision force follows a diagonal path toward the left."
+        ),
+    }
+
+    base_rule = rules.get(
+        impact_direction,
+        "Follow the selected impact direction mechanically.",
+    )
+
+    if impact_direction == "rear_to_front":
+        return f"""
+IMPACT DIRECTION — REAR TO FRONT
+
+{base_rule}
+
+If the selected component is at the rear of the vehicle, create a
+mechanically plausible rear-end collision deformation.
+
+Keep the strongest compression near the rear impact origin and allow only
+limited forward propagation through the selected component.
+
+Do not reinterpret this as a frontal impact.
+Do not move or redesign unrelated rear components.
+""".strip()
+
+    return f"""
+IMPACT DIRECTION
+
+{base_rule}
+""".strip()
+
+
 def build_deformation_quality_prompt(
     severity_percent: int,
     area_percent: int,
@@ -3263,7 +3332,7 @@ def _replicate_json_request(
             status_code=500,
             detail={
                 "message": "REPLICATE_API_TOKEN non configurato su Render.",
-                "analysis_version": "vehicle-segmentation-v17.0.12-memory-heic",
+                "analysis_version": "vehicle-segmentation-v17.0.13-rear-impact",
             },
         )
 
@@ -3306,7 +3375,7 @@ def _replicate_json_request(
                 "http_status": exc.code,
                 "request_url": url,
                 "replicate_detail": error_body[:2000],
-                "analysis_version": "vehicle-segmentation-v17.0.12-memory-heic",
+                "analysis_version": "vehicle-segmentation-v17.0.13-rear-impact",
             },
         ) from exc
     except Exception as exc:
@@ -3315,7 +3384,7 @@ def _replicate_json_request(
             detail={
                 "message": "Connessione a Replicate non riuscita.",
                 "error": f"{type(exc).__name__}: {str(exc)}"[:1200],
-                "analysis_version": "vehicle-segmentation-v17.0.12-memory-heic",
+                "analysis_version": "vehicle-segmentation-v17.0.13-rear-impact",
             },
         ) from exc
 
@@ -4210,7 +4279,7 @@ def _create_replicate_prediction(
                 "Limite Replicate ancora attivo dopo diversi tentativi."
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.12-memory-heic"
+                "vehicle-segmentation-v17.0.13-rear-impact"
             ),
         },
     )
@@ -5262,7 +5331,7 @@ def smart_polygon_component_payload(
         "smooth_polygon": smooth_polygon,
         "feather_radius": feather_radius,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.12-memory-heic"
+            "vehicle-segmentation-v17.0.13-rear-impact"
         ),
     }
 
@@ -5586,7 +5655,7 @@ def normalize_vehicle_analysis(
         "manual_polygon_required_only_for_selected_components": True,
         "segmentation_strategy": "manual_smart_polygon",
         "analysis_version": (
-            "vehicle-segmentation-v17.0.12-memory-heic"
+            "vehicle-segmentation-v17.0.13-rear-impact"
         ),
     }
 
@@ -5731,7 +5800,7 @@ Bounding-box rules:
                 "model": configured_model,
                 "primary_error": primary_message[:800],
                 "fallback_error": fallback_message[:800],
-                "analysis_version": "vehicle-segmentation-v17.0.12-memory-heic",
+                "analysis_version": "vehicle-segmentation-v17.0.13-rear-impact",
             },
         ) from fallback_exc
 
@@ -5886,7 +5955,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     ),
                     "raw_component_count": len(raw_components),
                     "analysis_version": (
-                        "vehicle-segmentation-v17.0.12-memory-heic"
+                        "vehicle-segmentation-v17.0.13-rear-impact"
                     ),
                 },
             )
@@ -5899,7 +5968,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                 "gpt-4.1-mini",
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.12-memory-heic"
+                "vehicle-segmentation-v17.0.13-rear-impact"
             ),
             "mask_format": "data:image/png;base64",
             "mask_semantics": "white_component_black_background",
@@ -5947,7 +6016,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     "error_type": type(exc).__name__,
                     "error": str(exc)[:1600],
                     "analysis_version": (
-                        "vehicle-segmentation-v17.0.12-memory-heic"
+                        "vehicle-segmentation-v17.0.13-rear-impact"
                     ),
                 },
             },
@@ -5989,7 +6058,7 @@ def start_vehicle_component_analysis(
             "result": None,
             "error": None,
             "analysis_version": (
-                "vehicle-segmentation-v17.0.12-memory-heic"
+                "vehicle-segmentation-v17.0.13-rear-impact"
             ),
         }
 
@@ -6007,7 +6076,7 @@ def start_vehicle_component_analysis(
             f"/v1/vehicle/analyze-components/status/{job_id}"
         ),
         "analysis_version": (
-            "vehicle-segmentation-v17.0.12-memory-heic"
+            "vehicle-segmentation-v17.0.13-rear-impact"
         ),
     }
 
@@ -6105,7 +6174,7 @@ def snap_vehicle_polygon_points(
         ),
         "snap_radius": payload.snap_radius,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.12-memory-heic"
+            "vehicle-segmentation-v17.0.13-rear-impact"
         ),
     }
 
@@ -6317,7 +6386,7 @@ def refine_vehicle_component(payload: ComponentRefineRequest):
         "requires_review": diagnostics.get("refinement_status") != "refined",
         "refinement": diagnostics,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.12-memory-heic"
+            "vehicle-segmentation-v17.0.13-rear-impact"
         ),
     }
 
@@ -6341,7 +6410,7 @@ def analyze_vehicle_components_sync_disabled(
                 "/v1/vehicle/analyze-components/status/{job_id}"
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.12-memory-heic"
+                "vehicle-segmentation-v17.0.13-rear-impact"
             ),
         },
     )
@@ -6424,7 +6493,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v17.0.12-memory-heic",
+        "prompt_version": "damage-v17.0.13-rear-impact",
         "result_kind": "full_frame_jpeg",
         "full_frame_guard": full_frame_diagnostics,
     }
@@ -6433,7 +6502,7 @@ async def edit_damage(
 @app.post("/v1/damage/edit-base64")
 def edit_damage_base64(payload: DamageEditBase64Request):
     """
-    V17.0.12 Memory Optimized + HEIC
+    V17.0.13 Rear Impact
 
     - con maschera manuale: foto completa + perimetro reale + prompt naturale,
       output diretto del modello e validazione anti-cambio-auto;
@@ -6533,6 +6602,10 @@ def edit_damage_base64(payload: DamageEditBase64Request):
             deformation_type=payload.deformation_type,
         )
 
+        impact_direction_prompt = build_impact_direction_prompt(
+            payload.impact_direction
+        )
+
         balanced_continuity_prompt = build_balanced_continuity_prompt(
             damage_continuity_text=payload.user_instructions,
             area_percent=area_percent,
@@ -6575,6 +6648,8 @@ Editing rules:
 {protected_components_prompt}
 
 {deformation_quality_prompt}
+
+{impact_direction_prompt}
 
 {balanced_continuity_prompt}
 
@@ -6666,7 +6741,7 @@ Final output rules:
             ).decode("ascii"),
             "mime_type": "image/jpeg",
             "prompt_version": (
-                "damage-v17.0.12-memory-heic"
+                "damage-v17.0.13-rear-impact"
             ),
             "result_kind": "full_frame_jpeg",
             "deformation_type": payload.deformation_type,
@@ -6688,6 +6763,8 @@ Final output rules:
             "balanced_continuity_prompt_applied": True,
             "max_secondary_tension_lines_requested": 2,
             "point_like_dent_forbidden": True,
+            "impact_direction_prompt_applied": True,
+            "rear_impact_supported": True,
             "mask_edge_margin_px": (
                 mask_diagnostics.get("edge_margin_px")
             ),
@@ -6975,7 +7052,7 @@ Final output rules:
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v17.0.12-memory-heic",
+        "prompt_version": "damage-v17.0.13-rear-impact",
         "result_kind": "full_frame_jpeg",
         "full_frame_guard": full_frame_diagnostics,
         "deformation_type": payload.deformation_type,
