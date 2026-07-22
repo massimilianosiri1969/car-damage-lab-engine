@@ -65,13 +65,13 @@ ALLOWED_ORIGINS = [
 ]
 
 print(
-    "=== CAR DAMAGE LAB BACKEND V17.0.26 WRITABLE ARRAY HOTFIX ===",
+    "=== CAR DAMAGE LAB BACKEND V17.0.27 PANEL-AWARE IDENTITY TRANSFORM ===",
     flush=True,
 )
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.7.0.26",
+    version="1.7.0.27",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -4019,16 +4019,285 @@ def merge_protect_masks(
     return Image.fromarray(merged, mode="L") if found else None
 
 
+def identity_region_to_pixels(
+    region: dict[str, object],
+    image_size: tuple[int, int],
+    padding_percent: float = 0.0,
+) -> tuple[int, int, int, int]:
+    width, height = image_size
+    box = region["bounding_box"]
+
+    x1 = int(round(width * int(box["x1"]) / 1000.0))
+    y1 = int(round(height * int(box["y1"]) / 1000.0))
+    x2 = int(round(width * int(box["x2"]) / 1000.0))
+    y2 = int(round(height * int(box["y2"]) / 1000.0))
+
+    pad_x = int(round(width * max(0.0, padding_percent) / 100.0))
+    pad_y = int(round(height * max(0.0, padding_percent) / 100.0))
+
+    x1 = max(0, x1 - pad_x)
+    y1 = max(0, y1 - pad_y)
+    x2 = min(width, x2 + pad_x)
+    y2 = min(height, y2 + pad_y)
+
+    return x1, y1, max(x1 + 1, x2), max(y1 + 1, y2)
+
+
+def estimate_local_panel_affine(
+    source_rgb: np.ndarray,
+    candidate_rgb: np.ndarray,
+    region_box: tuple[int, int, int, int],
+) -> tuple[np.ndarray, dict[str, object]]:
+    """
+    Stima una trasformazione rigida/affine locale del pannello attorno
+    all'elemento identitario. Evita il ritaglio rettangolare incollato.
+    """
+    height, width = source_rgb.shape[:2]
+    x1, y1, x2, y2 = region_box
+    region_w = max(1, x2 - x1)
+    region_h = max(1, y2 - y1)
+
+    margin_x = max(18, int(round(region_w * 1.35)))
+    margin_y = max(18, int(round(region_h * 1.35)))
+
+    rx1 = max(0, x1 - margin_x)
+    ry1 = max(0, y1 - margin_y)
+    rx2 = min(width, x2 + margin_x)
+    ry2 = min(height, y2 + margin_y)
+
+    source_roi = source_rgb[ry1:ry2, rx1:rx2]
+    candidate_roi = candidate_rgb[ry1:ry2, rx1:rx2]
+
+    if source_roi.size == 0 or candidate_roi.size == 0:
+        return np.eye(2, 3, dtype=np.float32), {
+            "method": "identity_empty_roi",
+            "confidence": 0.0,
+        }
+
+    source_gray = cv2.cvtColor(source_roi, cv2.COLOR_RGB2GRAY)
+    candidate_gray = cv2.cvtColor(candidate_roi, cv2.COLOR_RGB2GRAY)
+
+    source_gray = cv2.GaussianBlur(source_gray, (5, 5), 0)
+    candidate_gray = cv2.GaussianBlur(candidate_gray, (5, 5), 0)
+
+    # Maschera ad anello: usa il pannello circostante, non il testo/logo.
+    ring_mask = np.full(source_gray.shape, 255, dtype=np.uint8)
+    local_x1 = max(0, x1 - rx1)
+    local_y1 = max(0, y1 - ry1)
+    local_x2 = min(ring_mask.shape[1], x2 - rx1)
+    local_y2 = min(ring_mask.shape[0], y2 - ry1)
+
+    inner_pad_x = max(3, int(round(region_w * 0.08)))
+    inner_pad_y = max(3, int(round(region_h * 0.08)))
+    cv2.rectangle(
+        ring_mask,
+        (
+            max(0, local_x1 - inner_pad_x),
+            max(0, local_y1 - inner_pad_y),
+        ),
+        (
+            min(ring_mask.shape[1] - 1, local_x2 + inner_pad_x),
+            min(ring_mask.shape[0] - 1, local_y2 + inner_pad_y),
+        ),
+        0,
+        thickness=-1,
+    )
+
+    warp = np.eye(2, 3, dtype=np.float32)
+    method = "ecc_affine"
+    confidence = 0.0
+
+    try:
+        criteria = (
+            cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
+            80,
+            1e-5,
+        )
+        confidence, warp = cv2.findTransformECC(
+            source_gray,
+            candidate_gray,
+            warp,
+            cv2.MOTION_AFFINE,
+            criteria,
+            inputMask=ring_mask,
+            gaussFiltSize=5,
+        )
+    except Exception:
+        method = "phase_translation"
+        try:
+            source_float = source_gray.astype(np.float32)
+            candidate_float = candidate_gray.astype(np.float32)
+            shift, phase_response = cv2.phaseCorrelate(
+                source_float,
+                candidate_float,
+            )
+            warp = np.array(
+                [
+                    [1.0, 0.0, float(shift[0])],
+                    [0.0, 1.0, float(shift[1])],
+                ],
+                dtype=np.float32,
+            )
+            confidence = float(max(0.0, min(1.0, phase_response)))
+        except Exception:
+            method = "identity_fallback"
+            warp = np.eye(2, 3, dtype=np.float32)
+            confidence = 0.0
+
+    # Vincoli conservativi: un badge/targa può muoversi e ruotare, non deformarsi.
+    a, b, tx = [float(v) for v in warp[0]]
+    c, d, ty = [float(v) for v in warp[1]]
+
+    scale_x = max(1e-6, (a * a + c * c) ** 0.5)
+    scale_y = max(1e-6, (b * b + d * d) ** 0.5)
+    scale = max(0.90, min(1.10, (scale_x + scale_y) / 2.0))
+    angle = float(np.degrees(np.arctan2(c, a)))
+    angle = max(-8.0, min(8.0, angle))
+
+    max_tx = max(8.0, region_w * 0.30)
+    max_ty = max(8.0, region_h * 0.30)
+    tx = max(-max_tx, min(max_tx, tx))
+    ty = max(-max_ty, min(max_ty, ty))
+
+    rad = np.radians(angle)
+    cos_a = float(np.cos(rad) * scale)
+    sin_a = float(np.sin(rad) * scale)
+
+    constrained_local = np.array(
+        [
+            [cos_a, -sin_a, tx],
+            [sin_a, cos_a, ty],
+        ],
+        dtype=np.float32,
+    )
+
+    # Converti la trasformazione locale ROI in coordinate globali.
+    global_warp = constrained_local.copy()
+    global_warp[0, 2] += (
+        rx1
+        - constrained_local[0, 0] * rx1
+        - constrained_local[0, 1] * ry1
+    )
+    global_warp[1, 2] += (
+        ry1
+        - constrained_local[1, 0] * rx1
+        - constrained_local[1, 1] * ry1
+    )
+
+    return global_warp, {
+        "method": method,
+        "confidence": round(float(confidence), 4),
+        "rotation_degrees": round(angle, 3),
+        "scale": round(scale, 4),
+        "translation_x": round(tx, 3),
+        "translation_y": round(ty, 3),
+        "roi": [rx1, ry1, rx2, ry2],
+    }
+
+
+def panel_aware_identity_composite(
+    source_array: np.ndarray,
+    candidate_array: np.ndarray,
+    identity_regions: list[dict[str, object]],
+) -> tuple[np.ndarray, list[dict[str, object]]]:
+    """
+    Sposta targa, stemma e badge con il pannello usando una trasformazione
+    affine locale, poi fonde i bordi senza creare rettangoli incollati.
+    """
+    height, width = source_array.shape[:2]
+    result = np.array(candidate_array, copy=True)
+    diagnostics: list[dict[str, object]] = []
+
+    hard_types = {
+        "license_plate",
+        "manufacturer_emblem",
+        "model_badge",
+        "trim_badge",
+        "visible_brand_text",
+    }
+
+    for region in identity_regions:
+        region_type = str(region.get("type", "")).strip().lower()
+        if region_type not in hard_types:
+            continue
+
+        box = identity_region_to_pixels(
+            region,
+            (width, height),
+            padding_percent=0.35 if region_type == "license_plate" else 0.22,
+        )
+
+        warp, warp_diag = estimate_local_panel_affine(
+            source_array,
+            result,
+            box,
+        )
+
+        region_mask = np.zeros((height, width), dtype=np.uint8)
+        x1, y1, x2, y2 = box
+        radius = max(2, min(16, min(x2 - x1, y2 - y1) // 8))
+        cv2.rectangle(
+            region_mask,
+            (x1, y1),
+            (x2, y2),
+            255,
+            thickness=-1,
+        )
+
+        warped_source = cv2.warpAffine(
+            source_array,
+            warp,
+            (width, height),
+            flags=cv2.INTER_CUBIC,
+            borderMode=cv2.BORDER_REFLECT_101,
+        )
+        warped_mask = cv2.warpAffine(
+            region_mask,
+            warp,
+            (width, height),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
+
+        # Morbida transizione solo sul bordo esterno; centro quasi rigido.
+        feather_sigma = 2.2 if region_type == "license_plate" else 1.5
+        alpha = cv2.GaussianBlur(
+            warped_mask,
+            (0, 0),
+            sigmaX=feather_sigma,
+        ).astype(np.float32) / 255.0
+        alpha = np.clip(alpha, 0.0, 1.0)[:, :, None]
+
+        result = np.clip(
+            warped_source.astype(np.float32) * alpha
+            + result.astype(np.float32) * (1.0 - alpha),
+            0,
+            255,
+        ).astype(np.uint8)
+
+        diagnostics.append({
+            "type": region_type,
+            "text": str(region.get("text", "") or ""),
+            "bounding_box_pixels": [x1, y1, x2, y2],
+            "transform": warp_diag,
+            "blend": "panel_aware_affine_feather",
+        })
+
+    return result, diagnostics
+
+
 def preserve_identity_pixels(
     source: Image.Image,
     candidate_bytes: bytes,
     identity_mask: Image.Image | None,
+    identity_regions: list[dict[str, object]] | None = None,
     guided_mask: Image.Image | None = None,
-    apply_color_correction: bool = True,
+    apply_color_correction: bool = False,
 ) -> tuple[bytes, dict[str, object]]:
     """
-    Reinserisce i pixel identitari originali e riallinea la tinta della
-    carrozzeria nella zona modificata. Funziona con posizioni dinamiche.
+    V17.0.27 - Targa, stemma e badge seguono il movimento locale del pannello.
+    Nessun ripristino rettangolare rigido.
     """
     try:
         candidate = Image.open(io.BytesIO(candidate_bytes))
@@ -4067,10 +4336,11 @@ def preserve_identity_pixels(
             source_rgb=source_array,
             generated_rgb=candidate_array,
             mask_binary=guided_binary,
-            strength=0.58,
+            strength=0.35,
         )
         color_corrected = True
 
+    hard_regions, _ = split_identity_regions(identity_regions or [])
     identity_pixels = 0
     if identity_mask is not None:
         identity_binary = mask_to_binary(
@@ -4078,16 +4348,16 @@ def preserve_identity_pixels(
         )
         identity_pixels = int((identity_binary > 0).sum())
 
-        # Ripristino rigido: targa, stemma e badge devono restare
-        # pixel-identici all'originale. Nessun feather che possa riscrivere
-        # lettere, loghi o bordi.
-        hard = identity_binary > 0
-        if not candidate_array.flags.writeable:
-            candidate_array = candidate_array.copy()
-        candidate_array[hard] = source_array[hard]
+    transformed_array, transform_diagnostics = (
+        panel_aware_identity_composite(
+            source_array=source_array,
+            candidate_array=candidate_array,
+            identity_regions=hard_regions,
+        )
+    )
 
     output = io.BytesIO()
-    Image.fromarray(candidate_array, mode="RGB").save(
+    Image.fromarray(transformed_array, mode="RGB").save(
         output,
         format="JPEG",
         quality=96,
@@ -4096,15 +4366,22 @@ def preserve_identity_pixels(
     )
 
     return output.getvalue(), {
-        "dynamic_identity_composite_applied": identity_pixels > 0,
+        "dynamic_identity_composite_applied": bool(
+            transform_diagnostics
+        ),
         "identity_protected_pixels": identity_pixels,
         "paint_color_correction_applied": color_corrected,
         "identity_composite_strategy": (
-            "hard_exact_original_pixel_restore"
-            if identity_pixels > 0
+            "panel_aware_affine_transform"
+            if transform_diagnostics
             else "none"
         ),
-        "identity_pixels_exactly_restored": identity_pixels > 0,
+        "identity_pixels_exactly_restored": False,
+        "panel_aware_identity_transform_applied": bool(
+            transform_diagnostics
+        ),
+        "identity_transform_count": len(transform_diagnostics),
+        "identity_transform_diagnostics": transform_diagnostics,
     }
 
 
@@ -4125,7 +4402,7 @@ def analyze_vehicle_identity(
 
     return {
         "status": "completed",
-        "version": "1.7.0.26",
+        "version": "1.7.0.27",
         "regions": regions,
         "region_count": len(regions),
         "dynamic_identity_protection": True,
@@ -4175,8 +4452,8 @@ def root():
 def get_backend_version() -> dict[str, object]:
     return {
         "service": "Car Damage Lab Engine",
-        "version": "1.7.0.26",
-        "prompt_version": "damage-v17.0.26-writable-array-hotfix",
+        "version": "1.7.0.27",
+        "prompt_version": "damage-v17.0.27-panel-aware-identity-transform",
         "multicomponent_release": True,
         "generic_body_panel_filter": True,
         "fragile_rear_components": True,
@@ -4198,6 +4475,9 @@ def get_backend_version() -> dict[str, object]:
         "taillight_outer_geometry_lock": True,
         "post_composite_result_forced": True,
         "writable_array_hotfix": True,
+        "panel_aware_identity_transform": True,
+        "rigid_rectangle_restore_disabled": True,
+        "local_affine_panel_tracking": True,
     }
 
 
@@ -4369,7 +4649,7 @@ def _replicate_json_request(
             status_code=500,
             detail={
                 "message": "REPLICATE_API_TOKEN non configurato su Render.",
-                "analysis_version": "vehicle-segmentation-v17.0.26-writable-array-hotfix",
+                "analysis_version": "vehicle-segmentation-v17.0.27-panel-aware-identity-transform",
             },
         )
 
@@ -4412,7 +4692,7 @@ def _replicate_json_request(
                 "http_status": exc.code,
                 "request_url": url,
                 "replicate_detail": error_body[:2000],
-                "analysis_version": "vehicle-segmentation-v17.0.26-writable-array-hotfix",
+                "analysis_version": "vehicle-segmentation-v17.0.27-panel-aware-identity-transform",
             },
         ) from exc
     except Exception as exc:
@@ -4421,7 +4701,7 @@ def _replicate_json_request(
             detail={
                 "message": "Connessione a Replicate non riuscita.",
                 "error": f"{type(exc).__name__}: {str(exc)}"[:1200],
-                "analysis_version": "vehicle-segmentation-v17.0.26-writable-array-hotfix",
+                "analysis_version": "vehicle-segmentation-v17.0.27-panel-aware-identity-transform",
             },
         ) from exc
 
@@ -5316,7 +5596,7 @@ def _create_replicate_prediction(
                 "Limite Replicate ancora attivo dopo diversi tentativi."
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.26-writable-array-hotfix"
+                "vehicle-segmentation-v17.0.27-panel-aware-identity-transform"
             ),
         },
     )
@@ -6368,7 +6648,7 @@ def smart_polygon_component_payload(
         "smooth_polygon": smooth_polygon,
         "feather_radius": feather_radius,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.26-writable-array-hotfix"
+            "vehicle-segmentation-v17.0.27-panel-aware-identity-transform"
         ),
     }
 
@@ -6692,7 +6972,7 @@ def normalize_vehicle_analysis(
         "manual_polygon_required_only_for_selected_components": True,
         "segmentation_strategy": "manual_smart_polygon",
         "analysis_version": (
-            "vehicle-segmentation-v17.0.26-writable-array-hotfix"
+            "vehicle-segmentation-v17.0.27-panel-aware-identity-transform"
         ),
     }
 
@@ -6837,7 +7117,7 @@ Bounding-box rules:
                 "model": configured_model,
                 "primary_error": primary_message[:800],
                 "fallback_error": fallback_message[:800],
-                "analysis_version": "vehicle-segmentation-v17.0.26-writable-array-hotfix",
+                "analysis_version": "vehicle-segmentation-v17.0.27-panel-aware-identity-transform",
             },
         ) from fallback_exc
 
@@ -6992,7 +7272,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     ),
                     "raw_component_count": len(raw_components),
                     "analysis_version": (
-                        "vehicle-segmentation-v17.0.26-writable-array-hotfix"
+                        "vehicle-segmentation-v17.0.27-panel-aware-identity-transform"
                     ),
                 },
             )
@@ -7005,7 +7285,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                 "gpt-4.1-mini",
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.26-writable-array-hotfix"
+                "vehicle-segmentation-v17.0.27-panel-aware-identity-transform"
             ),
             "mask_format": "data:image/png;base64",
             "mask_semantics": "white_component_black_background",
@@ -7053,7 +7333,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     "error_type": type(exc).__name__,
                     "error": str(exc)[:1600],
                     "analysis_version": (
-                        "vehicle-segmentation-v17.0.26-writable-array-hotfix"
+                        "vehicle-segmentation-v17.0.27-panel-aware-identity-transform"
                     ),
                 },
             },
@@ -7095,7 +7375,7 @@ def start_vehicle_component_analysis(
             "result": None,
             "error": None,
             "analysis_version": (
-                "vehicle-segmentation-v17.0.26-writable-array-hotfix"
+                "vehicle-segmentation-v17.0.27-panel-aware-identity-transform"
             ),
         }
 
@@ -7113,7 +7393,7 @@ def start_vehicle_component_analysis(
             f"/v1/vehicle/analyze-components/status/{job_id}"
         ),
         "analysis_version": (
-            "vehicle-segmentation-v17.0.26-writable-array-hotfix"
+            "vehicle-segmentation-v17.0.27-panel-aware-identity-transform"
         ),
     }
 
@@ -7211,7 +7491,7 @@ def snap_vehicle_polygon_points(
         ),
         "snap_radius": payload.snap_radius,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.26-writable-array-hotfix"
+            "vehicle-segmentation-v17.0.27-panel-aware-identity-transform"
         ),
     }
 
@@ -7423,7 +7703,7 @@ def refine_vehicle_component(payload: ComponentRefineRequest):
         "requires_review": diagnostics.get("refinement_status") != "refined",
         "refinement": diagnostics,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.26-writable-array-hotfix"
+            "vehicle-segmentation-v17.0.27-panel-aware-identity-transform"
         ),
     }
 
@@ -7447,7 +7727,7 @@ def analyze_vehicle_components_sync_disabled(
                 "/v1/vehicle/analyze-components/status/{job_id}"
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.26-writable-array-hotfix"
+                "vehicle-segmentation-v17.0.27-panel-aware-identity-transform"
             ),
         },
     )
@@ -7530,7 +7810,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v17.0.26-writable-array-hotfix",
+        "prompt_version": "damage-v17.0.27-panel-aware-identity-transform",
         "result_kind": "full_frame_jpeg",
         "full_frame_guard": full_frame_diagnostics,
     }
@@ -7539,7 +7819,7 @@ async def edit_damage(
 @app.post("/v1/damage/edit-base64")
 def edit_damage_base64(payload: DamageEditBase64Request):
     """
-    V17.0.26 Writable Array Hotfix
+    V17.0.27 Panel-Aware Identity Transform
 
     - con maschera manuale: foto completa + perimetro reale + prompt naturale,
       output diretto del modello e validazione anti-cambio-auto;
@@ -7929,6 +8209,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                             source=source,
                             candidate_bytes=result_bytes,
                             identity_mask=identity_protect_mask,
+                            identity_regions=hard_identity_regions,
                             guided_mask=guided_mask,
                             apply_color_correction=(
                                 payload.identity_color_correction
@@ -7965,6 +8246,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                             source=source,
                             candidate_bytes=result_bytes,
                             identity_mask=identity_protect_mask,
+                            identity_regions=hard_identity_regions,
                             guided_mask=guided_mask,
                             apply_color_correction=(
                                 payload.identity_color_correction
@@ -7997,7 +8279,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 ).decode("ascii"),
                 "mime_type": "image/jpeg",
                 "prompt_version": (
-                    "damage-v17.0.26-writable-array-hotfix"
+                    "damage-v17.0.27-panel-aware-identity-transform"
                 ),
                 "result_kind": "full_frame_jpeg",
                 "deformation_type": payload.deformation_type,
@@ -8008,7 +8290,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 "mask_used_as_api_edit_region": has_manual_mask,
                 "mask_diagnostics": mask_diagnostics,
                 "result_diagnostics": result_diagnostics,
-                "composite_strategy": "hard_identity_restore_and_taillight_geometry_lock",
+                "composite_strategy": "panel_aware_identity_transform_and_taillight_geometry_lock",
                 "post_composite_applied": True,
                 "user_instructions_used": True,
                 "strict_vehicle_identity_prompt": True,
@@ -8055,13 +8337,16 @@ def edit_damage_base64(payload: DamageEditBase64Request):
             ),
             "multicomponent_validation_applied": True,
             "multicomponent_release_mode": True,
-            "backend_version": "1.7.0.26",
+            "backend_version": "1.7.0.27",
+            "panel_aware_identity_transform_applied": True,
+            "rigid_rectangle_restore_disabled": True,
             "writable_array_hotfix_applied": True,
             "imagedraw_hotfix_applied": True,
             "conservative_identity_guard_applied": True,
             "hard_identity_pixel_restore_applied": True,
             "conservative_component_composite_enabled": True,
-            "plate_hard_restore_applied": True,
+            "plate_hard_restore_applied": False,
+            "plate_panel_aware_transform_applied": True,
             "taillight_outer_geometry_lock_applied": (
                 tail_light_geometry_mask is not None
             ),
@@ -8364,7 +8649,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
             "area_percent": area_percent,
             "result_base64": base64.b64encode(result_bytes).decode("ascii"),
             "mime_type": "image/jpeg",
-            "prompt_version": "damage-v17.0.26-writable-array-hotfix",
+            "prompt_version": "damage-v17.0.27-panel-aware-identity-transform",
             "result_kind": "full_frame_jpeg",
             "full_frame_guard": full_frame_diagnostics,
             "deformation_type": payload.deformation_type,
