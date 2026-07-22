@@ -66,7 +66,7 @@ ALLOWED_ORIGINS = [
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.7.0.16",
+    version="1.7.0.16a",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -137,6 +137,9 @@ class DamageEditBase64Request(BaseModel):
         default_factory=lambda: {"bodyPanel": True}
     )
 
+    # Hotfix compatibilità Base44: il frontend invia questo campo.
+    selected_components: list[str] = Field(default_factory=list)
+
     hood_damage_type: str | None = None
     headlight_damage_type: str | None = None
     bumper_damage_type: str | None = None
@@ -159,6 +162,50 @@ class DamageEditBase64Request(BaseModel):
     protected_component_masks_base64: dict[str, str] = Field(
         default_factory=dict
     )
+
+
+def resolve_selected_components(
+    payload: DamageEditBase64Request,
+) -> list[str]:
+    candidates: list[str] = []
+
+    candidates.extend(payload.selected_components or [])
+
+    if payload.involved_components:
+        candidates.extend(
+            str(code)
+            for code, enabled in payload.involved_components.items()
+            if enabled
+        )
+
+    if payload.component_damage_types:
+        candidates.extend(
+            str(code)
+            for code in payload.component_damage_types.keys()
+        )
+
+    if payload.component_masks_base64:
+        candidates.extend(
+            str(code)
+            for code in payload.component_masks_base64.keys()
+        )
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+
+    for item in candidates:
+        code = str(item or "").strip()
+        if not code:
+            continue
+
+        key = code.lower()
+        if key in seen:
+            continue
+
+        seen.add(key)
+        normalized.append(code)
+
+    return normalized
 
 
 class VehicleAnalyzeRequest(BaseModel):
@@ -3517,7 +3564,7 @@ def _replicate_json_request(
             status_code=500,
             detail={
                 "message": "REPLICATE_API_TOKEN non configurato su Render.",
-                "analysis_version": "vehicle-segmentation-v17.0.16-diagnostic-502",
+                "analysis_version": "vehicle-segmentation-v17.0.16a-selected-components-hotfix",
             },
         )
 
@@ -3560,7 +3607,7 @@ def _replicate_json_request(
                 "http_status": exc.code,
                 "request_url": url,
                 "replicate_detail": error_body[:2000],
-                "analysis_version": "vehicle-segmentation-v17.0.16-diagnostic-502",
+                "analysis_version": "vehicle-segmentation-v17.0.16a-selected-components-hotfix",
             },
         ) from exc
     except Exception as exc:
@@ -3569,7 +3616,7 @@ def _replicate_json_request(
             detail={
                 "message": "Connessione a Replicate non riuscita.",
                 "error": f"{type(exc).__name__}: {str(exc)}"[:1200],
-                "analysis_version": "vehicle-segmentation-v17.0.16-diagnostic-502",
+                "analysis_version": "vehicle-segmentation-v17.0.16a-selected-components-hotfix",
             },
         ) from exc
 
@@ -4464,7 +4511,7 @@ def _create_replicate_prediction(
                 "Limite Replicate ancora attivo dopo diversi tentativi."
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.16-diagnostic-502"
+                "vehicle-segmentation-v17.0.16a-selected-components-hotfix"
             ),
         },
     )
@@ -5516,7 +5563,7 @@ def smart_polygon_component_payload(
         "smooth_polygon": smooth_polygon,
         "feather_radius": feather_radius,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.16-diagnostic-502"
+            "vehicle-segmentation-v17.0.16a-selected-components-hotfix"
         ),
     }
 
@@ -5840,7 +5887,7 @@ def normalize_vehicle_analysis(
         "manual_polygon_required_only_for_selected_components": True,
         "segmentation_strategy": "manual_smart_polygon",
         "analysis_version": (
-            "vehicle-segmentation-v17.0.16-diagnostic-502"
+            "vehicle-segmentation-v17.0.16a-selected-components-hotfix"
         ),
     }
 
@@ -5985,7 +6032,7 @@ Bounding-box rules:
                 "model": configured_model,
                 "primary_error": primary_message[:800],
                 "fallback_error": fallback_message[:800],
-                "analysis_version": "vehicle-segmentation-v17.0.16-diagnostic-502",
+                "analysis_version": "vehicle-segmentation-v17.0.16a-selected-components-hotfix",
             },
         ) from fallback_exc
 
@@ -6140,7 +6187,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     ),
                     "raw_component_count": len(raw_components),
                     "analysis_version": (
-                        "vehicle-segmentation-v17.0.16-diagnostic-502"
+                        "vehicle-segmentation-v17.0.16a-selected-components-hotfix"
                     ),
                 },
             )
@@ -6153,7 +6200,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                 "gpt-4.1-mini",
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.16-diagnostic-502"
+                "vehicle-segmentation-v17.0.16a-selected-components-hotfix"
             ),
             "mask_format": "data:image/png;base64",
             "mask_semantics": "white_component_black_background",
@@ -6201,7 +6248,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     "error_type": type(exc).__name__,
                     "error": str(exc)[:1600],
                     "analysis_version": (
-                        "vehicle-segmentation-v17.0.16-diagnostic-502"
+                        "vehicle-segmentation-v17.0.16a-selected-components-hotfix"
                     ),
                 },
             },
@@ -6243,7 +6290,7 @@ def start_vehicle_component_analysis(
             "result": None,
             "error": None,
             "analysis_version": (
-                "vehicle-segmentation-v17.0.16-diagnostic-502"
+                "vehicle-segmentation-v17.0.16a-selected-components-hotfix"
             ),
         }
 
@@ -6261,7 +6308,7 @@ def start_vehicle_component_analysis(
             f"/v1/vehicle/analyze-components/status/{job_id}"
         ),
         "analysis_version": (
-            "vehicle-segmentation-v17.0.16-diagnostic-502"
+            "vehicle-segmentation-v17.0.16a-selected-components-hotfix"
         ),
     }
 
@@ -6359,7 +6406,7 @@ def snap_vehicle_polygon_points(
         ),
         "snap_radius": payload.snap_radius,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.16-diagnostic-502"
+            "vehicle-segmentation-v17.0.16a-selected-components-hotfix"
         ),
     }
 
@@ -6571,7 +6618,7 @@ def refine_vehicle_component(payload: ComponentRefineRequest):
         "requires_review": diagnostics.get("refinement_status") != "refined",
         "refinement": diagnostics,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.16-diagnostic-502"
+            "vehicle-segmentation-v17.0.16a-selected-components-hotfix"
         ),
     }
 
@@ -6595,7 +6642,7 @@ def analyze_vehicle_components_sync_disabled(
                 "/v1/vehicle/analyze-components/status/{job_id}"
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.16-diagnostic-502"
+                "vehicle-segmentation-v17.0.16a-selected-components-hotfix"
             ),
         },
     )
@@ -6678,7 +6725,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v17.0.16-diagnostic-502",
+        "prompt_version": "damage-v17.0.16a-selected-components-hotfix",
         "result_kind": "full_frame_jpeg",
         "full_frame_guard": full_frame_diagnostics,
     }
@@ -6687,7 +6734,7 @@ async def edit_damage(
 @app.post("/v1/damage/edit-base64")
 def edit_damage_base64(payload: DamageEditBase64Request):
     """
-    V17.0.16 Diagnostic 502
+    V17.0.16a Selected Components Hotfix
 
     - con maschera manuale: foto completa + perimetro reale + prompt naturale,
       output diretto del modello e validazione anti-cambio-auto;
@@ -6696,12 +6743,13 @@ def edit_damage_base64(payload: DamageEditBase64Request):
     """
     request_diagnostic_id = str(uuid.uuid4())
     request_started_at = time.time()
+    selected_components = resolve_selected_components(payload)
     print(
         "[DAMAGE EDIT START]",
         {
             "diagnostic_id": request_diagnostic_id,
             "damage_mode": payload.damage_mode,
-            "selected_components": payload.selected_components,
+            "selected_components": selected_components,
             "protected_components": payload.protected_components,
             "severity_percent": payload.severity_percent,
             "area_percent": payload.area_percent,
@@ -6816,7 +6864,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
             )
 
             collision_consequences_prompt = build_collision_consequences_prompt(
-                selected_components=payload.selected_components,
+                selected_components=selected_components,
                 protected_components=payload.protected_components,
                 severity_percent=severity_percent,
                 area_percent=area_percent,
@@ -6960,7 +7008,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 ).decode("ascii"),
                 "mime_type": "image/jpeg",
                 "prompt_version": (
-                    "damage-v17.0.16-diagnostic-502"
+                    "damage-v17.0.16a-selected-components-hotfix"
                 ),
                 "result_kind": "full_frame_jpeg",
                 "deformation_type": payload.deformation_type,
@@ -7275,7 +7323,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
             "area_percent": area_percent,
             "result_base64": base64.b64encode(result_bytes).decode("ascii"),
             "mime_type": "image/jpeg",
-            "prompt_version": "damage-v17.0.16-diagnostic-502",
+            "prompt_version": "damage-v17.0.16a-selected-components-hotfix",
             "result_kind": "full_frame_jpeg",
             "full_frame_guard": full_frame_diagnostics,
             "deformation_type": payload.deformation_type,
@@ -7316,7 +7364,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 "detail": exc.detail,
                 "elapsed_ms": elapsed_ms,
                 "damage_mode": payload.damage_mode,
-                "selected_components": payload.selected_components,
+                "selected_components": selected_components,
                 "protected_components": payload.protected_components,
                 "severity_percent": payload.severity_percent,
                 "area_percent": payload.area_percent,
@@ -7340,7 +7388,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 "error": str(exc),
                 "elapsed_ms": elapsed_ms,
                 "damage_mode": payload.damage_mode,
-                "selected_components": payload.selected_components,
+                "selected_components": selected_components,
                 "protected_components": payload.protected_components,
                 "severity_percent": payload.severity_percent,
                 "area_percent": payload.area_percent,
