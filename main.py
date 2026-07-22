@@ -64,9 +64,14 @@ ALLOWED_ORIGINS = [
     if item.strip()
 ]
 
+print(
+    "=== CAR DAMAGE LAB BACKEND V17.0.20 MULTICOMPONENT RELEASE ===",
+    flush=True,
+)
+
 app = FastAPI(
     title=APP_NAME,
-    version="1.7.0.18",
+    version="1.7.0.20",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -205,6 +210,13 @@ def resolve_selected_components(
     normalized: list[str] = []
     seen: set[str] = set()
 
+    generic_codes = {
+        "bodypanel",
+        "body_panel",
+        "bodywork",
+        "generic_body_panel",
+    }
+
     for item in candidates:
         code = str(item or "").strip()
         if not code:
@@ -216,6 +228,15 @@ def resolve_selected_components(
 
         seen.add(key)
         normalized.append(code)
+
+    specific_components = [
+        code
+        for code in normalized
+        if code.lower() not in generic_codes
+    ]
+
+    if specific_components:
+        return specific_components
 
     return normalized
 
@@ -3005,14 +3026,34 @@ def validate_deformation_locality(
     candidate_bytes: bytes,
     guided_mask: Image.Image,
     area_percent: int,
+    severity_percent: int = 0,
+    selected_components: list[str] | None = None,
 ) -> dict[str, object]:
     """
-    Controllo prudente della diffusione del cambiamento dentro la maschera.
-
-    Non tenta di riconoscere il numero di pieghe. Misura soltanto se una quota
-    eccessiva dell'intero componente è stata modificata rispetto
-    all'estensione richiesta.
+    V17.0.19 - Validazione adattiva per urti multicompomente.
     """
+    components = [
+        str(item).strip()
+        for item in (selected_components or [])
+        if str(item).strip()
+    ]
+
+    generic_codes = {
+        "bodypanel",
+        "body_panel",
+        "bodywork",
+        "generic_body_panel",
+    }
+    specific_components = [
+        item
+        for item in components
+        if item.lower() not in generic_codes
+    ]
+    component_count = max(
+        1,
+        len(specific_components or components),
+    )
+
     source_rgb = source.convert("RGB")
     width, height = source_rgb.size
 
@@ -3056,34 +3097,84 @@ def validate_deformation_locality(
     changed_inside = (difference > 14.0) & mask
     changed_ratio = float(changed_inside.sum()) / float(selected_pixels)
 
-    requested_area = max(0, min(100, abs(int(area_percent)))) / 100.0
-
-    # Tolleranza larga per riflessi e variazioni del modello.
-    allowed_ratio = min(
-        0.92,
-        max(0.28, requested_area + 0.30),
+    requested_area = (
+        max(0, min(100, abs(int(area_percent)))) / 100.0
     )
+    severity = max(0, min(100, abs(int(severity_percent))))
+
+    allowed_ratio = max(0.35, requested_area + 0.30)
+
+    if component_count == 2:
+        allowed_ratio = max(allowed_ratio, 0.72)
+    elif component_count == 3:
+        allowed_ratio = max(allowed_ratio, 0.80)
+    elif component_count >= 4:
+        allowed_ratio = max(allowed_ratio, 0.88)
+
+    if severity >= 70 and component_count >= 3:
+        allowed_ratio = max(allowed_ratio, 0.90)
+    if severity >= 85 and component_count >= 4:
+        allowed_ratio = max(allowed_ratio, 0.93)
+
+    allowed_ratio = min(0.94, allowed_ratio)
+
+    validation_warning = None
 
     if changed_ratio > allowed_ratio:
-        raise HTTPException(
-            status_code=502,
-            detail={
+        if component_count >= 3:
+            validation_warning = {
                 "message": (
-                    "La deformazione si è estesa su una porzione troppo ampia "
-                    "del componente rispetto all'estensione richiesta."
+                    "La deformazione supera la soglia indicativa, ma il "
+                    "risultato viene accettato perché riguarda un urto "
+                    "multicomponente."
                 ),
                 "changed_component_ratio": round(changed_ratio, 4),
                 "allowed_component_ratio": round(allowed_ratio, 4),
-                "requested_area_percent": int(area_percent),
-            },
-        )
+                "selected_component_count": component_count,
+            }
+            print(
+                "[MULTICOMPONENT VALIDATION WARNING]",
+                validation_warning,
+                flush=True,
+            )
+        else:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "message": (
+                        "La deformazione ha modificato quasi tutta l'area "
+                        "selezionata oltre il limite consentito."
+                    ),
+                    "changed_component_ratio": round(changed_ratio, 4),
+                    "allowed_component_ratio": round(allowed_ratio, 4),
+                    "requested_area_percent": int(area_percent),
+                    "severity_percent": int(severity_percent),
+                    "selected_component_count": component_count,
+                    "selected_components": (
+                        specific_components or components
+                    ),
+                    "validation_profile": (
+                        "multicomponent_release"
+                    ),
+                },
+            )
 
     return {
         "deformation_locality_validation_applied": True,
         "changed_component_ratio": round(changed_ratio, 4),
         "allowed_component_ratio": round(allowed_ratio, 4),
         "requested_area_percent": int(area_percent),
+        "severity_percent": int(severity_percent),
+        "selected_component_count": component_count,
+        "selected_components_for_validation": (
+            specific_components or components
+        ),
+        "validation_profile": "multicomponent_release",
         "deformation_locality_validation_passed": True,
+        "deformation_locality_validation_warning": validation_warning,
+        "multicomponent_result_released": (
+            validation_warning is not None
+        ),
     }
 
 
@@ -3517,6 +3608,18 @@ def root():
         "health": "/health",
     }
 
+@app.get("/v1/version")
+def get_backend_version() -> dict[str, object]:
+    return {
+        "service": "Car Damage Lab Engine",
+        "version": "1.7.0.20",
+        "prompt_version": "damage-v17.0.20-multicomponent-release",
+        "multicomponent_release": True,
+        "generic_body_panel_filter": True,
+        "fragile_rear_components": True,
+    }
+
+
 
 @app.get("/health")
 def health():
@@ -3685,7 +3788,7 @@ def _replicate_json_request(
             status_code=500,
             detail={
                 "message": "REPLICATE_API_TOKEN non configurato su Render.",
-                "analysis_version": "vehicle-segmentation-v17.0.18-selected-components-hotfix",
+                "analysis_version": "vehicle-segmentation-v17.0.20-multicomponent-release",
             },
         )
 
@@ -3728,7 +3831,7 @@ def _replicate_json_request(
                 "http_status": exc.code,
                 "request_url": url,
                 "replicate_detail": error_body[:2000],
-                "analysis_version": "vehicle-segmentation-v17.0.18-selected-components-hotfix",
+                "analysis_version": "vehicle-segmentation-v17.0.20-multicomponent-release",
             },
         ) from exc
     except Exception as exc:
@@ -3737,7 +3840,7 @@ def _replicate_json_request(
             detail={
                 "message": "Connessione a Replicate non riuscita.",
                 "error": f"{type(exc).__name__}: {str(exc)}"[:1200],
-                "analysis_version": "vehicle-segmentation-v17.0.18-selected-components-hotfix",
+                "analysis_version": "vehicle-segmentation-v17.0.20-multicomponent-release",
             },
         ) from exc
 
@@ -4632,7 +4735,7 @@ def _create_replicate_prediction(
                 "Limite Replicate ancora attivo dopo diversi tentativi."
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.18-selected-components-hotfix"
+                "vehicle-segmentation-v17.0.20-multicomponent-release"
             ),
         },
     )
@@ -5684,7 +5787,7 @@ def smart_polygon_component_payload(
         "smooth_polygon": smooth_polygon,
         "feather_radius": feather_radius,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.18-selected-components-hotfix"
+            "vehicle-segmentation-v17.0.20-multicomponent-release"
         ),
     }
 
@@ -6008,7 +6111,7 @@ def normalize_vehicle_analysis(
         "manual_polygon_required_only_for_selected_components": True,
         "segmentation_strategy": "manual_smart_polygon",
         "analysis_version": (
-            "vehicle-segmentation-v17.0.18-selected-components-hotfix"
+            "vehicle-segmentation-v17.0.20-multicomponent-release"
         ),
     }
 
@@ -6153,7 +6256,7 @@ Bounding-box rules:
                 "model": configured_model,
                 "primary_error": primary_message[:800],
                 "fallback_error": fallback_message[:800],
-                "analysis_version": "vehicle-segmentation-v17.0.18-selected-components-hotfix",
+                "analysis_version": "vehicle-segmentation-v17.0.20-multicomponent-release",
             },
         ) from fallback_exc
 
@@ -6308,7 +6411,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     ),
                     "raw_component_count": len(raw_components),
                     "analysis_version": (
-                        "vehicle-segmentation-v17.0.18-selected-components-hotfix"
+                        "vehicle-segmentation-v17.0.20-multicomponent-release"
                     ),
                 },
             )
@@ -6321,7 +6424,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                 "gpt-4.1-mini",
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.18-selected-components-hotfix"
+                "vehicle-segmentation-v17.0.20-multicomponent-release"
             ),
             "mask_format": "data:image/png;base64",
             "mask_semantics": "white_component_black_background",
@@ -6369,7 +6472,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     "error_type": type(exc).__name__,
                     "error": str(exc)[:1600],
                     "analysis_version": (
-                        "vehicle-segmentation-v17.0.18-selected-components-hotfix"
+                        "vehicle-segmentation-v17.0.20-multicomponent-release"
                     ),
                 },
             },
@@ -6411,7 +6514,7 @@ def start_vehicle_component_analysis(
             "result": None,
             "error": None,
             "analysis_version": (
-                "vehicle-segmentation-v17.0.18-selected-components-hotfix"
+                "vehicle-segmentation-v17.0.20-multicomponent-release"
             ),
         }
 
@@ -6429,7 +6532,7 @@ def start_vehicle_component_analysis(
             f"/v1/vehicle/analyze-components/status/{job_id}"
         ),
         "analysis_version": (
-            "vehicle-segmentation-v17.0.18-selected-components-hotfix"
+            "vehicle-segmentation-v17.0.20-multicomponent-release"
         ),
     }
 
@@ -6527,7 +6630,7 @@ def snap_vehicle_polygon_points(
         ),
         "snap_radius": payload.snap_radius,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.18-selected-components-hotfix"
+            "vehicle-segmentation-v17.0.20-multicomponent-release"
         ),
     }
 
@@ -6739,7 +6842,7 @@ def refine_vehicle_component(payload: ComponentRefineRequest):
         "requires_review": diagnostics.get("refinement_status") != "refined",
         "refinement": diagnostics,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.18-selected-components-hotfix"
+            "vehicle-segmentation-v17.0.20-multicomponent-release"
         ),
     }
 
@@ -6763,7 +6866,7 @@ def analyze_vehicle_components_sync_disabled(
                 "/v1/vehicle/analyze-components/status/{job_id}"
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.18-selected-components-hotfix"
+                "vehicle-segmentation-v17.0.20-multicomponent-release"
             ),
         },
     )
@@ -6846,7 +6949,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v17.0.18-selected-components-hotfix",
+        "prompt_version": "damage-v17.0.20-multicomponent-release",
         "result_kind": "full_frame_jpeg",
         "full_frame_guard": full_frame_diagnostics,
     }
@@ -6855,7 +6958,7 @@ async def edit_damage(
 @app.post("/v1/damage/edit-base64")
 def edit_damage_base64(payload: DamageEditBase64Request):
     """
-    V17.0.18 Selected Components Hotfix
+    V17.0.20 Multicomponent Release
 
     - con maschera manuale: foto completa + perimetro reale + prompt naturale,
       output diretto del modello e validazione anti-cambio-auto;
@@ -7084,11 +7187,13 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                     )
 
                     locality_validation = validate_deformation_locality(
-                        source=source,
-                        candidate_bytes=result_bytes,
-                        guided_mask=guided_mask,
-                        area_percent=area_percent,
-                    )
+                            source=source,
+                            candidate_bytes=result_bytes,
+                            guided_mask=guided_mask,
+                            area_percent=area_percent,
+                            severity_percent=severity_percent,
+                            selected_components=selected_components,
+                        )
                     result_diagnostics.update(locality_validation)
 
                     protected_validation = (
@@ -7129,7 +7234,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 ).decode("ascii"),
                 "mime_type": "image/jpeg",
                 "prompt_version": (
-                    "damage-v17.0.18-selected-components-hotfix"
+                    "damage-v17.0.20-multicomponent-release"
                 ),
                 "result_kind": "full_frame_jpeg",
                 "deformation_type": payload.deformation_type,
@@ -7162,6 +7267,32 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 "fragile_component_protection_override": True,
             "selected_components_hotfix_applied": True,
             "resolved_selected_components": selected_components,
+            "generic_body_panel_removed": (
+                any(
+                    str(item).lower() in {
+                        "bodypanel",
+                        "body_panel",
+                        "bodywork",
+                        "generic_body_panel",
+                    }
+                    for item in (
+                        payload.selected_components
+                        + list(payload.involved_components.keys())
+                    )
+                )
+                and all(
+                    str(item).lower() not in {
+                        "bodypanel",
+                        "body_panel",
+                        "bodywork",
+                        "generic_body_panel",
+                    }
+                    for item in selected_components
+                )
+            ),
+            "multicomponent_validation_applied": True,
+            "multicomponent_release_mode": True,
+            "backend_version": "1.7.0.20",
                 "mask_edge_margin_px": (
                     mask_diagnostics.get("edge_margin_px")
                 ),
@@ -7449,7 +7580,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
             "area_percent": area_percent,
             "result_base64": base64.b64encode(result_bytes).decode("ascii"),
             "mime_type": "image/jpeg",
-            "prompt_version": "damage-v17.0.18-selected-components-hotfix",
+            "prompt_version": "damage-v17.0.20-multicomponent-release",
             "result_kind": "full_frame_jpeg",
             "full_frame_guard": full_frame_diagnostics,
             "deformation_type": payload.deformation_type,
