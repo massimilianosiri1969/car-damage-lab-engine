@@ -64,9 +64,14 @@ ALLOWED_ORIGINS = [
     if item.strip()
 ]
 
+print(
+    "=== CAR DAMAGE LAB BACKEND V17.0.17 STAGED IDENTITY VALIDATION ===",
+    flush=True,
+)
+
 app = FastAPI(
     title=APP_NAME,
-    version="1.7.0.16b",
+    version="1.7.0.17",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -3345,6 +3350,208 @@ def validate_hybrid_guided_result(
     return output.getvalue(), diagnostics
 
 
+def call_openai_identity_validation(
+    source: Image.Image,
+    candidate_bytes: bytes,
+    selected_components: list[str],
+) -> dict[str, object]:
+    """
+    Confronta originale e risultato senza modificare l'immagine.
+
+    Verifica:
+    - stessa marca e modello;
+    - stessa targa;
+    - stessi stemmi e badge;
+    - stessa tinta generale;
+    - stessa geometria esterna dei fanali;
+    - nessun cambio di veicolo.
+    """
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return {
+            "passed": True,
+            "skipped": True,
+            "reason": "OPENAI_API_KEY missing",
+        }
+
+    try:
+        candidate = Image.open(io.BytesIO(candidate_bytes))
+        candidate.load()
+        candidate = candidate.convert("RGB")
+    except Exception as exc:
+        return {
+            "passed": False,
+            "skipped": False,
+            "reason": "candidate_decode_error",
+            "error": str(exc),
+        }
+
+    if candidate.size != source.size:
+        candidate = candidate.resize(
+            source.size,
+            Image.Resampling.LANCZOS,
+        )
+
+    client = OpenAI(api_key=api_key)
+    model = os.getenv("OPENAI_IDENTITY_VALIDATION_MODEL", "gpt-4.1")
+
+    prompt = f"""
+Compare the ORIGINAL vehicle photograph and the EDITED photograph.
+
+The edited image is valid only if it still shows the exact same vehicle.
+
+Selected damaged components:
+{", ".join(selected_components)}
+
+Return ONLY valid JSON in this exact structure:
+{{
+  "passed": true or false,
+  "same_make": true or false,
+  "same_model": true or false,
+  "same_license_plate": true or false,
+  "same_manufacturer_emblem": true or false,
+  "same_model_badges": true or false,
+  "same_paint_colour": true or false,
+  "tail_light_outer_geometry_preserved": true or false,
+  "vehicle_identity_changed": true or false,
+  "failure_reasons": ["short reason"],
+  "confidence": number from 0 to 1
+}}
+
+Strict rules:
+- The license plate characters must be exactly identical.
+- Manufacturer emblem and model badges must remain the same.
+- The vehicle must not change make, model, generation or body architecture.
+- Paint colour must remain the same, allowing only natural lighting variation.
+- A selected tail light may be cracked internally, but its original outer
+  silhouette, size and design must remain recognizable.
+- Deformation of selected body panels is allowed.
+- Background changes are not relevant unless they indicate the whole image
+  was regenerated.
+- If any identity element is uncertain or unreadable, set passed=false.
+""".strip()
+
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            temperature=0,
+            response_format={"type": "json_object"},
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a strict automotive identity quality "
+                        "inspector. Return JSON only."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "text",
+                            "text": "ORIGINAL PHOTOGRAPH:",
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": image_to_data_url(source),
+                                "detail": "high",
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": "EDITED PHOTOGRAPH:",
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": image_to_data_url(candidate),
+                                "detail": "high",
+                            },
+                        },
+                    ],
+                },
+            ],
+        )
+
+        parsed = extract_json_object(
+            response.choices[0].message.content or "{}"
+        )
+
+        required_true = [
+            bool(parsed.get("same_make")),
+            bool(parsed.get("same_model")),
+            bool(parsed.get("same_license_plate")),
+            bool(parsed.get("same_manufacturer_emblem")),
+            bool(parsed.get("same_model_badges")),
+            bool(parsed.get("same_paint_colour")),
+            bool(parsed.get("tail_light_outer_geometry_preserved")),
+        ]
+
+        passed = (
+            bool(parsed.get("passed"))
+            and all(required_true)
+            and not bool(parsed.get("vehicle_identity_changed"))
+        )
+
+        parsed["passed"] = passed
+        parsed["model"] = model
+        parsed["skipped"] = False
+        return parsed
+
+    except Exception as exc:
+        print(
+            "[IDENTITY VALIDATION ERROR]",
+            {
+                "type": type(exc).__name__,
+                "error": str(exc),
+                "model": model,
+            },
+            flush=True,
+        )
+        return {
+            "passed": False,
+            "skipped": False,
+            "reason": "identity_validation_error",
+            "error": str(exc),
+            "model": model,
+        }
+
+
+def build_retry_prompt(
+    base_prompt: str,
+    validation: dict[str, object],
+) -> str:
+    reasons = validation.get("failure_reasons") or []
+    if not isinstance(reasons, list):
+        reasons = [str(reasons)]
+
+    reason_text = "; ".join(str(item) for item in reasons[:6])
+
+    return f"""
+{base_prompt}
+
+SECOND AND FINAL CONSERVATIVE ATTEMPT.
+
+The previous result failed identity validation:
+{reason_text or "vehicle identity was not preserved"}
+
+Absolute priorities for this retry:
+1. preserve the exact original license plate characters;
+2. preserve the exact manufacturer emblem and model badges;
+3. preserve the exact make and model;
+4. preserve the original paint colour;
+5. preserve the complete outer geometry of every rear light;
+6. reduce deformation rather than changing vehicle identity;
+7. modify only the selected bodywork inside the supplied mask;
+8. do not regenerate the entire rear of the vehicle.
+
+A less severe but identity-correct result is preferable to a dramatic result
+that changes the vehicle.
+""".strip()
+
+
 def call_openai_image_edit(
     source: Image.Image,
     api_mask: Image.Image,
@@ -3458,8 +3665,28 @@ def root():
     return {
         "service": APP_NAME,
         "status": "ok",
+        "version": "1.7.0.17",
         "docs": "/docs",
         "health": "/health",
+    }
+
+
+@app.get("/v1/version")
+def get_backend_version() -> dict[str, object]:
+    return {
+        "service": APP_NAME,
+        "version": "1.7.0.17",
+        "prompt_version": (
+            "damage-v17.0.17-staged-identity-validation"
+        ),
+        "staged_identity_validation": True,
+        "maximum_generation_attempts": 2,
+        "identity_validation_model": os.getenv(
+            "OPENAI_IDENTITY_VALIDATION_MODEL",
+            "gpt-4.1",
+        ),
+        "multicomponent_threshold_fix": True,
+        "image_compositing_disabled": True,
     }
 
 
@@ -3630,7 +3857,7 @@ def _replicate_json_request(
             status_code=500,
             detail={
                 "message": "REPLICATE_API_TOKEN non configurato su Render.",
-                "analysis_version": "vehicle-segmentation-v17.0.16b-multicomponent-threshold-fix",
+                "analysis_version": "vehicle-segmentation-v17.0.17-staged-identity-validation",
             },
         )
 
@@ -3673,7 +3900,7 @@ def _replicate_json_request(
                 "http_status": exc.code,
                 "request_url": url,
                 "replicate_detail": error_body[:2000],
-                "analysis_version": "vehicle-segmentation-v17.0.16b-multicomponent-threshold-fix",
+                "analysis_version": "vehicle-segmentation-v17.0.17-staged-identity-validation",
             },
         ) from exc
     except Exception as exc:
@@ -3682,7 +3909,7 @@ def _replicate_json_request(
             detail={
                 "message": "Connessione a Replicate non riuscita.",
                 "error": f"{type(exc).__name__}: {str(exc)}"[:1200],
-                "analysis_version": "vehicle-segmentation-v17.0.16b-multicomponent-threshold-fix",
+                "analysis_version": "vehicle-segmentation-v17.0.17-staged-identity-validation",
             },
         ) from exc
 
@@ -4577,7 +4804,7 @@ def _create_replicate_prediction(
                 "Limite Replicate ancora attivo dopo diversi tentativi."
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.16b-multicomponent-threshold-fix"
+                "vehicle-segmentation-v17.0.17-staged-identity-validation"
             ),
         },
     )
@@ -5629,7 +5856,7 @@ def smart_polygon_component_payload(
         "smooth_polygon": smooth_polygon,
         "feather_radius": feather_radius,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.16b-multicomponent-threshold-fix"
+            "vehicle-segmentation-v17.0.17-staged-identity-validation"
         ),
     }
 
@@ -5953,7 +6180,7 @@ def normalize_vehicle_analysis(
         "manual_polygon_required_only_for_selected_components": True,
         "segmentation_strategy": "manual_smart_polygon",
         "analysis_version": (
-            "vehicle-segmentation-v17.0.16b-multicomponent-threshold-fix"
+            "vehicle-segmentation-v17.0.17-staged-identity-validation"
         ),
     }
 
@@ -6098,7 +6325,7 @@ Bounding-box rules:
                 "model": configured_model,
                 "primary_error": primary_message[:800],
                 "fallback_error": fallback_message[:800],
-                "analysis_version": "vehicle-segmentation-v17.0.16b-multicomponent-threshold-fix",
+                "analysis_version": "vehicle-segmentation-v17.0.17-staged-identity-validation",
             },
         ) from fallback_exc
 
@@ -6253,7 +6480,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     ),
                     "raw_component_count": len(raw_components),
                     "analysis_version": (
-                        "vehicle-segmentation-v17.0.16b-multicomponent-threshold-fix"
+                        "vehicle-segmentation-v17.0.17-staged-identity-validation"
                     ),
                 },
             )
@@ -6266,7 +6493,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                 "gpt-4.1-mini",
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.16b-multicomponent-threshold-fix"
+                "vehicle-segmentation-v17.0.17-staged-identity-validation"
             ),
             "mask_format": "data:image/png;base64",
             "mask_semantics": "white_component_black_background",
@@ -6314,7 +6541,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     "error_type": type(exc).__name__,
                     "error": str(exc)[:1600],
                     "analysis_version": (
-                        "vehicle-segmentation-v17.0.16b-multicomponent-threshold-fix"
+                        "vehicle-segmentation-v17.0.17-staged-identity-validation"
                     ),
                 },
             },
@@ -6356,7 +6583,7 @@ def start_vehicle_component_analysis(
             "result": None,
             "error": None,
             "analysis_version": (
-                "vehicle-segmentation-v17.0.16b-multicomponent-threshold-fix"
+                "vehicle-segmentation-v17.0.17-staged-identity-validation"
             ),
         }
 
@@ -6374,7 +6601,7 @@ def start_vehicle_component_analysis(
             f"/v1/vehicle/analyze-components/status/{job_id}"
         ),
         "analysis_version": (
-            "vehicle-segmentation-v17.0.16b-multicomponent-threshold-fix"
+            "vehicle-segmentation-v17.0.17-staged-identity-validation"
         ),
     }
 
@@ -6472,7 +6699,7 @@ def snap_vehicle_polygon_points(
         ),
         "snap_radius": payload.snap_radius,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.16b-multicomponent-threshold-fix"
+            "vehicle-segmentation-v17.0.17-staged-identity-validation"
         ),
     }
 
@@ -6684,7 +6911,7 @@ def refine_vehicle_component(payload: ComponentRefineRequest):
         "requires_review": diagnostics.get("refinement_status") != "refined",
         "refinement": diagnostics,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.16b-multicomponent-threshold-fix"
+            "vehicle-segmentation-v17.0.17-staged-identity-validation"
         ),
     }
 
@@ -6708,7 +6935,7 @@ def analyze_vehicle_components_sync_disabled(
                 "/v1/vehicle/analyze-components/status/{job_id}"
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.16b-multicomponent-threshold-fix"
+                "vehicle-segmentation-v17.0.17-staged-identity-validation"
             ),
         },
     )
@@ -6791,7 +7018,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v17.0.16b-multicomponent-threshold-fix",
+        "prompt_version": "damage-v17.0.17-staged-identity-validation",
         "result_kind": "full_frame_jpeg",
         "full_frame_guard": full_frame_diagnostics,
     }
@@ -6800,7 +7027,7 @@ async def edit_damage(
 @app.post("/v1/damage/edit-base64")
 def edit_damage_base64(payload: DamageEditBase64Request):
     """
-    V17.0.16b Multicomponent Threshold Fix
+    V17.0.17 Staged Identity Validation
 
     - con maschera manuale: foto completa + perimetro reale + prompt naturale,
       output diretto del modello e validazione anti-cambio-auto;
@@ -7012,58 +7239,129 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                     "mock": True,
                 }
             else:
-                generated_bytes = call_openai_image_edit(
-                    source,
-                    api_mask,
-                    strict_identity_prompt,
-                    payload.output_quality,
-                )
+                generation_attempts: list[dict[str, object]] = []
+                result_bytes = b""
+                result_diagnostics: dict[str, object] = {}
+                identity_validation: dict[str, object] = {
+                    "passed": False,
+                }
 
-                if has_manual_mask:
-                    result_bytes, result_diagnostics = (
-                        validate_hybrid_guided_result(
-                            source=source,
-                            candidate_bytes=generated_bytes,
-                            guided_mask=guided_mask,
-                        )
+                current_prompt = strict_identity_prompt
+                max_attempts = 2
+
+                for attempt_number in range(1, max_attempts + 1):
+                    generated_bytes = call_openai_image_edit(
+                        source,
+                        api_mask,
+                        current_prompt,
+                        payload.output_quality,
                     )
 
-                    locality_validation = validate_deformation_locality(
+                    if has_manual_mask:
+                        candidate_bytes, candidate_diagnostics = (
+                            validate_hybrid_guided_result(
+                                source=source,
+                                candidate_bytes=generated_bytes,
+                                guided_mask=guided_mask,
+                            )
+                        )
+
+                        locality_validation = validate_deformation_locality(
                             source=source,
-                            candidate_bytes=result_bytes,
+                            candidate_bytes=candidate_bytes,
                             guided_mask=guided_mask,
                             area_percent=area_percent,
                             severity_percent=severity_percent,
                             selected_components=selected_components,
                         )
-                    result_diagnostics.update(locality_validation)
+                        candidate_diagnostics.update(
+                            locality_validation
+                        )
 
-                    protected_validation = (
-                        validate_protected_components_unchanged(
+                        protected_validation = (
+                            validate_protected_components_unchanged(
+                                source=source,
+                                candidate_bytes=candidate_bytes,
+                                protected_masks_base64=(
+                                    payload.protected_component_masks_base64
+                                ),
+                            )
+                        )
+                        candidate_diagnostics.update(
+                            protected_validation
+                        )
+                    else:
+                        candidate_bytes, candidate_diagnostics = (
+                            lightweight_full_frame_validation(
+                                source=source,
+                                candidate_bytes=generated_bytes,
+                            )
+                        )
+                        candidate_diagnostics.update({
+                            "direct_model_output_used": True,
+                            "post_composite_applied": False,
+                            "hybrid_result_validation_passed": False,
+                            "manual_mask_missing": True,
+                            "protected_components_validation_applied": False,
+                        })
+
+                    identity_validation = (
+                        call_openai_identity_validation(
                             source=source,
-                            candidate_bytes=result_bytes,
-                            protected_masks_base64=(
-                                payload.protected_component_masks_base64
-                            ),
+                            candidate_bytes=candidate_bytes,
+                            selected_components=selected_components,
                         )
                     )
-                    result_diagnostics.update(protected_validation)
-                else:
-                    # Senza perimetro non possiamo misurare in modo affidabile
-                    # le modifiche fuori componente; controlliamo solo il full frame.
-                    result_bytes, result_diagnostics = (
-                        lightweight_full_frame_validation(
-                            source=source,
-                            candidate_bytes=generated_bytes,
-                        )
-                    )
-                    result_diagnostics.update({
-                        "direct_model_output_used": True,
-                        "post_composite_applied": False,
-                        "hybrid_result_validation_passed": False,
-                        "manual_mask_missing": True,
-                        "protected_components_validation_applied": False,
+
+                    generation_attempts.append({
+                        "attempt": attempt_number,
+                        "identity_validation": identity_validation,
                     })
+
+                    print(
+                        "[IDENTITY VALIDATION RESULT]",
+                        {
+                            "diagnostic_id": request_diagnostic_id,
+                            "attempt": attempt_number,
+                            "validation": identity_validation,
+                        },
+                        flush=True,
+                    )
+
+                    if bool(identity_validation.get("passed")):
+                        result_bytes = candidate_bytes
+                        result_diagnostics = candidate_diagnostics
+                        result_diagnostics.update({
+                            "identity_validation": identity_validation,
+                            "identity_validation_passed": True,
+                            "generation_attempt_used": attempt_number,
+                            "generation_attempts": generation_attempts,
+                        })
+                        break
+
+                    if attempt_number < max_attempts:
+                        current_prompt = build_retry_prompt(
+                            strict_identity_prompt,
+                            identity_validation,
+                        )
+
+                if not result_bytes:
+                    raise HTTPException(
+                        status_code=422,
+                        detail={
+                            "message": (
+                                "La simulazione non ha superato i controlli "
+                                "di identità del veicolo dopo due tentativi."
+                            ),
+                            "action": (
+                                "Ridurre l'area del danno oppure selezionare "
+                                "meno componenti e riprovare."
+                            ),
+                            "identity_validation_failed": True,
+                            "attempts": generation_attempts,
+                            "diagnostic_id": request_diagnostic_id,
+                        },
+                    )
 
             return {
                 "job_id": job_id,
@@ -7076,7 +7374,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 ).decode("ascii"),
                 "mime_type": "image/jpeg",
                 "prompt_version": (
-                    "damage-v17.0.16b-multicomponent-threshold-fix"
+                    "damage-v17.0.17-staged-identity-validation"
                 ),
                 "result_kind": "full_frame_jpeg",
                 "deformation_type": payload.deformation_type,
@@ -7091,7 +7389,16 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 "post_composite_applied": False,
                 "user_instructions_used": True,
                 "strict_vehicle_identity_prompt": True,
-            "diagnostic_id": request_diagnostic_id,
+                "staged_identity_validation": True,
+                "maximum_generation_attempts": 2,
+                "identity_validation_passed": True,
+                "generation_attempt_used": (
+                    result_diagnostics.get("generation_attempt_used")
+                ),
+                "identity_validation": (
+                    result_diagnostics.get("identity_validation")
+                ),
+                "diagnostic_id": request_diagnostic_id,
                 "protected_components": payload.protected_components,
                 "protected_components_prompt_applied": True,
                 "deformation_quality_prompt_applied": True,
@@ -7391,7 +7698,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
             "area_percent": area_percent,
             "result_base64": base64.b64encode(result_bytes).decode("ascii"),
             "mime_type": "image/jpeg",
-            "prompt_version": "damage-v17.0.16b-multicomponent-threshold-fix",
+            "prompt_version": "damage-v17.0.17-staged-identity-validation",
             "result_kind": "full_frame_jpeg",
             "full_frame_guard": full_frame_diagnostics,
             "deformation_type": payload.deformation_type,
