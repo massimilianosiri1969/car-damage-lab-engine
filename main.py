@@ -65,13 +65,13 @@ ALLOWED_ORIGINS = [
 ]
 
 print(
-    "=== CAR DAMAGE LAB BACKEND V17.0.23 IMAGEDRAW HOTFIX ===",
+    "=== CAR DAMAGE LAB BACKEND V17.0.25 PLATE AND TAILLIGHT LOCK ===",
     flush=True,
 )
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.7.0.23",
+    version="1.7.0.25",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -179,7 +179,7 @@ class DamageEditBase64Request(BaseModel):
         ge=0.0,
         le=6.0,
     )
-    identity_color_correction: bool = True
+    identity_color_correction: bool = False
 
 
 def resolve_selected_components(
@@ -1838,8 +1838,8 @@ def lightweight_full_frame_validation(
     diagnostics = {
         "result_is_full_frame": True,
         "result_size": list(candidate.size),
-        "direct_model_output_used": True,
-        "post_composite_applied": False,
+        "direct_model_output_used": False,
+        "post_composite_applied": True,
         "lightweight_validation": True,
     }
 
@@ -2780,8 +2780,9 @@ Forbidden:
 - converting it into a lamp from another make or model;
 - damaging the opposite rear light unless the force physically reaches it.
 
-The light may be broken, but it must still be unmistakably the same original
-light assembly from this exact vehicle.
+The light may crack or lose internal lens fragments, but its outer silhouette,
+size, orientation and mounting footprint must remain exactly the same as in the
+source photograph. Do not bend, shrink, stretch or redesign the lamp housing.
 """.strip()
     else:
         rear_light_rule = """
@@ -3522,8 +3523,8 @@ def validate_hybrid_guided_result(
             4,
         ),
         "black_ratio": round(black_ratio, 4),
-        "direct_model_output_used": True,
-        "post_composite_applied": False,
+        "direct_model_output_used": False,
+        "post_composite_applied": True,
         "hybrid_result_validation_passed": True,
     }
     return output.getvalue(), diagnostics
@@ -3613,6 +3614,8 @@ IDENTITY_REGION_TYPES = {
     "model_badge",
     "trim_badge",
     "visible_brand_text",
+    "left_tail_light",
+    "right_tail_light",
 }
 
 
@@ -3646,7 +3649,7 @@ def normalize_identity_regions(
             continue
 
         # Conserviamo solo rilevamenti con una confidenza ragionevole.
-        if confidence < 0.45:
+        if confidence < 0.35:
             continue
 
         normalized.append({
@@ -3711,7 +3714,7 @@ def call_openai_identity_analysis(
         return []
 
     image_data_url = image_to_data_url(source)
-    model = os.getenv("OPENAI_VISION_MODEL", "gpt-4.1-mini")
+    model = os.getenv("OPENAI_IDENTITY_MODEL", "gpt-4.1")
     client = OpenAI(api_key=api_key)
 
     prompt = """
@@ -3727,7 +3730,9 @@ Return ONLY valid JSON:
         "manufacturer_emblem",
         "model_badge",
         "trim_badge",
-        "visible_brand_text"
+        "visible_brand_text",
+        "left_tail_light",
+        "right_tail_light"
       ],
       "confidence": number from 0 to 1,
       "text": readable text when present, otherwise "",
@@ -3746,7 +3751,9 @@ Rules:
 - Use tight boxes around the exact visible element.
 - Detect the actual license plate, manufacturer emblem, model name badge,
   trim badge and any visible brand/model text on the vehicle.
-- Do not include lamps, windows, body panels, reflections or background.
+- Also detect the complete outer bounding box of each visible rear light:
+  left_tail_light and right_tail_light.
+- Do not include windows, body panels, reflections or background.
 - Do not invent elements that are not visible.
 - A damaged or tilted element must still be located.
 - Return JSON only.
@@ -3803,6 +3810,131 @@ Rules:
         return []
 
 
+def split_identity_regions(
+    regions: list[dict[str, object]],
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    hard_identity_types = {
+        "license_plate",
+        "manufacturer_emblem",
+        "model_badge",
+        "trim_badge",
+        "visible_brand_text",
+    }
+    tail_light_types = {
+        "left_tail_light",
+        "right_tail_light",
+    }
+
+    hard_regions = [
+        region
+        for region in regions
+        if str(region.get("type", "")).lower() in hard_identity_types
+    ]
+    tail_light_regions = [
+        region
+        for region in regions
+        if str(region.get("type", "")).lower() in tail_light_types
+    ]
+    return hard_regions, tail_light_regions
+
+
+def filter_relevant_tail_light_regions(
+    regions: list[dict[str, object]],
+    selected_components: list[str],
+) -> list[dict[str, object]]:
+    selected = {
+        str(item).strip().lower()
+        for item in selected_components or []
+    }
+
+    wants_left = bool(selected & {
+        "left_tail_light",
+        "rear_light_left",
+        "tail_light_left",
+        "rear_light",
+        "tail_light",
+    })
+    wants_right = bool(selected & {
+        "right_tail_light",
+        "rear_light_right",
+        "tail_light_right",
+    })
+
+    relevant: list[dict[str, object]] = []
+    for region in regions:
+        region_type = str(region.get("type", "")).strip().lower()
+        if region_type == "left_tail_light" and wants_left:
+            relevant.append(region)
+        elif region_type == "right_tail_light" and wants_right:
+            relevant.append(region)
+
+    return relevant
+
+
+def build_tail_light_geometry_mask(
+    regions: list[dict[str, object]],
+    target_size: tuple[int, int],
+    padding_percent: float = 0.5,
+) -> Image.Image | None:
+    """
+    Crea una maschera della sagoma esterna del fanale.
+    La zona viene esclusa dalla rigenerazione geometrica, poi una porzione
+    interna più piccola resta modificabile per consentire crepe/rotture.
+    """
+    if not regions:
+        return None
+
+    width, height = target_size
+    outer = Image.new("L", target_size, 0)
+    inner = Image.new("L", target_size, 0)
+    outer_draw = ImageDraw.Draw(outer)
+    inner_draw = ImageDraw.Draw(inner)
+
+    base_pad_x = int(round(width * max(0.0, padding_percent) / 100.0))
+    base_pad_y = int(round(height * max(0.0, padding_percent) / 100.0))
+
+    for region in regions:
+        box = region["bounding_box"]
+        x1 = int(round(width * int(box["x1"]) / 1000.0))
+        y1 = int(round(height * int(box["y1"]) / 1000.0))
+        x2 = int(round(width * int(box["x2"]) / 1000.0))
+        y2 = int(round(height * int(box["y2"]) / 1000.0))
+
+        x1 = max(0, x1 - base_pad_x)
+        y1 = max(0, y1 - base_pad_y)
+        x2 = min(width, x2 + base_pad_x)
+        y2 = min(height, y2 + base_pad_y)
+
+        outer_draw.rounded_rectangle(
+            [x1, y1, x2, y2],
+            radius=max(2, min(12, (x2 - x1) // 12)),
+            fill=255,
+        )
+
+        inset_x = max(2, int(round((x2 - x1) * 0.16)))
+        inset_y = max(2, int(round((y2 - y1) * 0.18)))
+        ix1 = min(x2 - 1, x1 + inset_x)
+        iy1 = min(y2 - 1, y1 + inset_y)
+        ix2 = max(ix1 + 1, x2 - inset_x)
+        iy2 = max(iy1 + 1, y2 - inset_y)
+
+        inner_draw.rounded_rectangle(
+            [ix1, iy1, ix2, iy2],
+            radius=max(1, min(8, (ix2 - ix1) // 14)),
+            fill=255,
+        )
+
+    outer_arr = mask_to_binary(outer)
+    inner_arr = mask_to_binary(inner)
+
+    # Protegge il bordo/sagoma esterna; l'interno resta editabile.
+    ring = cv2.bitwise_and(
+        outer_arr,
+        cv2.bitwise_not(inner_arr),
+    )
+    return Image.fromarray(ring, mode="L")
+
+
 def build_identity_protect_mask(
     regions: list[dict[str, object]],
     target_size: tuple[int, int],
@@ -3818,10 +3950,37 @@ def build_identity_protect_mask(
     for region in regions:
         box = region["bounding_box"]
 
-        x1 = int(round(width * int(box["x1"]) / 1000.0)) - pad_x
-        y1 = int(round(height * int(box["y1"]) / 1000.0)) - pad_y
-        x2 = int(round(width * int(box["x2"]) / 1000.0)) + pad_x
-        y2 = int(round(height * int(box["y2"]) / 1000.0)) + pad_y
+        region_type = str(region.get("type", "")).strip().lower()
+
+        type_padding_multiplier = {
+            "license_plate": 1.9,
+            "manufacturer_emblem": 2.3,
+            "model_badge": 2.2,
+            "trim_badge": 2.2,
+            "visible_brand_text": 2.0,
+            "left_tail_light": 1.5,
+            "right_tail_light": 1.5,
+        }.get(region_type, 1.5)
+
+        region_pad_x = int(round(pad_x * type_padding_multiplier))
+        region_pad_y = int(round(pad_y * type_padding_multiplier))
+
+        x1 = (
+            int(round(width * int(box["x1"]) / 1000.0))
+            - region_pad_x
+        )
+        y1 = (
+            int(round(height * int(box["y1"]) / 1000.0))
+            - region_pad_y
+        )
+        x2 = (
+            int(round(width * int(box["x2"]) / 1000.0))
+            + region_pad_x
+        )
+        y2 = (
+            int(round(height * int(box["y2"]) / 1000.0))
+            + region_pad_y
+        )
 
         x1 = max(0, min(width - 1, x1))
         y1 = max(0, min(height - 1, y1))
@@ -3911,21 +4070,11 @@ def preserve_identity_pixels(
         )
         identity_pixels = int((identity_binary > 0).sum())
 
-        # Bordo netto al centro e feather minimo sul perimetro.
+        # Ripristino rigido: targa, stemma e badge devono restare
+        # pixel-identici all'originale. Nessun feather che possa riscrivere
+        # lettere, loghi o bordi.
         hard = identity_binary > 0
-        feather = cv2.GaussianBlur(
-            identity_binary,
-            (0, 0),
-            sigmaX=1.2,
-        ).astype(np.float32) / 255.0
-        feather = feather[:, :, None]
-
-        composite = (
-            source_array.astype(np.float32) * feather
-            + candidate_array.astype(np.float32) * (1.0 - feather)
-        )
-        composite[hard] = source_array[hard]
-        candidate_array = np.clip(composite, 0, 255).astype(np.uint8)
+        candidate_array[hard] = source_array[hard]
 
     output = io.BytesIO()
     Image.fromarray(candidate_array, mode="RGB").save(
@@ -3941,10 +4090,11 @@ def preserve_identity_pixels(
         "identity_protected_pixels": identity_pixels,
         "paint_color_correction_applied": color_corrected,
         "identity_composite_strategy": (
-            "dynamic_original_pixel_restore"
+            "hard_exact_original_pixel_restore"
             if identity_pixels > 0
             else "none"
         ),
+        "identity_pixels_exactly_restored": identity_pixels > 0,
     }
 
 
@@ -3965,7 +4115,7 @@ def analyze_vehicle_identity(
 
     return {
         "status": "completed",
-        "version": "1.7.0.23",
+        "version": "1.7.0.25",
         "regions": regions,
         "region_count": len(regions),
         "dynamic_identity_protection": True,
@@ -4015,8 +4165,8 @@ def root():
 def get_backend_version() -> dict[str, object]:
     return {
         "service": "Car Damage Lab Engine",
-        "version": "1.7.0.23",
-        "prompt_version": "damage-v17.0.23-imagedraw-hotfix",
+        "version": "1.7.0.25",
+        "prompt_version": "damage-v17.0.25-plate-and-taillight-lock",
         "multicomponent_release": True,
         "generic_body_panel_filter": True,
         "fragile_rear_components": True,
@@ -4029,6 +4179,14 @@ def get_backend_version() -> dict[str, object]:
         "paint_color_correction": True,
         "identity_analysis_endpoint": "/v1/vehicle/analyze-identity",
         "imagedraw_hotfix": True,
+        "conservative_identity_guard": True,
+        "hard_identity_pixel_restore": True,
+        "conservative_component_composite": True,
+        "default_color_correction_disabled": True,
+        "identity_model": "gpt-4.1",
+        "plate_hard_restore": True,
+        "taillight_outer_geometry_lock": True,
+        "post_composite_result_forced": True,
     }
 
 
@@ -4200,7 +4358,7 @@ def _replicate_json_request(
             status_code=500,
             detail={
                 "message": "REPLICATE_API_TOKEN non configurato su Render.",
-                "analysis_version": "vehicle-segmentation-v17.0.23-imagedraw-hotfix",
+                "analysis_version": "vehicle-segmentation-v17.0.25-plate-and-taillight-lock",
             },
         )
 
@@ -4243,7 +4401,7 @@ def _replicate_json_request(
                 "http_status": exc.code,
                 "request_url": url,
                 "replicate_detail": error_body[:2000],
-                "analysis_version": "vehicle-segmentation-v17.0.23-imagedraw-hotfix",
+                "analysis_version": "vehicle-segmentation-v17.0.25-plate-and-taillight-lock",
             },
         ) from exc
     except Exception as exc:
@@ -4252,7 +4410,7 @@ def _replicate_json_request(
             detail={
                 "message": "Connessione a Replicate non riuscita.",
                 "error": f"{type(exc).__name__}: {str(exc)}"[:1200],
-                "analysis_version": "vehicle-segmentation-v17.0.23-imagedraw-hotfix",
+                "analysis_version": "vehicle-segmentation-v17.0.25-plate-and-taillight-lock",
             },
         ) from exc
 
@@ -5147,7 +5305,7 @@ def _create_replicate_prediction(
                 "Limite Replicate ancora attivo dopo diversi tentativi."
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.23-imagedraw-hotfix"
+                "vehicle-segmentation-v17.0.25-plate-and-taillight-lock"
             ),
         },
     )
@@ -6199,7 +6357,7 @@ def smart_polygon_component_payload(
         "smooth_polygon": smooth_polygon,
         "feather_radius": feather_radius,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.23-imagedraw-hotfix"
+            "vehicle-segmentation-v17.0.25-plate-and-taillight-lock"
         ),
     }
 
@@ -6523,7 +6681,7 @@ def normalize_vehicle_analysis(
         "manual_polygon_required_only_for_selected_components": True,
         "segmentation_strategy": "manual_smart_polygon",
         "analysis_version": (
-            "vehicle-segmentation-v17.0.23-imagedraw-hotfix"
+            "vehicle-segmentation-v17.0.25-plate-and-taillight-lock"
         ),
     }
 
@@ -6668,7 +6826,7 @@ Bounding-box rules:
                 "model": configured_model,
                 "primary_error": primary_message[:800],
                 "fallback_error": fallback_message[:800],
-                "analysis_version": "vehicle-segmentation-v17.0.23-imagedraw-hotfix",
+                "analysis_version": "vehicle-segmentation-v17.0.25-plate-and-taillight-lock",
             },
         ) from fallback_exc
 
@@ -6823,7 +6981,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     ),
                     "raw_component_count": len(raw_components),
                     "analysis_version": (
-                        "vehicle-segmentation-v17.0.23-imagedraw-hotfix"
+                        "vehicle-segmentation-v17.0.25-plate-and-taillight-lock"
                     ),
                 },
             )
@@ -6836,7 +6994,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                 "gpt-4.1-mini",
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.23-imagedraw-hotfix"
+                "vehicle-segmentation-v17.0.25-plate-and-taillight-lock"
             ),
             "mask_format": "data:image/png;base64",
             "mask_semantics": "white_component_black_background",
@@ -6884,7 +7042,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     "error_type": type(exc).__name__,
                     "error": str(exc)[:1600],
                     "analysis_version": (
-                        "vehicle-segmentation-v17.0.23-imagedraw-hotfix"
+                        "vehicle-segmentation-v17.0.25-plate-and-taillight-lock"
                     ),
                 },
             },
@@ -6926,7 +7084,7 @@ def start_vehicle_component_analysis(
             "result": None,
             "error": None,
             "analysis_version": (
-                "vehicle-segmentation-v17.0.23-imagedraw-hotfix"
+                "vehicle-segmentation-v17.0.25-plate-and-taillight-lock"
             ),
         }
 
@@ -6944,7 +7102,7 @@ def start_vehicle_component_analysis(
             f"/v1/vehicle/analyze-components/status/{job_id}"
         ),
         "analysis_version": (
-            "vehicle-segmentation-v17.0.23-imagedraw-hotfix"
+            "vehicle-segmentation-v17.0.25-plate-and-taillight-lock"
         ),
     }
 
@@ -7042,7 +7200,7 @@ def snap_vehicle_polygon_points(
         ),
         "snap_radius": payload.snap_radius,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.23-imagedraw-hotfix"
+            "vehicle-segmentation-v17.0.25-plate-and-taillight-lock"
         ),
     }
 
@@ -7254,7 +7412,7 @@ def refine_vehicle_component(payload: ComponentRefineRequest):
         "requires_review": diagnostics.get("refinement_status") != "refined",
         "refinement": diagnostics,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.23-imagedraw-hotfix"
+            "vehicle-segmentation-v17.0.25-plate-and-taillight-lock"
         ),
     }
 
@@ -7278,7 +7436,7 @@ def analyze_vehicle_components_sync_disabled(
                 "/v1/vehicle/analyze-components/status/{job_id}"
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.23-imagedraw-hotfix"
+                "vehicle-segmentation-v17.0.25-plate-and-taillight-lock"
             ),
         },
     )
@@ -7361,7 +7519,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v17.0.23-imagedraw-hotfix",
+        "prompt_version": "damage-v17.0.25-plate-and-taillight-lock",
         "result_kind": "full_frame_jpeg",
         "full_frame_guard": full_frame_diagnostics,
     }
@@ -7370,7 +7528,7 @@ async def edit_damage(
 @app.post("/v1/damage/edit-base64")
 def edit_damage_base64(payload: DamageEditBase64Request):
     """
-    V17.0.23 ImageDraw Hotfix
+    V17.0.25 Plate and Taillight Lock
 
     - con maschera manuale: foto completa + perimetro reale + prompt naturale,
       output diretto del modello e validazione anti-cambio-auto;
@@ -7493,13 +7651,32 @@ def edit_damage_base64(payload: DamageEditBase64Request):
             ):
                 identity_regions = call_openai_identity_analysis(source)
 
+            hard_identity_regions, detected_tail_light_regions = (
+                split_identity_regions(identity_regions)
+            )
+            relevant_tail_light_regions = (
+                filter_relevant_tail_light_regions(
+                    detected_tail_light_regions,
+                    selected_components,
+                )
+            )
+
             identity_protect_mask = (
                 build_identity_protect_mask(
-                    identity_regions,
+                    hard_identity_regions,
                     source.size,
                     payload.identity_detection_padding_percent,
                 )
-                if identity_regions
+                if hard_identity_regions
+                else None
+            )
+
+            tail_light_geometry_mask = (
+                build_tail_light_geometry_mask(
+                    relevant_tail_light_regions,
+                    source.size,
+                )
+                if relevant_tail_light_regions
                 else None
             )
 
@@ -7520,6 +7697,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 [
                     explicit_protect_mask,
                     identity_protect_mask,
+                    tail_light_geometry_mask,
                 ],
             )
 
@@ -7535,7 +7713,16 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                     "dynamic_identity_region_count": len(
                         identity_regions
                     ),
+                    "hard_identity_region_count": len(
+                        hard_identity_regions
+                    ),
+                    "tail_light_geometry_region_count": len(
+                        relevant_tail_light_regions
+                    ),
                     "dynamic_identity_protection_applied": True,
+                    "tail_light_geometry_lock_applied": (
+                        tail_light_geometry_mask is not None
+                    ),
                     "identity_protect_pixels": int(
                         (
                             mask_to_binary(
@@ -7674,8 +7861,8 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                     "result_is_full_frame": True,
                     "original_size": list(source.size),
                     "result_size": list(source.size),
-                    "direct_model_output_used": True,
-                    "post_composite_applied": False,
+                    "direct_model_output_used": False,
+                    "post_composite_applied": True,
                     "hybrid_result_validation_passed": True,
                     "mock": True,
                 }
@@ -7688,13 +7875,33 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 )
 
                 if has_manual_mask:
+                    conservative_composite_bytes = (
+                        smart_component_composite(
+                            source=source,
+                            generated_bytes=generated_bytes,
+                            source_mask=guided_mask,
+                            protect_mask=effective_protect_mask,
+                            expansion_px=0,
+                            feather_px=2,
+                        )
+                    )
+
                     result_bytes, result_diagnostics = (
                         validate_hybrid_guided_result(
                             source=source,
-                            candidate_bytes=generated_bytes,
+                            candidate_bytes=conservative_composite_bytes,
                             guided_mask=guided_mask,
                         )
                     )
+                    result_diagnostics.update({
+                        "conservative_component_composite_applied": True,
+                        "identity_regions_hard_excluded": (
+                            identity_protect_mask is not None
+                        ),
+                        "paint_color_correction_skipped_by_default": (
+                            not payload.identity_color_correction
+                        ),
+                    })
 
                     locality_validation = validate_deformation_locality(
                             source=source,
@@ -7757,7 +7964,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                     result_diagnostics.update({
                         "identity_regions": identity_regions,
                         "identity_region_count": len(identity_regions),
-                        "direct_model_output_used": True,
+                        "direct_model_output_used": False,
                         "post_composite_applied": (
                             identity_diagnostics[
                                 "dynamic_identity_composite_applied"
@@ -7779,7 +7986,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 ).decode("ascii"),
                 "mime_type": "image/jpeg",
                 "prompt_version": (
-                    "damage-v17.0.23-imagedraw-hotfix"
+                    "damage-v17.0.25-plate-and-taillight-lock"
                 ),
                 "result_kind": "full_frame_jpeg",
                 "deformation_type": payload.deformation_type,
@@ -7790,8 +7997,8 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 "mask_used_as_api_edit_region": has_manual_mask,
                 "mask_diagnostics": mask_diagnostics,
                 "result_diagnostics": result_diagnostics,
-                "composite_strategy": "none_direct_model_output",
-                "post_composite_applied": False,
+                "composite_strategy": "hard_identity_restore_and_taillight_geometry_lock",
+                "post_composite_applied": True,
                 "user_instructions_used": True,
                 "strict_vehicle_identity_prompt": True,
             "diagnostic_id": request_diagnostic_id,
@@ -7837,8 +8044,16 @@ def edit_damage_base64(payload: DamageEditBase64Request):
             ),
             "multicomponent_validation_applied": True,
             "multicomponent_release_mode": True,
-            "backend_version": "1.7.0.23",
+            "backend_version": "1.7.0.25",
             "imagedraw_hotfix_applied": True,
+            "conservative_identity_guard_applied": True,
+            "hard_identity_pixel_restore_applied": True,
+            "conservative_component_composite_enabled": True,
+            "plate_hard_restore_applied": True,
+            "taillight_outer_geometry_lock_applied": (
+                tail_light_geometry_mask is not None
+            ),
+            "post_composite_result_forced": True,
             "vehicle_identity_lock_applied": True,
             "rear_light_geometry_lock_applied": True,
             "badge_logo_plate_lock_applied": True,
@@ -8137,7 +8352,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
             "area_percent": area_percent,
             "result_base64": base64.b64encode(result_bytes).decode("ascii"),
             "mime_type": "image/jpeg",
-            "prompt_version": "damage-v17.0.23-imagedraw-hotfix",
+            "prompt_version": "damage-v17.0.25-plate-and-taillight-lock",
             "result_kind": "full_frame_jpeg",
             "full_frame_guard": full_frame_diagnostics,
             "deformation_type": payload.deformation_type,
