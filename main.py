@@ -66,7 +66,7 @@ ALLOWED_ORIGINS = [
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.7.0.13",
+    version="1.7.0.14",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -80,6 +80,14 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+
+class ImageNormalizeRequest(BaseModel):
+    image_base64: str
+    output_format: Literal["jpeg", "png"] = "jpeg"
+    max_side: int = Field(default=1600, ge=512, le=2400)
+    jpeg_quality: int = Field(default=94, ge=80, le=98)
 
 
 class DamageEditBase64Request(BaseModel):
@@ -1585,6 +1593,58 @@ def _open_image_bytes(raw: bytes, mode: str) -> Image.Image | None:
 
     return None
 
+
+
+
+def normalize_image_to_base64(
+    image_base64: str,
+    output_format: str = "jpeg",
+    max_side: int = 1600,
+    jpeg_quality: int = 94,
+) -> dict[str, object]:
+    """Decodifica JPEG/PNG/HEIC/HEIF e restituisce un formato browser-safe."""
+    image = decode_base64_image(image_base64, "image_base64", "RGB")
+    original_size = image.size
+    original_format = getattr(image, "format", None) or "UNKNOWN"
+
+    image, _, scale = resize_in_place_for_memory(image, max_side=max_side)
+    output = io.BytesIO()
+
+    if output_format == "png":
+        mime_type = "image/png"
+        normalized_format = "PNG"
+        image.save(output, format="PNG", optimize=False)
+    else:
+        mime_type = "image/jpeg"
+        normalized_format = "JPEG"
+        image.save(
+            output,
+            format="JPEG",
+            quality=jpeg_quality,
+            subsampling=0,
+            optimize=False,
+        )
+
+    encoded = base64.b64encode(output.getvalue()).decode("ascii")
+    result = {
+        "normalized_image_base64": f"data:{mime_type};base64,{encoded}",
+        "original_format": str(original_format).upper(),
+        "normalized_format": normalized_format,
+        "original_width": int(original_size[0]),
+        "original_height": int(original_size[1]),
+        "width": int(image.size[0]),
+        "height": int(image.size[1]),
+        "processing_scale": round(scale, 6),
+        "heic_support_enabled": HEIC_SUPPORT_ENABLED,
+    }
+
+    try:
+        image.close()
+    except Exception:
+        pass
+    output.close()
+    gc.collect()
+    return result
 
 
 def _looks_like_heic(raw: bytes) -> bool:
@@ -3155,6 +3215,37 @@ def call_openai_image_edit(
         gc.collect()
 
 
+
+@app.post("/v1/image/normalize")
+def normalize_image(payload: ImageNormalizeRequest) -> dict[str, object]:
+    """V17.0.14: normalizza HEIC/HEIF/JPEG/PNG per Base44 e browser."""
+    try:
+        result = normalize_image_to_base64(
+            image_base64=payload.image_base64,
+            output_format=payload.output_format,
+            max_side=payload.max_side,
+            jpeg_quality=payload.jpeg_quality,
+        )
+        result.update({
+            "status": "completed",
+            "version": "v17.0.14",
+            "memory_optimized": True,
+        })
+        return result
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "message": "Impossibile normalizzare la fotografia.",
+                "type": type(exc).__name__,
+                "error": str(exc),
+                "heic_support_enabled": HEIC_SUPPORT_ENABLED,
+            },
+        ) from exc
+
+
 @app.get("/")
 def root():
     return {
@@ -3332,7 +3423,7 @@ def _replicate_json_request(
             status_code=500,
             detail={
                 "message": "REPLICATE_API_TOKEN non configurato su Render.",
-                "analysis_version": "vehicle-segmentation-v17.0.13-rear-impact",
+                "analysis_version": "vehicle-segmentation-v17.0.14-heic-normalize",
             },
         )
 
@@ -3375,7 +3466,7 @@ def _replicate_json_request(
                 "http_status": exc.code,
                 "request_url": url,
                 "replicate_detail": error_body[:2000],
-                "analysis_version": "vehicle-segmentation-v17.0.13-rear-impact",
+                "analysis_version": "vehicle-segmentation-v17.0.14-heic-normalize",
             },
         ) from exc
     except Exception as exc:
@@ -3384,7 +3475,7 @@ def _replicate_json_request(
             detail={
                 "message": "Connessione a Replicate non riuscita.",
                 "error": f"{type(exc).__name__}: {str(exc)}"[:1200],
-                "analysis_version": "vehicle-segmentation-v17.0.13-rear-impact",
+                "analysis_version": "vehicle-segmentation-v17.0.14-heic-normalize",
             },
         ) from exc
 
@@ -4279,7 +4370,7 @@ def _create_replicate_prediction(
                 "Limite Replicate ancora attivo dopo diversi tentativi."
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.13-rear-impact"
+                "vehicle-segmentation-v17.0.14-heic-normalize"
             ),
         },
     )
@@ -5331,7 +5422,7 @@ def smart_polygon_component_payload(
         "smooth_polygon": smooth_polygon,
         "feather_radius": feather_radius,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.13-rear-impact"
+            "vehicle-segmentation-v17.0.14-heic-normalize"
         ),
     }
 
@@ -5655,7 +5746,7 @@ def normalize_vehicle_analysis(
         "manual_polygon_required_only_for_selected_components": True,
         "segmentation_strategy": "manual_smart_polygon",
         "analysis_version": (
-            "vehicle-segmentation-v17.0.13-rear-impact"
+            "vehicle-segmentation-v17.0.14-heic-normalize"
         ),
     }
 
@@ -5800,7 +5891,7 @@ Bounding-box rules:
                 "model": configured_model,
                 "primary_error": primary_message[:800],
                 "fallback_error": fallback_message[:800],
-                "analysis_version": "vehicle-segmentation-v17.0.13-rear-impact",
+                "analysis_version": "vehicle-segmentation-v17.0.14-heic-normalize",
             },
         ) from fallback_exc
 
@@ -5955,7 +6046,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     ),
                     "raw_component_count": len(raw_components),
                     "analysis_version": (
-                        "vehicle-segmentation-v17.0.13-rear-impact"
+                        "vehicle-segmentation-v17.0.14-heic-normalize"
                     ),
                 },
             )
@@ -5968,7 +6059,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                 "gpt-4.1-mini",
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.13-rear-impact"
+                "vehicle-segmentation-v17.0.14-heic-normalize"
             ),
             "mask_format": "data:image/png;base64",
             "mask_semantics": "white_component_black_background",
@@ -6016,7 +6107,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     "error_type": type(exc).__name__,
                     "error": str(exc)[:1600],
                     "analysis_version": (
-                        "vehicle-segmentation-v17.0.13-rear-impact"
+                        "vehicle-segmentation-v17.0.14-heic-normalize"
                     ),
                 },
             },
@@ -6058,7 +6149,7 @@ def start_vehicle_component_analysis(
             "result": None,
             "error": None,
             "analysis_version": (
-                "vehicle-segmentation-v17.0.13-rear-impact"
+                "vehicle-segmentation-v17.0.14-heic-normalize"
             ),
         }
 
@@ -6076,7 +6167,7 @@ def start_vehicle_component_analysis(
             f"/v1/vehicle/analyze-components/status/{job_id}"
         ),
         "analysis_version": (
-            "vehicle-segmentation-v17.0.13-rear-impact"
+            "vehicle-segmentation-v17.0.14-heic-normalize"
         ),
     }
 
@@ -6174,7 +6265,7 @@ def snap_vehicle_polygon_points(
         ),
         "snap_radius": payload.snap_radius,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.13-rear-impact"
+            "vehicle-segmentation-v17.0.14-heic-normalize"
         ),
     }
 
@@ -6386,7 +6477,7 @@ def refine_vehicle_component(payload: ComponentRefineRequest):
         "requires_review": diagnostics.get("refinement_status") != "refined",
         "refinement": diagnostics,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.13-rear-impact"
+            "vehicle-segmentation-v17.0.14-heic-normalize"
         ),
     }
 
@@ -6410,7 +6501,7 @@ def analyze_vehicle_components_sync_disabled(
                 "/v1/vehicle/analyze-components/status/{job_id}"
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.13-rear-impact"
+                "vehicle-segmentation-v17.0.14-heic-normalize"
             ),
         },
     )
@@ -6493,7 +6584,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v17.0.13-rear-impact",
+        "prompt_version": "damage-v17.0.14-heic-normalize",
         "result_kind": "full_frame_jpeg",
         "full_frame_guard": full_frame_diagnostics,
     }
@@ -6502,7 +6593,7 @@ async def edit_damage(
 @app.post("/v1/damage/edit-base64")
 def edit_damage_base64(payload: DamageEditBase64Request):
     """
-    V17.0.13 Rear Impact
+    V17.0.14 HEIC Normalize
 
     - con maschera manuale: foto completa + perimetro reale + prompt naturale,
       output diretto del modello e validazione anti-cambio-auto;
@@ -6741,7 +6832,7 @@ Final output rules:
             ).decode("ascii"),
             "mime_type": "image/jpeg",
             "prompt_version": (
-                "damage-v17.0.13-rear-impact"
+                "damage-v17.0.14-heic-normalize"
             ),
             "result_kind": "full_frame_jpeg",
             "deformation_type": payload.deformation_type,
@@ -7052,7 +7143,7 @@ Final output rules:
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v17.0.13-rear-impact",
+        "prompt_version": "damage-v17.0.14-heic-normalize",
         "result_kind": "full_frame_jpeg",
         "full_frame_guard": full_frame_diagnostics,
         "deformation_type": payload.deformation_type,
