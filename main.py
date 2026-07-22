@@ -65,13 +65,13 @@ ALLOWED_ORIGINS = [
 ]
 
 print(
-    "=== CAR DAMAGE LAB BACKEND V17.0.25 PLATE AND TAILLIGHT LOCK ===",
+    "=== CAR DAMAGE LAB BACKEND V17.0.26 WRITABLE ARRAY HOTFIX ===",
     flush=True,
 )
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.7.0.25",
+    version="1.7.0.26",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -4047,8 +4047,16 @@ def preserve_identity_pixels(
             Image.Resampling.LANCZOS,
         )
 
-    source_array = np.asarray(source_rgb, dtype=np.uint8)
-    candidate_array = np.asarray(candidate, dtype=np.uint8)
+    source_array = np.array(
+        source_rgb,
+        dtype=np.uint8,
+        copy=True,
+    )
+    candidate_array = np.array(
+        candidate,
+        dtype=np.uint8,
+        copy=True,
+    )
 
     color_corrected = False
     if apply_color_correction and guided_mask is not None:
@@ -4074,6 +4082,8 @@ def preserve_identity_pixels(
         # pixel-identici all'originale. Nessun feather che possa riscrivere
         # lettere, loghi o bordi.
         hard = identity_binary > 0
+        if not candidate_array.flags.writeable:
+            candidate_array = candidate_array.copy()
         candidate_array[hard] = source_array[hard]
 
     output = io.BytesIO()
@@ -4115,7 +4125,7 @@ def analyze_vehicle_identity(
 
     return {
         "status": "completed",
-        "version": "1.7.0.25",
+        "version": "1.7.0.26",
         "regions": regions,
         "region_count": len(regions),
         "dynamic_identity_protection": True,
@@ -4165,8 +4175,8 @@ def root():
 def get_backend_version() -> dict[str, object]:
     return {
         "service": "Car Damage Lab Engine",
-        "version": "1.7.0.25",
-        "prompt_version": "damage-v17.0.25-plate-and-taillight-lock",
+        "version": "1.7.0.26",
+        "prompt_version": "damage-v17.0.26-writable-array-hotfix",
         "multicomponent_release": True,
         "generic_body_panel_filter": True,
         "fragile_rear_components": True,
@@ -4187,6 +4197,7 @@ def get_backend_version() -> dict[str, object]:
         "plate_hard_restore": True,
         "taillight_outer_geometry_lock": True,
         "post_composite_result_forced": True,
+        "writable_array_hotfix": True,
     }
 
 
@@ -4358,7 +4369,7 @@ def _replicate_json_request(
             status_code=500,
             detail={
                 "message": "REPLICATE_API_TOKEN non configurato su Render.",
-                "analysis_version": "vehicle-segmentation-v17.0.25-plate-and-taillight-lock",
+                "analysis_version": "vehicle-segmentation-v17.0.26-writable-array-hotfix",
             },
         )
 
@@ -4401,7 +4412,7 @@ def _replicate_json_request(
                 "http_status": exc.code,
                 "request_url": url,
                 "replicate_detail": error_body[:2000],
-                "analysis_version": "vehicle-segmentation-v17.0.25-plate-and-taillight-lock",
+                "analysis_version": "vehicle-segmentation-v17.0.26-writable-array-hotfix",
             },
         ) from exc
     except Exception as exc:
@@ -4410,7 +4421,7 @@ def _replicate_json_request(
             detail={
                 "message": "Connessione a Replicate non riuscita.",
                 "error": f"{type(exc).__name__}: {str(exc)}"[:1200],
-                "analysis_version": "vehicle-segmentation-v17.0.25-plate-and-taillight-lock",
+                "analysis_version": "vehicle-segmentation-v17.0.26-writable-array-hotfix",
             },
         ) from exc
 
@@ -5305,7 +5316,7 @@ def _create_replicate_prediction(
                 "Limite Replicate ancora attivo dopo diversi tentativi."
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.25-plate-and-taillight-lock"
+                "vehicle-segmentation-v17.0.26-writable-array-hotfix"
             ),
         },
     )
@@ -6357,7 +6368,7 @@ def smart_polygon_component_payload(
         "smooth_polygon": smooth_polygon,
         "feather_radius": feather_radius,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.25-plate-and-taillight-lock"
+            "vehicle-segmentation-v17.0.26-writable-array-hotfix"
         ),
     }
 
@@ -6681,7 +6692,7 @@ def normalize_vehicle_analysis(
         "manual_polygon_required_only_for_selected_components": True,
         "segmentation_strategy": "manual_smart_polygon",
         "analysis_version": (
-            "vehicle-segmentation-v17.0.25-plate-and-taillight-lock"
+            "vehicle-segmentation-v17.0.26-writable-array-hotfix"
         ),
     }
 
@@ -6826,7 +6837,7 @@ Bounding-box rules:
                 "model": configured_model,
                 "primary_error": primary_message[:800],
                 "fallback_error": fallback_message[:800],
-                "analysis_version": "vehicle-segmentation-v17.0.25-plate-and-taillight-lock",
+                "analysis_version": "vehicle-segmentation-v17.0.26-writable-array-hotfix",
             },
         ) from fallback_exc
 
@@ -6981,7 +6992,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     ),
                     "raw_component_count": len(raw_components),
                     "analysis_version": (
-                        "vehicle-segmentation-v17.0.25-plate-and-taillight-lock"
+                        "vehicle-segmentation-v17.0.26-writable-array-hotfix"
                     ),
                 },
             )
@@ -6994,7 +7005,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                 "gpt-4.1-mini",
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.25-plate-and-taillight-lock"
+                "vehicle-segmentation-v17.0.26-writable-array-hotfix"
             ),
             "mask_format": "data:image/png;base64",
             "mask_semantics": "white_component_black_background",
@@ -7042,7 +7053,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     "error_type": type(exc).__name__,
                     "error": str(exc)[:1600],
                     "analysis_version": (
-                        "vehicle-segmentation-v17.0.25-plate-and-taillight-lock"
+                        "vehicle-segmentation-v17.0.26-writable-array-hotfix"
                     ),
                 },
             },
@@ -7084,7 +7095,7 @@ def start_vehicle_component_analysis(
             "result": None,
             "error": None,
             "analysis_version": (
-                "vehicle-segmentation-v17.0.25-plate-and-taillight-lock"
+                "vehicle-segmentation-v17.0.26-writable-array-hotfix"
             ),
         }
 
@@ -7102,7 +7113,7 @@ def start_vehicle_component_analysis(
             f"/v1/vehicle/analyze-components/status/{job_id}"
         ),
         "analysis_version": (
-            "vehicle-segmentation-v17.0.25-plate-and-taillight-lock"
+            "vehicle-segmentation-v17.0.26-writable-array-hotfix"
         ),
     }
 
@@ -7200,7 +7211,7 @@ def snap_vehicle_polygon_points(
         ),
         "snap_radius": payload.snap_radius,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.25-plate-and-taillight-lock"
+            "vehicle-segmentation-v17.0.26-writable-array-hotfix"
         ),
     }
 
@@ -7412,7 +7423,7 @@ def refine_vehicle_component(payload: ComponentRefineRequest):
         "requires_review": diagnostics.get("refinement_status") != "refined",
         "refinement": diagnostics,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.25-plate-and-taillight-lock"
+            "vehicle-segmentation-v17.0.26-writable-array-hotfix"
         ),
     }
 
@@ -7436,7 +7447,7 @@ def analyze_vehicle_components_sync_disabled(
                 "/v1/vehicle/analyze-components/status/{job_id}"
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.25-plate-and-taillight-lock"
+                "vehicle-segmentation-v17.0.26-writable-array-hotfix"
             ),
         },
     )
@@ -7519,7 +7530,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v17.0.25-plate-and-taillight-lock",
+        "prompt_version": "damage-v17.0.26-writable-array-hotfix",
         "result_kind": "full_frame_jpeg",
         "full_frame_guard": full_frame_diagnostics,
     }
@@ -7528,7 +7539,7 @@ async def edit_damage(
 @app.post("/v1/damage/edit-base64")
 def edit_damage_base64(payload: DamageEditBase64Request):
     """
-    V17.0.25 Plate and Taillight Lock
+    V17.0.26 Writable Array Hotfix
 
     - con maschera manuale: foto completa + perimetro reale + prompt naturale,
       output diretto del modello e validazione anti-cambio-auto;
@@ -7986,7 +7997,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 ).decode("ascii"),
                 "mime_type": "image/jpeg",
                 "prompt_version": (
-                    "damage-v17.0.25-plate-and-taillight-lock"
+                    "damage-v17.0.26-writable-array-hotfix"
                 ),
                 "result_kind": "full_frame_jpeg",
                 "deformation_type": payload.deformation_type,
@@ -8044,7 +8055,8 @@ def edit_damage_base64(payload: DamageEditBase64Request):
             ),
             "multicomponent_validation_applied": True,
             "multicomponent_release_mode": True,
-            "backend_version": "1.7.0.25",
+            "backend_version": "1.7.0.26",
+            "writable_array_hotfix_applied": True,
             "imagedraw_hotfix_applied": True,
             "conservative_identity_guard_applied": True,
             "hard_identity_pixel_restore_applied": True,
@@ -8352,7 +8364,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
             "area_percent": area_percent,
             "result_base64": base64.b64encode(result_bytes).decode("ascii"),
             "mime_type": "image/jpeg",
-            "prompt_version": "damage-v17.0.25-plate-and-taillight-lock",
+            "prompt_version": "damage-v17.0.26-writable-array-hotfix",
             "result_kind": "full_frame_jpeg",
             "full_frame_guard": full_frame_diagnostics,
             "deformation_type": payload.deformation_type,
