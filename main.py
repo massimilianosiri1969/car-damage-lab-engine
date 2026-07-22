@@ -65,13 +65,13 @@ ALLOWED_ORIGINS = [
 ]
 
 print(
-    "=== CAR DAMAGE LAB BACKEND V17.0.20 MULTICOMPONENT RELEASE ===",
+    "=== CAR DAMAGE LAB BACKEND V17.0.21 IDENTITY LOCK ===",
     flush=True,
 )
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.7.0.20",
+    version="1.7.0.21",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -2743,22 +2743,35 @@ Do not crack, displace, shatter, blur or regenerate the protected rear light.
 """.strip()
     elif severe_rear_collision or rear_light_selected:
         rear_light_rule = """
-REAR LIGHT DAMAGE — REQUIRED WHEN PHYSICALLY REACHED
+REAR LIGHT DAMAGE — ORIGINAL GEOMETRY LOCKED
 
 The rear collision is severe enough to affect the rear light mounting area.
 
-The rear light nearest the impact must show physically plausible damage:
-- cracked or partially shattered lens;
-- displaced or tilted housing;
+Damage the exact original rear light already present in the photograph.
+The original outer silhouette, length, height, curvature, colour, lens layout,
+internal graphic signature and relationship with adjacent body panels are
+identity-critical and must remain recognizable.
+
+Allowed damage:
+- cracks inside the original lens surface;
+- partial shattering of the original lens;
+- missing lens fragments while preserving the original housing outline;
+- slight displacement or tilt of the whole original assembly;
 - broken mounting points;
 - partial separation from the body;
-- internal elements visibly misaligned.
+- internal elements misaligned inside the original housing.
 
-Do not leave the affected rear light perfectly intact when the surrounding
-bumper, rear quarter panel or tailgate is heavily crushed around it.
+Forbidden:
+- replacing the light with a different design;
+- making it rounder, shorter, narrower, larger or smaller;
+- inventing a new lamp shape;
+- changing its colour or internal styling;
+- merging it with the bodywork;
+- converting it into a lamp from another make or model;
+- damaging the opposite rear light unless the force physically reaches it.
 
-Preserve its recognizable original design and colour.
-Do not damage the opposite rear light unless the collision force reaches it.
+The light may be broken, but it must still be unmistakably the same original
+light assembly from this exact vehicle.
 """.strip()
     else:
         rear_light_rule = """
@@ -2819,13 +2832,28 @@ physical stress to crack or detach it.
     return f"""
 COLLISION CONSEQUENCES AND IDENTITY PRESERVATION — STRICT
 
-LICENSE PLATE:
+VEHICLE IDENTITY — ABSOLUTE LOCK:
+- preserve the exact same make, model, generation and trim;
+- preserve the exact body architecture, roofline, glass shape and panel layout;
+- preserve every manufacturer emblem, model badge, trim badge and readable text;
+- never replace, redraw or invent logos, badges, lettering or brand symbols;
+- never transform this vehicle into another make or model;
+- damage must alter condition, not identity.
+
+LICENSE PLATE — ABSOLUTE LOCK:
 - preserve the exact original license plate;
-- preserve text, characters, spacing, colour, size and position;
-- do not remove, blur, replace, distort or regenerate it;
+- preserve every character, spacing, font appearance, colour, border and plate type;
+- do not remove, blur, replace, distort, translate or regenerate it;
 - do not invent a different plate;
-- if its mounting panel moves, the plate may move with it, but all characters
-  must remain exactly readable and unchanged.
+- if its mounting panel moves, the entire original plate may move rigidly with
+  that panel, but its content and appearance must remain unchanged.
+
+BADGES AND EMBLEMS — ABSOLUTE LOCK:
+- preserve the exact original manufacturer emblem;
+- preserve the exact original model name and trim lettering;
+- do not substitute any logo or badge from another brand;
+- do not change FIAT into Renault, CLIO, or any other make/model;
+- badges may move rigidly with a deformed panel but must not change identity.
 
 {rear_light_rule}
 
@@ -3612,11 +3640,14 @@ def root():
 def get_backend_version() -> dict[str, object]:
     return {
         "service": "Car Damage Lab Engine",
-        "version": "1.7.0.20",
-        "prompt_version": "damage-v17.0.20-multicomponent-release",
+        "version": "1.7.0.21",
+        "prompt_version": "damage-v17.0.21-identity-lock",
         "multicomponent_release": True,
         "generic_body_panel_filter": True,
         "fragile_rear_components": True,
+        "vehicle_identity_lock": True,
+        "rear_light_geometry_lock": True,
+        "badge_logo_plate_lock": True,
     }
 
 
@@ -3788,7 +3819,7 @@ def _replicate_json_request(
             status_code=500,
             detail={
                 "message": "REPLICATE_API_TOKEN non configurato su Render.",
-                "analysis_version": "vehicle-segmentation-v17.0.20-multicomponent-release",
+                "analysis_version": "vehicle-segmentation-v17.0.21-identity-lock",
             },
         )
 
@@ -3831,7 +3862,7 @@ def _replicate_json_request(
                 "http_status": exc.code,
                 "request_url": url,
                 "replicate_detail": error_body[:2000],
-                "analysis_version": "vehicle-segmentation-v17.0.20-multicomponent-release",
+                "analysis_version": "vehicle-segmentation-v17.0.21-identity-lock",
             },
         ) from exc
     except Exception as exc:
@@ -3840,7 +3871,7 @@ def _replicate_json_request(
             detail={
                 "message": "Connessione a Replicate non riuscita.",
                 "error": f"{type(exc).__name__}: {str(exc)}"[:1200],
-                "analysis_version": "vehicle-segmentation-v17.0.20-multicomponent-release",
+                "analysis_version": "vehicle-segmentation-v17.0.21-identity-lock",
             },
         ) from exc
 
@@ -4735,7 +4766,7 @@ def _create_replicate_prediction(
                 "Limite Replicate ancora attivo dopo diversi tentativi."
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.20-multicomponent-release"
+                "vehicle-segmentation-v17.0.21-identity-lock"
             ),
         },
     )
@@ -5787,7 +5818,7 @@ def smart_polygon_component_payload(
         "smooth_polygon": smooth_polygon,
         "feather_radius": feather_radius,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.20-multicomponent-release"
+            "vehicle-segmentation-v17.0.21-identity-lock"
         ),
     }
 
@@ -6111,7 +6142,7 @@ def normalize_vehicle_analysis(
         "manual_polygon_required_only_for_selected_components": True,
         "segmentation_strategy": "manual_smart_polygon",
         "analysis_version": (
-            "vehicle-segmentation-v17.0.20-multicomponent-release"
+            "vehicle-segmentation-v17.0.21-identity-lock"
         ),
     }
 
@@ -6256,7 +6287,7 @@ Bounding-box rules:
                 "model": configured_model,
                 "primary_error": primary_message[:800],
                 "fallback_error": fallback_message[:800],
-                "analysis_version": "vehicle-segmentation-v17.0.20-multicomponent-release",
+                "analysis_version": "vehicle-segmentation-v17.0.21-identity-lock",
             },
         ) from fallback_exc
 
@@ -6411,7 +6442,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     ),
                     "raw_component_count": len(raw_components),
                     "analysis_version": (
-                        "vehicle-segmentation-v17.0.20-multicomponent-release"
+                        "vehicle-segmentation-v17.0.21-identity-lock"
                     ),
                 },
             )
@@ -6424,7 +6455,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                 "gpt-4.1-mini",
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.20-multicomponent-release"
+                "vehicle-segmentation-v17.0.21-identity-lock"
             ),
             "mask_format": "data:image/png;base64",
             "mask_semantics": "white_component_black_background",
@@ -6472,7 +6503,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     "error_type": type(exc).__name__,
                     "error": str(exc)[:1600],
                     "analysis_version": (
-                        "vehicle-segmentation-v17.0.20-multicomponent-release"
+                        "vehicle-segmentation-v17.0.21-identity-lock"
                     ),
                 },
             },
@@ -6514,7 +6545,7 @@ def start_vehicle_component_analysis(
             "result": None,
             "error": None,
             "analysis_version": (
-                "vehicle-segmentation-v17.0.20-multicomponent-release"
+                "vehicle-segmentation-v17.0.21-identity-lock"
             ),
         }
 
@@ -6532,7 +6563,7 @@ def start_vehicle_component_analysis(
             f"/v1/vehicle/analyze-components/status/{job_id}"
         ),
         "analysis_version": (
-            "vehicle-segmentation-v17.0.20-multicomponent-release"
+            "vehicle-segmentation-v17.0.21-identity-lock"
         ),
     }
 
@@ -6630,7 +6661,7 @@ def snap_vehicle_polygon_points(
         ),
         "snap_radius": payload.snap_radius,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.20-multicomponent-release"
+            "vehicle-segmentation-v17.0.21-identity-lock"
         ),
     }
 
@@ -6842,7 +6873,7 @@ def refine_vehicle_component(payload: ComponentRefineRequest):
         "requires_review": diagnostics.get("refinement_status") != "refined",
         "refinement": diagnostics,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.20-multicomponent-release"
+            "vehicle-segmentation-v17.0.21-identity-lock"
         ),
     }
 
@@ -6866,7 +6897,7 @@ def analyze_vehicle_components_sync_disabled(
                 "/v1/vehicle/analyze-components/status/{job_id}"
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.20-multicomponent-release"
+                "vehicle-segmentation-v17.0.21-identity-lock"
             ),
         },
     )
@@ -6949,7 +6980,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v17.0.20-multicomponent-release",
+        "prompt_version": "damage-v17.0.21-identity-lock",
         "result_kind": "full_frame_jpeg",
         "full_frame_guard": full_frame_diagnostics,
     }
@@ -6958,7 +6989,7 @@ async def edit_damage(
 @app.post("/v1/damage/edit-base64")
 def edit_damage_base64(payload: DamageEditBase64Request):
     """
-    V17.0.20 Multicomponent Release
+    V17.0.21 Identity Lock
 
     - con maschera manuale: foto completa + perimetro reale + prompt naturale,
       output diretto del modello e validazione anti-cambio-auto;
@@ -7100,39 +7131,64 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 area_percent=area_percent,
                 severity_percent=severity_percent,
             )
-
             strict_identity_prompt = f"""
-    STRICT CONSERVATIVE IMAGE EDIT OF THE PROVIDED ORIGINAL PHOTOGRAPH.
+    SOURCE-IMAGE IDENTITY LOCK — HIGHEST PRIORITY
 
-    This is not a new image generation task.
+    Edit the supplied original photograph conservatively.
+    This is an image-editing task, never a vehicle redesign task.
 
-    Keep exactly the same:
-    - vehicle identity, make, model and body shape;
-    - paint colour and surface finish;
-    - headlights, grille, bumper, wheels, tyres, mirrors, glass and doors;
-    - workshop environment, floor, lift, surrounding vehicles and background;
-    - camera angle, perspective, framing, lighting and reflections.
+    The exact vehicle in the source image is immutable in identity.
 
-    Never replace the vehicle.
-    Never create a different make or model.
-    Never redesign unrelated panels.
-    Never change the workshop or viewpoint.
+    ABSOLUTELY PRESERVE:
+    - the same manufacturer, model, generation and trim;
+    - the same body shell, roofline, hatch shape, glass openings and proportions;
+    - the same paint colour, finish and reflections;
+    - the same front and rear light designs and original outer silhouettes;
+    - the same wheels, tyres, mirrors, doors, windows, seals and trim;
+    - every manufacturer logo, emblem, model badge, trim badge and visible text;
+    - the exact original licence plate and every one of its characters;
+    - the same environment, background, camera angle, framing and perspective.
+
+    IDENTITY CHANGES ARE FORBIDDEN:
+    - never replace this vehicle with another vehicle;
+    - never change brand or model;
+    - never invent Renault, Clio, Volkswagen, Peugeot, Ford or any other identity;
+    - never redraw the manufacturer emblem;
+    - never replace or rewrite the model badge;
+    - never create a different licence plate;
+    - never substitute a different tail-light design;
+    - never reinterpret the vehicle based on visual similarity.
+
+    DAMAGE-ONLY PRINCIPLE:
+    Change only the physical condition of the selected original components.
+    The damaged result must remain unmistakably the same exact vehicle.
+
+    REAR-LIGHT GEOMETRY LOCK:
+    When a rear light is damaged, preserve its original outer footprint,
+    length, height, curvature, orientation and internal design identity.
+    Add cracks, shattered lens regions, broken mounts or slight displacement
+    inside that original geometry.
+    Do not redesign, shrink, enlarge, round off or replace the lamp.
+
+    BADGE, LOGO AND PLATE BEHAVIOUR:
+    If a deformed panel carries a badge, emblem or plate, these items may move
+    rigidly with that panel in perspective, but their design, text and identity
+    must remain exactly unchanged.
+    Do not paint over them, replace them or regenerate them.
 
     User-guided damage instructions:
     {payload.user_instructions.strip()}
 
     Editing rules:
-    - modify only the requested component of this exact vehicle;
-    - begin the deformation near the selected impact point;
-    - propagate the metal deformation according to the requested impact direction;
-    - make it physically consistent with existing adjacent damage when requested;
+    - modify only the requested components of this exact vehicle;
+    - begin deformation near the selected impact point;
+    - propagate deformation according to the requested impact direction;
+    - create one physically coherent collision event;
     - preserve every explicitly protected component;
-    - when a manual perimeter is supplied, use it as the real editable component
-      region and keep the rest of the photograph unchanged;
-    - do not let the deformation cross the selected panel boundary into a
-      protected component;
-    - preserve original panel gaps around protected components;
-    - return the complete edited original photograph with the same dimensions;
+    - use the manual perimeter as the real editable region when supplied;
+    - do not cross into unrelated or protected components;
+    - preserve panel gaps where physically possible;
+    - return the complete original photograph at the same dimensions.
 
     {protected_components_prompt}
 
@@ -7144,11 +7200,15 @@ def edit_damage_base64(payload: DamageEditBase64Request):
 
     {balanced_continuity_prompt}
 
-    Final output rules:
-    - do not return a crop, isolated component, transparent layer, mask or black
-      background;
-    - the output must look like this exact photograph after a local automotive
-      collision deformation.
+    FINAL SELF-CHECK BEFORE OUTPUT:
+    Confirm that the edited image still shows the same exact vehicle.
+    Confirm that make, model, logos, badges, licence plate and lamp design have
+    not changed.
+    If any identity element would change, preserve it from the source image
+    instead of regenerating it.
+
+    Output only the complete edited photograph.
+    Do not return a crop, isolated component, layer, mask or black background.
     """.strip()
 
             if os.getenv("MOCK_MODE", "false").lower() == "true":
@@ -7234,7 +7294,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 ).decode("ascii"),
                 "mime_type": "image/jpeg",
                 "prompt_version": (
-                    "damage-v17.0.20-multicomponent-release"
+                    "damage-v17.0.21-identity-lock"
                 ),
                 "result_kind": "full_frame_jpeg",
                 "deformation_type": payload.deformation_type,
@@ -7292,7 +7352,10 @@ def edit_damage_base64(payload: DamageEditBase64Request):
             ),
             "multicomponent_validation_applied": True,
             "multicomponent_release_mode": True,
-            "backend_version": "1.7.0.20",
+            "backend_version": "1.7.0.21",
+            "vehicle_identity_lock_applied": True,
+            "rear_light_geometry_lock_applied": True,
+            "badge_logo_plate_lock_applied": True,
                 "mask_edge_margin_px": (
                     mask_diagnostics.get("edge_margin_px")
                 ),
@@ -7580,7 +7643,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
             "area_percent": area_percent,
             "result_base64": base64.b64encode(result_bytes).decode("ascii"),
             "mime_type": "image/jpeg",
-            "prompt_version": "damage-v17.0.20-multicomponent-release",
+            "prompt_version": "damage-v17.0.21-identity-lock",
             "result_kind": "full_frame_jpeg",
             "full_frame_guard": full_frame_diagnostics,
             "deformation_type": payload.deformation_type,
