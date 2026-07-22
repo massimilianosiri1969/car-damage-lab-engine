@@ -65,13 +65,13 @@ ALLOWED_ORIGINS = [
 ]
 
 print(
-    "=== CAR DAMAGE LAB BACKEND V17.0.17 STAGED IDENTITY VALIDATION ===",
+    "=== CAR DAMAGE LAB BACKEND V17.0.18 ASYNC STAGED GENERATION ===",
     flush=True,
 )
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.7.0.17",
+    version="1.7.0.18",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -735,6 +735,22 @@ ANALYSIS_JOB_DIR.mkdir(parents=True, exist_ok=True)
 
 ANALYSIS_JOBS: dict[str, dict] = {}
 ANALYSIS_JOBS_LOCK = threading.Lock()
+
+DAMAGE_JOB_TTL_SECONDS = max(
+    600,
+    min(86400, int(os.getenv("DAMAGE_JOB_TTL_SECONDS", "7200"))),
+)
+DAMAGE_JOB_MAX_COUNT = max(
+    5,
+    min(200, int(os.getenv("DAMAGE_JOB_MAX_COUNT", "50"))),
+)
+DAMAGE_JOB_DIR = Path(
+    os.getenv("DAMAGE_JOB_DIR", "/tmp/car-damage-lab-damage-jobs")
+)
+DAMAGE_JOB_DIR.mkdir(parents=True, exist_ok=True)
+
+DAMAGE_JOBS: dict[str, dict] = {}
+DAMAGE_JOBS_LOCK = threading.Lock()
 
 DEFORMATION_INSTRUCTIONS = {
     "dent": (
@@ -3665,7 +3681,7 @@ def root():
     return {
         "service": APP_NAME,
         "status": "ok",
-        "version": "1.7.0.17",
+        "version": "1.7.0.18",
         "docs": "/docs",
         "health": "/health",
     }
@@ -3675,9 +3691,9 @@ def root():
 def get_backend_version() -> dict[str, object]:
     return {
         "service": APP_NAME,
-        "version": "1.7.0.17",
+        "version": "1.7.0.18",
         "prompt_version": (
-            "damage-v17.0.17-staged-identity-validation"
+            "damage-v17.0.18-async-staged-generation"
         ),
         "staged_identity_validation": True,
         "maximum_generation_attempts": 2,
@@ -3687,6 +3703,12 @@ def get_backend_version() -> dict[str, object]:
         ),
         "multicomponent_threshold_fix": True,
         "image_compositing_disabled": True,
+        "async_staged_generation": True,
+        "async_start_endpoint": "/v1/damage/edit-base64/start",
+        "async_status_endpoint": (
+            "/v1/damage/edit-base64/status/{job_id}"
+        ),
+        "recommended_poll_interval_ms": 3500,
     }
 
 
@@ -3857,7 +3879,7 @@ def _replicate_json_request(
             status_code=500,
             detail={
                 "message": "REPLICATE_API_TOKEN non configurato su Render.",
-                "analysis_version": "vehicle-segmentation-v17.0.17-staged-identity-validation",
+                "analysis_version": "vehicle-segmentation-v17.0.18-async-staged-generation",
             },
         )
 
@@ -3900,7 +3922,7 @@ def _replicate_json_request(
                 "http_status": exc.code,
                 "request_url": url,
                 "replicate_detail": error_body[:2000],
-                "analysis_version": "vehicle-segmentation-v17.0.17-staged-identity-validation",
+                "analysis_version": "vehicle-segmentation-v17.0.18-async-staged-generation",
             },
         ) from exc
     except Exception as exc:
@@ -3909,7 +3931,7 @@ def _replicate_json_request(
             detail={
                 "message": "Connessione a Replicate non riuscita.",
                 "error": f"{type(exc).__name__}: {str(exc)}"[:1200],
-                "analysis_version": "vehicle-segmentation-v17.0.17-staged-identity-validation",
+                "analysis_version": "vehicle-segmentation-v17.0.18-async-staged-generation",
             },
         ) from exc
 
@@ -4804,7 +4826,7 @@ def _create_replicate_prediction(
                 "Limite Replicate ancora attivo dopo diversi tentativi."
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.17-staged-identity-validation"
+                "vehicle-segmentation-v17.0.18-async-staged-generation"
             ),
         },
     )
@@ -5856,7 +5878,7 @@ def smart_polygon_component_payload(
         "smooth_polygon": smooth_polygon,
         "feather_radius": feather_radius,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.17-staged-identity-validation"
+            "vehicle-segmentation-v17.0.18-async-staged-generation"
         ),
     }
 
@@ -6180,7 +6202,7 @@ def normalize_vehicle_analysis(
         "manual_polygon_required_only_for_selected_components": True,
         "segmentation_strategy": "manual_smart_polygon",
         "analysis_version": (
-            "vehicle-segmentation-v17.0.17-staged-identity-validation"
+            "vehicle-segmentation-v17.0.18-async-staged-generation"
         ),
     }
 
@@ -6325,7 +6347,7 @@ Bounding-box rules:
                 "model": configured_model,
                 "primary_error": primary_message[:800],
                 "fallback_error": fallback_message[:800],
-                "analysis_version": "vehicle-segmentation-v17.0.17-staged-identity-validation",
+                "analysis_version": "vehicle-segmentation-v17.0.18-async-staged-generation",
             },
         ) from fallback_exc
 
@@ -6480,7 +6502,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     ),
                     "raw_component_count": len(raw_components),
                     "analysis_version": (
-                        "vehicle-segmentation-v17.0.17-staged-identity-validation"
+                        "vehicle-segmentation-v17.0.18-async-staged-generation"
                     ),
                 },
             )
@@ -6493,7 +6515,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                 "gpt-4.1-mini",
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.17-staged-identity-validation"
+                "vehicle-segmentation-v17.0.18-async-staged-generation"
             ),
             "mask_format": "data:image/png;base64",
             "mask_semantics": "white_component_black_background",
@@ -6541,7 +6563,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     "error_type": type(exc).__name__,
                     "error": str(exc)[:1600],
                     "analysis_version": (
-                        "vehicle-segmentation-v17.0.17-staged-identity-validation"
+                        "vehicle-segmentation-v17.0.18-async-staged-generation"
                     ),
                 },
             },
@@ -6583,7 +6605,7 @@ def start_vehicle_component_analysis(
             "result": None,
             "error": None,
             "analysis_version": (
-                "vehicle-segmentation-v17.0.17-staged-identity-validation"
+                "vehicle-segmentation-v17.0.18-async-staged-generation"
             ),
         }
 
@@ -6601,7 +6623,7 @@ def start_vehicle_component_analysis(
             f"/v1/vehicle/analyze-components/status/{job_id}"
         ),
         "analysis_version": (
-            "vehicle-segmentation-v17.0.17-staged-identity-validation"
+            "vehicle-segmentation-v17.0.18-async-staged-generation"
         ),
     }
 
@@ -6699,7 +6721,7 @@ def snap_vehicle_polygon_points(
         ),
         "snap_radius": payload.snap_radius,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.17-staged-identity-validation"
+            "vehicle-segmentation-v17.0.18-async-staged-generation"
         ),
     }
 
@@ -6911,7 +6933,7 @@ def refine_vehicle_component(payload: ComponentRefineRequest):
         "requires_review": diagnostics.get("refinement_status") != "refined",
         "refinement": diagnostics,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.17-staged-identity-validation"
+            "vehicle-segmentation-v17.0.18-async-staged-generation"
         ),
     }
 
@@ -6935,7 +6957,7 @@ def analyze_vehicle_components_sync_disabled(
                 "/v1/vehicle/analyze-components/status/{job_id}"
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.17-staged-identity-validation"
+                "vehicle-segmentation-v17.0.18-async-staged-generation"
             ),
         },
     )
@@ -7018,7 +7040,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v17.0.17-staged-identity-validation",
+        "prompt_version": "damage-v17.0.18-async-staged-generation",
         "result_kind": "full_frame_jpeg",
         "full_frame_guard": full_frame_diagnostics,
     }
@@ -7027,7 +7049,7 @@ async def edit_damage(
 @app.post("/v1/damage/edit-base64")
 def edit_damage_base64(payload: DamageEditBase64Request):
     """
-    V17.0.17 Staged Identity Validation
+    V17.0.18 Async Staged Generation
 
     - con maschera manuale: foto completa + perimetro reale + prompt naturale,
       output diretto del modello e validazione anti-cambio-auto;
@@ -7374,7 +7396,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 ).decode("ascii"),
                 "mime_type": "image/jpeg",
                 "prompt_version": (
-                    "damage-v17.0.17-staged-identity-validation"
+                    "damage-v17.0.18-async-staged-generation"
                 ),
                 "result_kind": "full_frame_jpeg",
                 "deformation_type": payload.deformation_type,
@@ -7698,7 +7720,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
             "area_percent": area_percent,
             "result_base64": base64.b64encode(result_bytes).decode("ascii"),
             "mime_type": "image/jpeg",
-            "prompt_version": "damage-v17.0.17-staged-identity-validation",
+            "prompt_version": "damage-v17.0.18-async-staged-generation",
             "result_kind": "full_frame_jpeg",
             "full_frame_guard": full_frame_diagnostics,
             "deformation_type": payload.deformation_type,
@@ -7786,6 +7808,278 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 "diagnostic_id": request_diagnostic_id,
             },
         ) from exc
+
+
+
+def cleanup_damage_jobs() -> None:
+    now = datetime.now(timezone.utc).timestamp()
+
+    with DAMAGE_JOBS_LOCK:
+        removable: list[str] = []
+
+        for job_id, job in DAMAGE_JOBS.items():
+            age = now - float(job.get("updated_at_epoch", now))
+            if age > DAMAGE_JOB_TTL_SECONDS:
+                removable.append(job_id)
+
+        if len(DAMAGE_JOBS) - len(removable) > DAMAGE_JOB_MAX_COUNT:
+            remaining = [
+                (job_id, float(job.get("updated_at_epoch", 0.0)))
+                for job_id, job in DAMAGE_JOBS.items()
+                if job_id not in removable
+            ]
+            remaining.sort(key=lambda item: item[1])
+            overflow = (
+                len(DAMAGE_JOBS)
+                - len(removable)
+                - DAMAGE_JOB_MAX_COUNT
+            )
+            removable.extend(
+                job_id for job_id, _ in remaining[:max(0, overflow)]
+            )
+
+        for job_id in set(removable):
+            job = DAMAGE_JOBS.pop(job_id, None)
+            if job:
+                _safe_unlink(job.get("result_path"))
+
+
+def set_damage_job(job_id: str, **updates) -> None:
+    with DAMAGE_JOBS_LOCK:
+        current = DAMAGE_JOBS.get(job_id, {})
+        current.update(updates)
+        current["updated_at"] = utc_now_iso()
+        current["updated_at_epoch"] = datetime.now(
+            timezone.utc
+        ).timestamp()
+        DAMAGE_JOBS[job_id] = current
+
+
+def get_damage_job(job_id: str) -> dict | None:
+    with DAMAGE_JOBS_LOCK:
+        job = DAMAGE_JOBS.get(job_id)
+        return dict(job) if job is not None else None
+
+
+def _write_damage_job_result(
+    job_id: str,
+    result: dict[str, object],
+) -> str:
+    result_path = DAMAGE_JOB_DIR / f"{job_id}.json"
+    temporary_path = DAMAGE_JOB_DIR / f"{job_id}.json.tmp"
+
+    temporary_path.write_text(
+        json.dumps(result, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    temporary_path.replace(result_path)
+    return str(result_path)
+
+
+def _read_damage_job_result(result_path: str) -> dict[str, object]:
+    return json.loads(
+        Path(result_path).read_text(encoding="utf-8")
+    )
+
+
+def run_async_damage_generation(
+    job_id: str,
+    payload_data: dict[str, object],
+) -> None:
+    try:
+        set_damage_job(
+            job_id,
+            status="processing",
+            progress_stage="generating_first_attempt",
+            progress_percent=10,
+        )
+
+        payload = DamageEditBase64Request.model_validate(payload_data)
+
+        # La funzione sincrona contiene già:
+        # generazione, validazione identità e secondo tentativo conservativo.
+        result = edit_damage_base64(payload)
+
+        set_damage_job(
+            job_id,
+            progress_stage="saving_result",
+            progress_percent=95,
+        )
+        result_path = _write_damage_job_result(job_id, result)
+
+        set_damage_job(
+            job_id,
+            status="succeeded",
+            progress_stage="completed",
+            progress_percent=100,
+            result_path=result_path,
+            error=None,
+        )
+
+    except HTTPException as exc:
+        set_damage_job(
+            job_id,
+            status="failed",
+            progress_stage="failed",
+            progress_percent=100,
+            error={
+                "http_status": exc.status_code,
+                "detail": exc.detail,
+            },
+        )
+        print(
+            "[ASYNC DAMAGE HTTP ERROR]",
+            {
+                "job_id": job_id,
+                "status_code": exc.status_code,
+                "detail": exc.detail,
+            },
+            flush=True,
+        )
+
+    except Exception as exc:
+        traceback.print_exc()
+        set_damage_job(
+            job_id,
+            status="failed",
+            progress_stage="failed",
+            progress_percent=100,
+            error={
+                "http_status": 500,
+                "detail": {
+                    "message": (
+                        "Errore inatteso durante la generazione asincrona."
+                    ),
+                    "error_type": type(exc).__name__,
+                    "error": str(exc)[:1800],
+                },
+            },
+        )
+        print(
+            "[ASYNC DAMAGE UNHANDLED ERROR]",
+            {
+                "job_id": job_id,
+                "type": type(exc).__name__,
+                "error": str(exc),
+            },
+            flush=True,
+        )
+
+    finally:
+        gc.collect()
+
+
+@app.post("/v1/damage/edit-base64/start")
+def start_async_damage_generation(
+    payload: DamageEditBase64Request,
+    background_tasks: BackgroundTasks,
+):
+    cleanup_damage_jobs()
+
+    job_id = uuid.uuid4().hex
+    now = datetime.now(timezone.utc)
+
+    with DAMAGE_JOBS_LOCK:
+        DAMAGE_JOBS[job_id] = {
+            "job_id": job_id,
+            "status": "queued",
+            "progress_stage": "queued",
+            "progress_percent": 0,
+            "created_at": now.isoformat(),
+            "updated_at": now.isoformat(),
+            "updated_at_epoch": now.timestamp(),
+            "result_path": None,
+            "error": None,
+            "generation_version": (
+                "damage-v17.0.18-async-staged-generation"
+            ),
+        }
+
+    # Copia serializzabile: evita di tenere riferimenti mutabili al request.
+    payload_data = payload.model_dump(mode="python")
+
+    background_tasks.add_task(
+        run_async_damage_generation,
+        job_id,
+        payload_data,
+    )
+
+    return {
+        "job_id": job_id,
+        "status": "queued",
+        "progress_stage": "queued",
+        "progress_percent": 0,
+        "poll_url": f"/v1/damage/edit-base64/status/{job_id}",
+        "delete_url": f"/v1/damage/edit-base64/status/{job_id}",
+        "generation_version": (
+            "damage-v17.0.18-async-staged-generation"
+        ),
+        "poll_interval_ms": 3500,
+    }
+
+
+@app.get("/v1/damage/edit-base64/status/{job_id}")
+def get_async_damage_generation_status(job_id: str):
+    cleanup_damage_jobs()
+    job = get_damage_job(job_id)
+
+    if job is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": "Job di generazione non trovato o scaduto.",
+                "job_id": job_id,
+            },
+        )
+
+    response: dict[str, object] = {
+        "job_id": job_id,
+        "status": job.get("status"),
+        "progress_stage": job.get("progress_stage"),
+        "progress_percent": job.get("progress_percent", 0),
+        "created_at": job.get("created_at"),
+        "updated_at": job.get("updated_at"),
+        "generation_version": job.get("generation_version"),
+    }
+
+    if job.get("status") == "succeeded":
+        result_path = job.get("result_path")
+        if not result_path or not Path(result_path).exists():
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "message": "Risultato del job non disponibile.",
+                    "job_id": job_id,
+                },
+            )
+        response["result"] = _read_damage_job_result(result_path)
+
+    if job.get("status") == "failed":
+        response["error"] = job.get("error")
+
+    return response
+
+
+@app.delete("/v1/damage/edit-base64/status/{job_id}")
+def delete_async_damage_generation_job(job_id: str):
+    with DAMAGE_JOBS_LOCK:
+        job = DAMAGE_JOBS.pop(job_id, None)
+
+    if job is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": "Job di generazione non trovato.",
+                "job_id": job_id,
+            },
+        )
+
+    _safe_unlink(job.get("result_path"))
+
+    return {
+        "job_id": job_id,
+        "deleted": True,
+    }
 
 
 def finalize_without_regeneration(
