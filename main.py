@@ -21,7 +21,7 @@ from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadF
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from openai import OpenAI
-from PIL import Image, ImageDraw, ImageEnhance, ImageFile, ImageFilter
+from PIL import Image, ImageEnhance, ImageFile, ImageFilter
 
 try:
     from pillow_heif import register_heif_opener
@@ -64,14 +64,9 @@ ALLOWED_ORIGINS = [
     if item.strip()
 ]
 
-print(
-    "=== CAR DAMAGE LAB BACKEND V17.0.28 PROTECTED GEOMETRY BASELINE ===",
-    flush=True,
-)
-
 app = FastAPI(
     title=APP_NAME,
-    version="1.7.0.28",
+    version="1.7.0.16",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -142,12 +137,6 @@ class DamageEditBase64Request(BaseModel):
         default_factory=lambda: {"bodyPanel": True}
     )
 
-    # Elenco esplicito inviato da Base44 nelle selezioni multiple.
-    # Nelle versioni precedenti il payload lo conteneva, ma Pydantic lo
-    # ignorava perché il campo non era dichiarato; il codice tentava poi
-    # di leggerlo causando AttributeError e risposta HTTP 500.
-    selected_components: list[str] = Field(default_factory=list)
-
     hood_damage_type: str | None = None
     headlight_damage_type: str | None = None
     bumper_damage_type: str | None = None
@@ -170,85 +159,6 @@ class DamageEditBase64Request(BaseModel):
     protected_component_masks_base64: dict[str, str] = Field(
         default_factory=dict
     )
-
-    # V17.0.22 - Protezione identità dinamica e indipendente dal modello auto.
-    dynamic_identity_protection: bool = True
-    identity_regions: list[dict[str, object]] = Field(default_factory=list)
-    identity_detection_padding_percent: float = Field(
-        default=1.2,
-        ge=0.0,
-        le=6.0,
-    )
-    identity_color_correction: bool = False
-
-
-def resolve_selected_components(
-    payload: DamageEditBase64Request,
-) -> list[str]:
-    """
-    Restituisce una lista stabile di componenti selezionati.
-
-    Priorità:
-    1. selected_components inviato esplicitamente da Base44;
-    2. chiavi vere di involved_components;
-    3. chiavi di component_damage_types;
-    4. chiavi delle maschere per componente.
-    """
-    candidates: list[str] = []
-
-    candidates.extend(payload.selected_components or [])
-
-    if payload.involved_components:
-        candidates.extend(
-            str(code)
-            for code, enabled in payload.involved_components.items()
-            if enabled
-        )
-
-    if payload.component_damage_types:
-        candidates.extend(
-            str(code)
-            for code in payload.component_damage_types.keys()
-        )
-
-    if payload.component_masks_base64:
-        candidates.extend(
-            str(code)
-            for code in payload.component_masks_base64.keys()
-        )
-
-    normalized: list[str] = []
-    seen: set[str] = set()
-
-    generic_codes = {
-        "bodypanel",
-        "body_panel",
-        "bodywork",
-        "generic_body_panel",
-    }
-
-    for item in candidates:
-        code = str(item or "").strip()
-        if not code:
-            continue
-
-        key = code.lower()
-        if key in seen:
-            continue
-
-        seen.add(key)
-        normalized.append(code)
-
-    specific_components = [
-        code
-        for code in normalized
-        if code.lower() not in generic_codes
-    ]
-
-    if specific_components:
-        return specific_components
-
-    return normalized
 
 
 class VehicleAnalyzeRequest(BaseModel):
@@ -1838,8 +1748,8 @@ def lightweight_full_frame_validation(
     diagnostics = {
         "result_is_full_frame": True,
         "result_size": list(candidate.size),
-        "direct_model_output_used": False,
-        "post_composite_applied": True,
+        "direct_model_output_used": True,
+        "post_composite_applied": False,
         "lightweight_validation": True,
     }
 
@@ -2672,214 +2582,75 @@ def build_collision_consequences_prompt(
     area_percent: int,
     impact_direction: str,
 ) -> str:
-    """
-    V17.0.17 - Conseguenze fisiche coerenti su fanali posteriori e lunotto.
-    Le protezioni esplicite prevalgono sempre.
-    """
-    selected = {
-        str(item).strip().lower()
-        for item in selected_components or []
-    }
-    protected = {
-        str(item).strip().lower()
-        for item in protected_components or []
-    }
+    """Regole V17.0.15 per targa e componenti fragili adiacenti."""
+    selected = {str(x).strip().lower() for x in selected_components or []}
+    protected = {str(x).strip().lower() for x in protected_components or []}
 
     severity = max(0, min(100, abs(int(severity_percent))))
     area = max(0, min(100, abs(int(area_percent))))
 
-    rear_body_components = {
-        "rear_bumper",
-        "bumper_rear",
-        "rear_fender",
-        "rear_fender_left",
-        "rear_fender_right",
-        "rear_quarter_panel",
-        "rear_quarter_panel_left",
-        "rear_quarter_panel_right",
-        "tailgate",
-        "trunk_lid",
-        "rear_panel",
+    rear_components = {
+        "rear_bumper", "bumper_rear", "rear_fender",
+        "rear_fender_left", "rear_fender_right",
+        "tailgate", "trunk_lid", "rear_panel",
+    }
+    rear_lights = {
+        "rear_light", "tail_light", "left_tail_light",
+        "right_tail_light", "rear_lamp",
     }
 
-    rear_light_components = {
-        "rear_light",
-        "tail_light",
-        "left_tail_light",
-        "right_tail_light",
-        "rear_lamp",
-        "rear_light_left",
-        "rear_light_right",
-    }
+    rear_collision = bool(selected & rear_components) or impact_direction == "rear_to_front"
+    rear_light_protected = bool(protected & rear_lights)
 
-    rear_glass_components = {
-        "rear_window",
-        "rear_windscreen",
-        "back_glass",
-        "tailgate_glass",
-        "lunotto",
-    }
+    if rear_collision and severity >= 65 and area >= 35 and not rear_light_protected:
+        light_rule = """
+REAR LIGHT PHYSICAL CONSEQUENCE
 
-    rear_collision = (
-        bool(selected & rear_body_components)
-        or impact_direction == "rear_to_front"
-    )
-    rear_light_selected = bool(selected & rear_light_components)
-    rear_light_protected = bool(protected & rear_light_components)
-    rear_glass_selected = bool(selected & rear_glass_components)
-    rear_glass_protected = bool(protected & rear_glass_components)
+The rear collision is severe and affects adjacent rear body components.
+If the collision path reaches the rear light mounting area, the affected
+rear light must show physically plausible damage such as a cracked lens,
+displaced housing, broken mounting points or partial internal misalignment.
 
-    severe_rear_collision = (
-        rear_collision
-        and severity >= 65
-        and area >= 35
-    )
-    very_severe_rear_collision = (
-        rear_collision
-        and severity >= 78
-        and area >= 50
-    )
-
-    if rear_light_protected:
-        rear_light_rule = """
-REAR LIGHT PROTECTION — ABSOLUTE
-
-A rear light is explicitly protected.
-
-Preserve exactly its lens outline, internal geometry, housing position,
-mounting points, reflections and panel gaps.
-
-Do not crack, displace, shatter, blur or regenerate the protected rear light.
+Do not keep the rear light perfectly intact when the surrounding bodywork
+and bumper are heavily crushed around it.
+Do not damage the opposite rear light unless the force reaches it.
 """.strip()
-    elif severe_rear_collision or rear_light_selected:
-        rear_light_rule = """
-REAR LIGHT DAMAGE — ORIGINAL GEOMETRY LOCKED
+    elif rear_light_protected:
+        light_rule = """
+REAR LIGHT PROTECTION
 
-The rear collision is severe enough to affect the rear light mounting area.
-
-Damage the exact original rear light already present in the photograph.
-The original outer silhouette, length, height, curvature, colour, lens layout,
-internal graphic signature and relationship with adjacent body panels are
-identity-critical and must remain recognizable.
-
-Allowed damage:
-- cracks inside the original lens surface;
-- partial shattering of the original lens;
-- missing lens fragments while preserving the original housing outline;
-- slight displacement or tilt of the whole original assembly;
-- broken mounting points;
-- partial separation from the body;
-- internal elements misaligned inside the original housing.
-
-Forbidden:
-- replacing the light with a different design;
-- making it rounder, shorter, narrower, larger or smaller;
-- inventing a new lamp shape;
-- changing its colour or internal styling;
-- merging it with the bodywork;
-- converting it into a lamp from another make or model;
-- damaging the opposite rear light unless the force physically reaches it.
-
-The rear light is geometry-protected in this baseline. Preserve the complete
-original lamp exactly: outer silhouette, lens, internal pattern, size, colour,
-position and orientation. Do not crack, shatter, bend, shrink, stretch, move or
-redesign the lamp. Damage only the surrounding bodywork and mounting area.
+A rear light is explicitly protected. Preserve its exact lens shape,
+internal geometry, position, mounting and reflections.
 """.strip()
     else:
-        rear_light_rule = """
-REAR LIGHT CONSISTENCY
+        light_rule = """
+FRAGILE COMPONENT CONSISTENCY
 
-Keep the rear light intact only when the force does not reach its housing or
-mounting area. Do not add arbitrary breakage.
-""".strip()
-
-    if rear_glass_protected:
-        rear_glass_rule = """
-REAR WINDOW PROTECTION — ABSOLUTE
-
-The rear window is explicitly protected.
-
-Preserve its exact outline, transparency, reflections, heating lines,
-seal position and mounting within the tailgate frame.
-
-Do not crack, detach, shatter or regenerate the protected rear window.
-""".strip()
-    elif rear_glass_selected or very_severe_rear_collision:
-        rear_glass_rule = """
-REAR WINDOW DAMAGE — REQUIRED WHEN THE FRAME IS HEAVILY DISTORTED
-
-The tailgate and rear frame are deformed strongly enough that the rear
-window cannot remain perfectly intact.
-
-Create a physically plausible consequence according to frame distortion:
-- cracks starting from stressed edges;
-- partial fracture;
-- separation from part of the rubber seal;
-- localized shattering;
-- complete breakage only when frame distortion is extreme.
-
-Glass damage must follow stress transmitted through the distorted tailgate
-frame. Do not create decorative cracks or damage unrelated windows.
-""".strip()
-    elif severe_rear_collision:
-        rear_glass_rule = """
-REAR WINDOW CONDITIONAL DAMAGE
-
-Inspect the tailgate frame.
-
-If the window opening is twisted, compressed or displaced, add realistic
-edge cracks or partial detachment from the seal.
-
-If the frame remains geometrically stable, the glass may remain intact.
-Do not keep the glass perfect when its surrounding frame is severely bent.
-""".strip()
-    else:
-        rear_glass_rule = """
-REAR WINDOW CONSISTENCY
-
-Keep the rear window intact unless the tailgate frame transmits enough
-physical stress to crack or detach it.
+Fragile adjacent components may remain intact only when the collision force
+does not physically reach them. Do not add arbitrary breakage.
 """.strip()
 
     return f"""
 COLLISION CONSEQUENCES AND IDENTITY PRESERVATION — STRICT
 
-VEHICLE IDENTITY — ABSOLUTE LOCK:
-- preserve the exact same make, model, generation and trim;
-- preserve the exact body architecture, roofline, glass shape and panel layout;
-- preserve every manufacturer emblem, model badge, trim badge and readable text;
-- never replace, redraw or invent logos, badges, lettering or brand symbols;
-- never transform this vehicle into another make or model;
-- damage must alter condition, not identity.
-
-LICENSE PLATE — ABSOLUTE LOCK:
+LICENSE PLATE:
 - preserve the exact original license plate;
-- preserve every character, spacing, font appearance, colour, border and plate type;
-- do not remove, blur, replace, distort, translate or regenerate it;
+- preserve its text, characters, spacing, colour, size and position;
+- do not remove, blur, replace, distort or regenerate it;
 - do not invent a different plate;
-- if its mounting panel moves, the entire original plate may move rigidly with
-  that panel, but its content and appearance must remain unchanged.
+- if its mounting panel moves, the plate may move with that panel, but all
+  characters must remain exactly readable and unchanged.
 
-BADGES AND EMBLEMS — ABSOLUTE LOCK:
-- preserve the exact original manufacturer emblem;
-- preserve the exact original model name and trim lettering;
-- do not substitute any logo or badge from another brand;
-- do not change FIAT into Renault, CLIO, or any other make/model;
-- badges may move rigidly with a deformed panel but must not change identity.
-
-{rear_light_rule}
-
-{rear_glass_rule}
+{light_rule}
 
 MULTI-COMPONENT CONSISTENCY:
 - all selected damaged components belong to one collision event;
-- deformation follows one impact origin and one force direction;
-- plastic, sheet metal, lights and glass react according to their material;
-- fragile parts must react consistently with surrounding damage;
-- do not preserve a fragile part unrealistically when its mounting area or
-  supporting frame is clearly crushed;
-- do not break fragile parts outside the collision path;
-- explicit protected components always override automatic consequences.
+- deformation strength must follow one impact origin and one force direction;
+- adjacent fragile parts must react consistently with surrounding damage;
+- do not preserve a fragile part unrealistically when its mounting area is
+  clearly crushed;
+- do not damage components outside the collision path without a mechanical
+  reason.
 """.strip()
 
 
@@ -3066,34 +2837,14 @@ def validate_deformation_locality(
     candidate_bytes: bytes,
     guided_mask: Image.Image,
     area_percent: int,
-    severity_percent: int = 0,
-    selected_components: list[str] | None = None,
 ) -> dict[str, object]:
     """
-    V17.0.19 - Validazione adattiva per urti multicompomente.
+    Controllo prudente della diffusione del cambiamento dentro la maschera.
+
+    Non tenta di riconoscere il numero di pieghe. Misura soltanto se una quota
+    eccessiva dell'intero componente è stata modificata rispetto
+    all'estensione richiesta.
     """
-    components = [
-        str(item).strip()
-        for item in (selected_components or [])
-        if str(item).strip()
-    ]
-
-    generic_codes = {
-        "bodypanel",
-        "body_panel",
-        "bodywork",
-        "generic_body_panel",
-    }
-    specific_components = [
-        item
-        for item in components
-        if item.lower() not in generic_codes
-    ]
-    component_count = max(
-        1,
-        len(specific_components or components),
-    )
-
     source_rgb = source.convert("RGB")
     width, height = source_rgb.size
 
@@ -3137,84 +2888,34 @@ def validate_deformation_locality(
     changed_inside = (difference > 14.0) & mask
     changed_ratio = float(changed_inside.sum()) / float(selected_pixels)
 
-    requested_area = (
-        max(0, min(100, abs(int(area_percent)))) / 100.0
+    requested_area = max(0, min(100, abs(int(area_percent)))) / 100.0
+
+    # Tolleranza larga per riflessi e variazioni del modello.
+    allowed_ratio = min(
+        0.92,
+        max(0.28, requested_area + 0.30),
     )
-    severity = max(0, min(100, abs(int(severity_percent))))
-
-    allowed_ratio = max(0.35, requested_area + 0.30)
-
-    if component_count == 2:
-        allowed_ratio = max(allowed_ratio, 0.72)
-    elif component_count == 3:
-        allowed_ratio = max(allowed_ratio, 0.80)
-    elif component_count >= 4:
-        allowed_ratio = max(allowed_ratio, 0.88)
-
-    if severity >= 70 and component_count >= 3:
-        allowed_ratio = max(allowed_ratio, 0.90)
-    if severity >= 85 and component_count >= 4:
-        allowed_ratio = max(allowed_ratio, 0.93)
-
-    allowed_ratio = min(0.94, allowed_ratio)
-
-    validation_warning = None
 
     if changed_ratio > allowed_ratio:
-        if component_count >= 3:
-            validation_warning = {
+        raise HTTPException(
+            status_code=502,
+            detail={
                 "message": (
-                    "La deformazione supera la soglia indicativa, ma il "
-                    "risultato viene accettato perché riguarda un urto "
-                    "multicomponente."
+                    "La deformazione si è estesa su una porzione troppo ampia "
+                    "del componente rispetto all'estensione richiesta."
                 ),
                 "changed_component_ratio": round(changed_ratio, 4),
                 "allowed_component_ratio": round(allowed_ratio, 4),
-                "selected_component_count": component_count,
-            }
-            print(
-                "[MULTICOMPONENT VALIDATION WARNING]",
-                validation_warning,
-                flush=True,
-            )
-        else:
-            raise HTTPException(
-                status_code=502,
-                detail={
-                    "message": (
-                        "La deformazione ha modificato quasi tutta l'area "
-                        "selezionata oltre il limite consentito."
-                    ),
-                    "changed_component_ratio": round(changed_ratio, 4),
-                    "allowed_component_ratio": round(allowed_ratio, 4),
-                    "requested_area_percent": int(area_percent),
-                    "severity_percent": int(severity_percent),
-                    "selected_component_count": component_count,
-                    "selected_components": (
-                        specific_components or components
-                    ),
-                    "validation_profile": (
-                        "multicomponent_release"
-                    ),
-                },
-            )
+                "requested_area_percent": int(area_percent),
+            },
+        )
 
     return {
         "deformation_locality_validation_applied": True,
         "changed_component_ratio": round(changed_ratio, 4),
         "allowed_component_ratio": round(allowed_ratio, 4),
         "requested_area_percent": int(area_percent),
-        "severity_percent": int(severity_percent),
-        "selected_component_count": component_count,
-        "selected_components_for_validation": (
-            specific_components or components
-        ),
-        "validation_profile": "multicomponent_release",
         "deformation_locality_validation_passed": True,
-        "deformation_locality_validation_warning": validation_warning,
-        "multicomponent_result_released": (
-            validation_warning is not None
-        ),
     }
 
 
@@ -3524,8 +3225,8 @@ def validate_hybrid_guided_result(
             4,
         ),
         "black_ratio": round(black_ratio, 4),
-        "direct_model_output_used": False,
-        "post_composite_applied": True,
+        "direct_model_output_used": True,
+        "post_composite_applied": False,
         "hybrid_result_validation_passed": True,
     }
     return output.getvalue(), diagnostics
@@ -3609,757 +3310,6 @@ def call_openai_image_edit(
 
 
 
-IDENTITY_REGION_TYPES = {
-    "license_plate",
-    "manufacturer_emblem",
-    "model_badge",
-    "trim_badge",
-    "visible_brand_text",
-    "left_tail_light",
-    "right_tail_light",
-}
-
-
-def normalize_identity_regions(
-    raw_regions: list[dict[str, object]] | None,
-) -> list[dict[str, object]]:
-    normalized: list[dict[str, object]] = []
-
-    for item in raw_regions or []:
-        if not isinstance(item, dict):
-            continue
-
-        region_type = str(item.get("type", "")).strip().lower()
-        if region_type not in IDENTITY_REGION_TYPES:
-            continue
-
-        box = item.get("bounding_box")
-        if not isinstance(box, dict):
-            continue
-
-        try:
-            x1 = max(0, min(1000, int(box.get("x1", 0))))
-            y1 = max(0, min(1000, int(box.get("y1", 0))))
-            x2 = max(0, min(1000, int(box.get("x2", 0))))
-            y2 = max(0, min(1000, int(box.get("y2", 0))))
-            confidence = float(item.get("confidence", 0.0))
-        except (TypeError, ValueError):
-            continue
-
-        if x2 <= x1 or y2 <= y1:
-            continue
-
-        # Conserviamo solo rilevamenti con una confidenza ragionevole.
-        if confidence < 0.35:
-            continue
-
-        normalized.append({
-            "type": region_type,
-            "confidence": round(max(0.0, min(1.0, confidence)), 4),
-            "bounding_box": {
-                "x1": x1,
-                "y1": y1,
-                "x2": x2,
-                "y2": y2,
-            },
-            "text": str(item.get("text", "") or "").strip()[:80],
-        })
-
-    # Deduplicazione semplice per tipo e forte sovrapposizione.
-    deduplicated: list[dict[str, object]] = []
-
-    for candidate in sorted(
-        normalized,
-        key=lambda region: float(region["confidence"]),
-        reverse=True,
-    ):
-        candidate_box = candidate["bounding_box"]
-        duplicate = False
-
-        for existing in deduplicated:
-            if existing["type"] != candidate["type"]:
-                continue
-
-            existing_box = existing["bounding_box"]
-
-            ix1 = max(candidate_box["x1"], existing_box["x1"])
-            iy1 = max(candidate_box["y1"], existing_box["y1"])
-            ix2 = min(candidate_box["x2"], existing_box["x2"])
-            iy2 = min(candidate_box["y2"], existing_box["y2"])
-
-            intersection = max(0, ix2 - ix1) * max(0, iy2 - iy1)
-            candidate_area = (
-                (candidate_box["x2"] - candidate_box["x1"])
-                * (candidate_box["y2"] - candidate_box["y1"])
-            )
-
-            if candidate_area > 0 and intersection / candidate_area > 0.65:
-                duplicate = True
-                break
-
-        if not duplicate:
-            deduplicated.append(candidate)
-
-    return deduplicated
-
-
-def call_openai_identity_analysis(
-    source: Image.Image,
-) -> list[dict[str, object]]:
-    """
-    Rileva dinamicamente targa, stemma, badge e scritte identitarie.
-    Le coordinate sono normalizzate 0..1000 e valgono per qualsiasi auto.
-    """
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        return []
-
-    image_data_url = image_to_data_url(source)
-    model = os.getenv("OPENAI_IDENTITY_MODEL", "gpt-4.1")
-    client = OpenAI(api_key=api_key)
-
-    prompt = """
-Analyze the exact vehicle in this photograph and locate only identity-critical
-visual elements that must never be regenerated during a damage simulation.
-
-Return ONLY valid JSON:
-{
-  "regions": [
-    {
-      "type": one of [
-        "license_plate",
-        "manufacturer_emblem",
-        "model_badge",
-        "trim_badge",
-        "visible_brand_text",
-        "left_tail_light",
-        "right_tail_light"
-      ],
-      "confidence": number from 0 to 1,
-      "text": readable text when present, otherwise "",
-      "bounding_box": {
-        "x1": integer 0..1000,
-        "y1": integer 0..1000,
-        "x2": integer 0..1000,
-        "y2": integer 0..1000
-      }
-    }
-  ]
-}
-
-Rules:
-- Coordinates refer to the complete photograph.
-- Use tight boxes around the exact visible element.
-- Detect the actual license plate, manufacturer emblem, model name badge,
-  trim badge and any visible brand/model text on the vehicle.
-- Also detect the complete outer bounding box of each visible rear light:
-  left_tail_light and right_tail_light.
-- Do not include windows, body panels, reflections or background.
-- Do not invent elements that are not visible.
-- A damaged or tilted element must still be located.
-- Return JSON only.
-""".strip()
-
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "You locate automotive identity elements precisely. "
-                "Return valid JSON only."
-            ),
-        },
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": prompt},
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": image_data_url,
-                        "detail": "high",
-                    },
-                },
-            ],
-        },
-    ]
-
-    try:
-        response = client.chat.completions.create(
-            model=model,
-            temperature=0,
-            response_format={"type": "json_object"},
-            messages=messages,
-        )
-        parsed = extract_json_object(
-            response.choices[0].message.content or "{}"
-        )
-        return normalize_identity_regions(
-            parsed.get("regions", [])
-            if isinstance(parsed, dict)
-            else []
-        )
-    except Exception as exc:
-        print(
-            "[IDENTITY ANALYSIS WARNING]",
-            {
-                "type": type(exc).__name__,
-                "error": str(exc),
-                "model": model,
-            },
-            flush=True,
-        )
-        return []
-
-
-def split_identity_regions(
-    regions: list[dict[str, object]],
-) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
-    hard_identity_types = {
-        "license_plate",
-        "manufacturer_emblem",
-        "model_badge",
-        "trim_badge",
-        "visible_brand_text",
-    }
-    tail_light_types = {
-        "left_tail_light",
-        "right_tail_light",
-    }
-
-    hard_regions = [
-        region
-        for region in regions
-        if str(region.get("type", "")).lower() in hard_identity_types
-    ]
-    tail_light_regions = [
-        region
-        for region in regions
-        if str(region.get("type", "")).lower() in tail_light_types
-    ]
-    return hard_regions, tail_light_regions
-
-
-def filter_relevant_tail_light_regions(
-    regions: list[dict[str, object]],
-    selected_components: list[str],
-) -> list[dict[str, object]]:
-    selected = {
-        str(item).strip().lower()
-        for item in selected_components or []
-    }
-
-    wants_left = bool(selected & {
-        "left_tail_light",
-        "rear_light_left",
-        "tail_light_left",
-        "rear_light",
-        "tail_light",
-    })
-    wants_right = bool(selected & {
-        "right_tail_light",
-        "rear_light_right",
-        "tail_light_right",
-    })
-
-    relevant: list[dict[str, object]] = []
-    for region in regions:
-        region_type = str(region.get("type", "")).strip().lower()
-        if region_type == "left_tail_light" and wants_left:
-            relevant.append(region)
-        elif region_type == "right_tail_light" and wants_right:
-            relevant.append(region)
-
-    return relevant
-
-
-def build_tail_light_geometry_mask(
-    regions: list[dict[str, object]],
-    target_size: tuple[int, int],
-    padding_percent: float = 0.7,
-) -> Image.Image | None:
-    """
-    V17.0.28 - Protegge integralmente la geometria del fanale.
-
-    Nessuna porzione del fanale viene rigenerata. La simulazione del danno
-    deve avvenire sulla carrozzeria e sui supporti circostanti, non sulla
-    sagoma o sulla lente del gruppo ottico.
-    """
-    if not regions:
-        return None
-
-    width, height = target_size
-    mask = Image.new("L", target_size, 0)
-    draw = ImageDraw.Draw(mask)
-
-    base_pad_x = int(round(width * max(0.0, padding_percent) / 100.0))
-    base_pad_y = int(round(height * max(0.0, padding_percent) / 100.0))
-
-    for region in regions:
-        box = region["bounding_box"]
-        x1 = int(round(width * int(box["x1"]) / 1000.0))
-        y1 = int(round(height * int(box["y1"]) / 1000.0))
-        x2 = int(round(width * int(box["x2"]) / 1000.0))
-        y2 = int(round(height * int(box["y2"]) / 1000.0))
-
-        x1 = max(0, x1 - base_pad_x)
-        y1 = max(0, y1 - base_pad_y)
-        x2 = min(width, x2 + base_pad_x)
-        y2 = min(height, y2 + base_pad_y)
-
-        draw.rounded_rectangle(
-            [x1, y1, x2, y2],
-            radius=max(2, min(12, min(x2 - x1, y2 - y1) // 10)),
-            fill=255,
-        )
-
-    return mask
-
-
-def build_identity_protect_mask(
-    regions: list[dict[str, object]],
-    target_size: tuple[int, int],
-    padding_percent: float = 1.2,
-) -> Image.Image:
-    width, height = target_size
-    mask = Image.new("L", target_size, 0)
-    draw = ImageDraw.Draw(mask)
-
-    pad_x = int(round(width * max(0.0, padding_percent) / 100.0))
-    pad_y = int(round(height * max(0.0, padding_percent) / 100.0))
-
-    for region in regions:
-        box = region["bounding_box"]
-
-        region_type = str(region.get("type", "")).strip().lower()
-
-        type_padding_multiplier = {
-            "license_plate": 1.9,
-            "manufacturer_emblem": 2.3,
-            "model_badge": 2.2,
-            "trim_badge": 2.2,
-            "visible_brand_text": 2.0,
-            "left_tail_light": 1.5,
-            "right_tail_light": 1.5,
-        }.get(region_type, 1.5)
-
-        region_pad_x = int(round(pad_x * type_padding_multiplier))
-        region_pad_y = int(round(pad_y * type_padding_multiplier))
-
-        x1 = (
-            int(round(width * int(box["x1"]) / 1000.0))
-            - region_pad_x
-        )
-        y1 = (
-            int(round(height * int(box["y1"]) / 1000.0))
-            - region_pad_y
-        )
-        x2 = (
-            int(round(width * int(box["x2"]) / 1000.0))
-            + region_pad_x
-        )
-        y2 = (
-            int(round(height * int(box["y2"]) / 1000.0))
-            + region_pad_y
-        )
-
-        x1 = max(0, min(width - 1, x1))
-        y1 = max(0, min(height - 1, y1))
-        x2 = max(x1 + 1, min(width, x2))
-        y2 = max(y1 + 1, min(height, y2))
-
-        draw.rounded_rectangle(
-            [x1, y1, x2, y2],
-            radius=max(1, min(pad_x, pad_y, 8)),
-            fill=255,
-        )
-
-    return mask
-
-
-def merge_protect_masks(
-    target_size: tuple[int, int],
-    masks: list[Image.Image | None],
-) -> Image.Image | None:
-    merged = np.zeros(
-        (target_size[1], target_size[0]),
-        dtype=np.uint8,
-    )
-    found = False
-
-    for mask in masks:
-        if mask is None:
-            continue
-        resized = resize_mask(mask.convert("L"), target_size)
-        binary = mask_to_binary(resized)
-        if int((binary > 0).sum()) == 0:
-            continue
-        merged = cv2.bitwise_or(merged, binary)
-        found = True
-
-    return Image.fromarray(merged, mode="L") if found else None
-
-
-def identity_region_to_pixels(
-    region: dict[str, object],
-    image_size: tuple[int, int],
-    padding_percent: float = 0.0,
-) -> tuple[int, int, int, int]:
-    width, height = image_size
-    box = region["bounding_box"]
-
-    x1 = int(round(width * int(box["x1"]) / 1000.0))
-    y1 = int(round(height * int(box["y1"]) / 1000.0))
-    x2 = int(round(width * int(box["x2"]) / 1000.0))
-    y2 = int(round(height * int(box["y2"]) / 1000.0))
-
-    pad_x = int(round(width * max(0.0, padding_percent) / 100.0))
-    pad_y = int(round(height * max(0.0, padding_percent) / 100.0))
-
-    x1 = max(0, x1 - pad_x)
-    y1 = max(0, y1 - pad_y)
-    x2 = min(width, x2 + pad_x)
-    y2 = min(height, y2 + pad_y)
-
-    return x1, y1, max(x1 + 1, x2), max(y1 + 1, y2)
-
-
-def estimate_local_panel_affine(
-    source_rgb: np.ndarray,
-    candidate_rgb: np.ndarray,
-    region_box: tuple[int, int, int, int],
-) -> tuple[np.ndarray, dict[str, object]]:
-    """
-    Stima una trasformazione rigida/affine locale del pannello attorno
-    all'elemento identitario. Evita il ritaglio rettangolare incollato.
-    """
-    height, width = source_rgb.shape[:2]
-    x1, y1, x2, y2 = region_box
-    region_w = max(1, x2 - x1)
-    region_h = max(1, y2 - y1)
-
-    margin_x = max(18, int(round(region_w * 1.35)))
-    margin_y = max(18, int(round(region_h * 1.35)))
-
-    rx1 = max(0, x1 - margin_x)
-    ry1 = max(0, y1 - margin_y)
-    rx2 = min(width, x2 + margin_x)
-    ry2 = min(height, y2 + margin_y)
-
-    source_roi = source_rgb[ry1:ry2, rx1:rx2]
-    candidate_roi = candidate_rgb[ry1:ry2, rx1:rx2]
-
-    if source_roi.size == 0 or candidate_roi.size == 0:
-        return np.eye(2, 3, dtype=np.float32), {
-            "method": "identity_empty_roi",
-            "confidence": 0.0,
-        }
-
-    source_gray = cv2.cvtColor(source_roi, cv2.COLOR_RGB2GRAY)
-    candidate_gray = cv2.cvtColor(candidate_roi, cv2.COLOR_RGB2GRAY)
-
-    source_gray = cv2.GaussianBlur(source_gray, (5, 5), 0)
-    candidate_gray = cv2.GaussianBlur(candidate_gray, (5, 5), 0)
-
-    # Maschera ad anello: usa il pannello circostante, non il testo/logo.
-    ring_mask = np.full(source_gray.shape, 255, dtype=np.uint8)
-    local_x1 = max(0, x1 - rx1)
-    local_y1 = max(0, y1 - ry1)
-    local_x2 = min(ring_mask.shape[1], x2 - rx1)
-    local_y2 = min(ring_mask.shape[0], y2 - ry1)
-
-    inner_pad_x = max(3, int(round(region_w * 0.08)))
-    inner_pad_y = max(3, int(round(region_h * 0.08)))
-    cv2.rectangle(
-        ring_mask,
-        (
-            max(0, local_x1 - inner_pad_x),
-            max(0, local_y1 - inner_pad_y),
-        ),
-        (
-            min(ring_mask.shape[1] - 1, local_x2 + inner_pad_x),
-            min(ring_mask.shape[0] - 1, local_y2 + inner_pad_y),
-        ),
-        0,
-        thickness=-1,
-    )
-
-    warp = np.eye(2, 3, dtype=np.float32)
-    method = "ecc_affine"
-    confidence = 0.0
-
-    try:
-        criteria = (
-            cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
-            80,
-            1e-5,
-        )
-        confidence, warp = cv2.findTransformECC(
-            source_gray,
-            candidate_gray,
-            warp,
-            cv2.MOTION_AFFINE,
-            criteria,
-            inputMask=ring_mask,
-            gaussFiltSize=5,
-        )
-    except Exception:
-        method = "phase_translation"
-        try:
-            source_float = source_gray.astype(np.float32)
-            candidate_float = candidate_gray.astype(np.float32)
-            shift, phase_response = cv2.phaseCorrelate(
-                source_float,
-                candidate_float,
-            )
-            warp = np.array(
-                [
-                    [1.0, 0.0, float(shift[0])],
-                    [0.0, 1.0, float(shift[1])],
-                ],
-                dtype=np.float32,
-            )
-            confidence = float(max(0.0, min(1.0, phase_response)))
-        except Exception:
-            method = "identity_fallback"
-            warp = np.eye(2, 3, dtype=np.float32)
-            confidence = 0.0
-
-    # Vincoli conservativi: un badge/targa può muoversi e ruotare, non deformarsi.
-    a, b, tx = [float(v) for v in warp[0]]
-    c, d, ty = [float(v) for v in warp[1]]
-
-    scale_x = max(1e-6, (a * a + c * c) ** 0.5)
-    scale_y = max(1e-6, (b * b + d * d) ** 0.5)
-    scale = max(0.90, min(1.10, (scale_x + scale_y) / 2.0))
-    angle = float(np.degrees(np.arctan2(c, a)))
-    angle = max(-8.0, min(8.0, angle))
-
-    max_tx = max(8.0, region_w * 0.30)
-    max_ty = max(8.0, region_h * 0.30)
-    tx = max(-max_tx, min(max_tx, tx))
-    ty = max(-max_ty, min(max_ty, ty))
-
-    rad = np.radians(angle)
-    cos_a = float(np.cos(rad) * scale)
-    sin_a = float(np.sin(rad) * scale)
-
-    constrained_local = np.array(
-        [
-            [cos_a, -sin_a, tx],
-            [sin_a, cos_a, ty],
-        ],
-        dtype=np.float32,
-    )
-
-    # Converti la trasformazione locale ROI in coordinate globali.
-    global_warp = constrained_local.copy()
-    global_warp[0, 2] += (
-        rx1
-        - constrained_local[0, 0] * rx1
-        - constrained_local[0, 1] * ry1
-    )
-    global_warp[1, 2] += (
-        ry1
-        - constrained_local[1, 0] * rx1
-        - constrained_local[1, 1] * ry1
-    )
-
-    return global_warp, {
-        "method": method,
-        "confidence": round(float(confidence), 4),
-        "rotation_degrees": round(angle, 3),
-        "scale": round(scale, 4),
-        "translation_x": round(tx, 3),
-        "translation_y": round(ty, 3),
-        "roi": [rx1, ry1, rx2, ry2],
-    }
-
-
-def panel_aware_identity_composite(
-    source_array: np.ndarray,
-    candidate_array: np.ndarray,
-    identity_regions: list[dict[str, object]],
-) -> tuple[np.ndarray, list[dict[str, object]]]:
-    """
-    Sposta targa, stemma e badge con il pannello usando una trasformazione
-    affine locale, poi fonde i bordi senza creare rettangoli incollati.
-    """
-    height, width = source_array.shape[:2]
-    result = np.array(candidate_array, copy=True)
-    diagnostics: list[dict[str, object]] = []
-
-    hard_types = {
-        "license_plate",
-        "manufacturer_emblem",
-        "model_badge",
-        "trim_badge",
-        "visible_brand_text",
-    }
-
-    for region in identity_regions:
-        region_type = str(region.get("type", "")).strip().lower()
-        if region_type not in hard_types:
-            continue
-
-        box = identity_region_to_pixels(
-            region,
-            (width, height),
-            padding_percent=0.35 if region_type == "license_plate" else 0.22,
-        )
-
-        warp, warp_diag = estimate_local_panel_affine(
-            source_array,
-            result,
-            box,
-        )
-
-        region_mask = np.zeros((height, width), dtype=np.uint8)
-        x1, y1, x2, y2 = box
-        radius = max(2, min(16, min(x2 - x1, y2 - y1) // 8))
-        cv2.rectangle(
-            region_mask,
-            (x1, y1),
-            (x2, y2),
-            255,
-            thickness=-1,
-        )
-
-        warped_source = cv2.warpAffine(
-            source_array,
-            warp,
-            (width, height),
-            flags=cv2.INTER_CUBIC,
-            borderMode=cv2.BORDER_REFLECT_101,
-        )
-        warped_mask = cv2.warpAffine(
-            region_mask,
-            warp,
-            (width, height),
-            flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=0,
-        )
-
-        # Morbida transizione solo sul bordo esterno; centro quasi rigido.
-        feather_sigma = 2.2 if region_type == "license_plate" else 1.5
-        alpha = cv2.GaussianBlur(
-            warped_mask,
-            (0, 0),
-            sigmaX=feather_sigma,
-        ).astype(np.float32) / 255.0
-        alpha = np.clip(alpha, 0.0, 1.0)[:, :, None]
-
-        result = np.clip(
-            warped_source.astype(np.float32) * alpha
-            + result.astype(np.float32) * (1.0 - alpha),
-            0,
-            255,
-        ).astype(np.uint8)
-
-        diagnostics.append({
-            "type": region_type,
-            "text": str(region.get("text", "") or ""),
-            "bounding_box_pixels": [x1, y1, x2, y2],
-            "transform": warp_diag,
-            "blend": "panel_aware_affine_feather",
-        })
-
-    return result, diagnostics
-
-
-def preserve_identity_pixels(
-    source: Image.Image,
-    candidate_bytes: bytes,
-    identity_mask: Image.Image | None,
-    identity_regions: list[dict[str, object]] | None = None,
-    guided_mask: Image.Image | None = None,
-    apply_color_correction: bool = False,
-) -> tuple[bytes, dict[str, object]]:
-    """
-    V17.0.28 - Baseline conservativa.
-
-    Non reinserisce, non sposta e non trasforma targa, stemmi, badge o fanali.
-    Questi elementi devono essere esclusi a monte dalla maschera di editing.
-    """
-    try:
-        candidate = Image.open(io.BytesIO(candidate_bytes))
-        candidate.load()
-        candidate = candidate.convert("RGB")
-    except Exception as exc:
-        raise HTTPException(
-            status_code=502,
-            detail="Risultato non decodificabile per identity protection.",
-        ) from exc
-
-    source_rgb = source.convert("RGB")
-    if candidate.size != source_rgb.size:
-        candidate = candidate.resize(
-            source_rgb.size,
-            Image.Resampling.LANCZOS,
-        )
-
-    candidate_array = np.array(
-        candidate,
-        dtype=np.uint8,
-        copy=True,
-    )
-
-    # Nessuna correzione colore automatica: può cambiare la tinta del veicolo.
-    color_corrected = False
-
-    identity_pixels = 0
-    if identity_mask is not None:
-        identity_binary = mask_to_binary(
-            resize_mask(identity_mask.convert("L"), source_rgb.size)
-        )
-        identity_pixels = int((identity_binary > 0).sum())
-
-    output = io.BytesIO()
-    Image.fromarray(candidate_array, mode="RGB").save(
-        output,
-        format="JPEG",
-        quality=96,
-        subsampling=0,
-        optimize=True,
-    )
-
-    return output.getvalue(), {
-        "dynamic_identity_composite_applied": False,
-        "identity_protected_pixels": identity_pixels,
-        "paint_color_correction_applied": color_corrected,
-        "identity_composite_strategy": "none_mask_exclusion_only",
-        "identity_pixels_exactly_restored": False,
-        "panel_aware_identity_transform_applied": False,
-        "identity_transform_count": 0,
-        "identity_transform_diagnostics": [],
-        "protected_geometry_baseline_applied": True,
-    }
-
-
-@app.post("/v1/vehicle/analyze-identity")
-def analyze_vehicle_identity(
-    payload: ImageNormalizeRequest,
-) -> dict[str, object]:
-    source = decode_base64_image(
-        payload.image_base64,
-        "image_base64",
-        "RGB",
-    )
-    source, _, _ = resize_in_place_for_memory(
-        source,
-        min(MAX_PROCESSING_SIDE, 1400),
-    )
-    regions = call_openai_identity_analysis(source)
-
-    return {
-        "status": "completed",
-        "version": "1.7.0.28",
-        "regions": regions,
-        "region_count": len(regions),
-        "dynamic_identity_protection": True,
-    }
-
-
 @app.post("/v1/image/normalize")
 def normalize_image(payload: ImageNormalizeRequest) -> dict[str, object]:
     """V17.0.14: normalizza HEIC/HEIF/JPEG/PNG per Base44 e browser."""
@@ -4398,43 +3348,6 @@ def root():
         "docs": "/docs",
         "health": "/health",
     }
-
-@app.get("/v1/version")
-def get_backend_version() -> dict[str, object]:
-    return {
-        "service": "Car Damage Lab Engine",
-        "version": "1.7.0.28",
-        "prompt_version": "damage-v17.0.28-protected-geometry-baseline",
-        "multicomponent_release": True,
-        "generic_body_panel_filter": True,
-        "fragile_rear_components": True,
-        "vehicle_identity_lock": True,
-        "rear_light_geometry_lock": True,
-        "badge_logo_plate_lock": True,
-        "dynamic_identity_detection": True,
-        "dynamic_identity_masking": True,
-        "dynamic_identity_composite": True,
-        "paint_color_correction": True,
-        "identity_analysis_endpoint": "/v1/vehicle/analyze-identity",
-        "imagedraw_hotfix": True,
-        "conservative_identity_guard": True,
-        "hard_identity_pixel_restore": True,
-        "conservative_component_composite": True,
-        "default_color_correction_disabled": True,
-        "identity_model": "gpt-4.1",
-        "plate_hard_restore": False,
-        "taillight_outer_geometry_lock": True,
-        "post_composite_result_forced": False,
-        "writable_array_hotfix": True,
-        "panel_aware_identity_transform": False,
-        "rigid_rectangle_restore_disabled": True,
-        "local_affine_panel_tracking": False,
-        "protected_geometry_baseline": True,
-        "identity_mask_exclusion_only": True,
-        "taillight_full_geometry_protection": True,
-        "automatic_color_correction": False,
-    }
-
 
 
 @app.get("/health")
@@ -4604,7 +3517,7 @@ def _replicate_json_request(
             status_code=500,
             detail={
                 "message": "REPLICATE_API_TOKEN non configurato su Render.",
-                "analysis_version": "vehicle-segmentation-v17.0.28-protected-geometry-baseline",
+                "analysis_version": "vehicle-segmentation-v17.0.16-diagnostic-502",
             },
         )
 
@@ -4647,7 +3560,7 @@ def _replicate_json_request(
                 "http_status": exc.code,
                 "request_url": url,
                 "replicate_detail": error_body[:2000],
-                "analysis_version": "vehicle-segmentation-v17.0.28-protected-geometry-baseline",
+                "analysis_version": "vehicle-segmentation-v17.0.16-diagnostic-502",
             },
         ) from exc
     except Exception as exc:
@@ -4656,7 +3569,7 @@ def _replicate_json_request(
             detail={
                 "message": "Connessione a Replicate non riuscita.",
                 "error": f"{type(exc).__name__}: {str(exc)}"[:1200],
-                "analysis_version": "vehicle-segmentation-v17.0.28-protected-geometry-baseline",
+                "analysis_version": "vehicle-segmentation-v17.0.16-diagnostic-502",
             },
         ) from exc
 
@@ -5551,7 +4464,7 @@ def _create_replicate_prediction(
                 "Limite Replicate ancora attivo dopo diversi tentativi."
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.28-protected-geometry-baseline"
+                "vehicle-segmentation-v17.0.16-diagnostic-502"
             ),
         },
     )
@@ -6603,7 +5516,7 @@ def smart_polygon_component_payload(
         "smooth_polygon": smooth_polygon,
         "feather_radius": feather_radius,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.28-protected-geometry-baseline"
+            "vehicle-segmentation-v17.0.16-diagnostic-502"
         ),
     }
 
@@ -6927,7 +5840,7 @@ def normalize_vehicle_analysis(
         "manual_polygon_required_only_for_selected_components": True,
         "segmentation_strategy": "manual_smart_polygon",
         "analysis_version": (
-            "vehicle-segmentation-v17.0.28-protected-geometry-baseline"
+            "vehicle-segmentation-v17.0.16-diagnostic-502"
         ),
     }
 
@@ -7072,7 +5985,7 @@ Bounding-box rules:
                 "model": configured_model,
                 "primary_error": primary_message[:800],
                 "fallback_error": fallback_message[:800],
-                "analysis_version": "vehicle-segmentation-v17.0.28-protected-geometry-baseline",
+                "analysis_version": "vehicle-segmentation-v17.0.16-diagnostic-502",
             },
         ) from fallback_exc
 
@@ -7227,7 +6140,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     ),
                     "raw_component_count": len(raw_components),
                     "analysis_version": (
-                        "vehicle-segmentation-v17.0.28-protected-geometry-baseline"
+                        "vehicle-segmentation-v17.0.16-diagnostic-502"
                     ),
                 },
             )
@@ -7240,7 +6153,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                 "gpt-4.1-mini",
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.28-protected-geometry-baseline"
+                "vehicle-segmentation-v17.0.16-diagnostic-502"
             ),
             "mask_format": "data:image/png;base64",
             "mask_semantics": "white_component_black_background",
@@ -7288,7 +6201,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     "error_type": type(exc).__name__,
                     "error": str(exc)[:1600],
                     "analysis_version": (
-                        "vehicle-segmentation-v17.0.28-protected-geometry-baseline"
+                        "vehicle-segmentation-v17.0.16-diagnostic-502"
                     ),
                 },
             },
@@ -7330,7 +6243,7 @@ def start_vehicle_component_analysis(
             "result": None,
             "error": None,
             "analysis_version": (
-                "vehicle-segmentation-v17.0.28-protected-geometry-baseline"
+                "vehicle-segmentation-v17.0.16-diagnostic-502"
             ),
         }
 
@@ -7348,7 +6261,7 @@ def start_vehicle_component_analysis(
             f"/v1/vehicle/analyze-components/status/{job_id}"
         ),
         "analysis_version": (
-            "vehicle-segmentation-v17.0.28-protected-geometry-baseline"
+            "vehicle-segmentation-v17.0.16-diagnostic-502"
         ),
     }
 
@@ -7446,7 +6359,7 @@ def snap_vehicle_polygon_points(
         ),
         "snap_radius": payload.snap_radius,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.28-protected-geometry-baseline"
+            "vehicle-segmentation-v17.0.16-diagnostic-502"
         ),
     }
 
@@ -7658,7 +6571,7 @@ def refine_vehicle_component(payload: ComponentRefineRequest):
         "requires_review": diagnostics.get("refinement_status") != "refined",
         "refinement": diagnostics,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.28-protected-geometry-baseline"
+            "vehicle-segmentation-v17.0.16-diagnostic-502"
         ),
     }
 
@@ -7682,7 +6595,7 @@ def analyze_vehicle_components_sync_disabled(
                 "/v1/vehicle/analyze-components/status/{job_id}"
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.28-protected-geometry-baseline"
+                "vehicle-segmentation-v17.0.16-diagnostic-502"
             ),
         },
     )
@@ -7765,7 +6678,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v17.0.28-protected-geometry-baseline",
+        "prompt_version": "damage-v17.0.16-diagnostic-502",
         "result_kind": "full_frame_jpeg",
         "full_frame_guard": full_frame_diagnostics,
     }
@@ -7774,7 +6687,7 @@ async def edit_damage(
 @app.post("/v1/damage/edit-base64")
 def edit_damage_base64(payload: DamageEditBase64Request):
     """
-    V17.0.28 Protected Geometry Baseline
+    V17.0.16 Diagnostic 502
 
     - con maschera manuale: foto completa + perimetro reale + prompt naturale,
       output diretto del modello e validazione anti-cambio-auto;
@@ -7783,13 +6696,12 @@ def edit_damage_base64(payload: DamageEditBase64Request):
     """
     request_diagnostic_id = str(uuid.uuid4())
     request_started_at = time.time()
-    selected_components = resolve_selected_components(payload)
     print(
         "[DAMAGE EDIT START]",
         {
             "diagnostic_id": request_diagnostic_id,
             "damage_mode": payload.damage_mode,
-            "selected_components": selected_components,
+            "selected_components": payload.selected_components,
             "protected_components": payload.protected_components,
             "severity_percent": payload.severity_percent,
             "area_percent": payload.area_percent,
@@ -7887,104 +6799,6 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 }
                 resolved_guided_mode = "simple_guided"
 
-            identity_regions = normalize_identity_regions(
-                payload.identity_regions
-            )
-
-            if (
-                payload.dynamic_identity_protection
-                and not identity_regions
-            ):
-                identity_regions = call_openai_identity_analysis(source)
-
-            hard_identity_regions, detected_tail_light_regions = (
-                split_identity_regions(identity_regions)
-            )
-            relevant_tail_light_regions = (
-                filter_relevant_tail_light_regions(
-                    detected_tail_light_regions,
-                    selected_components,
-                )
-            )
-
-            identity_protect_mask = (
-                build_identity_protect_mask(
-                    hard_identity_regions,
-                    source.size,
-                    payload.identity_detection_padding_percent,
-                )
-                if hard_identity_regions
-                else None
-            )
-
-            tail_light_geometry_mask = (
-                build_tail_light_geometry_mask(
-                    relevant_tail_light_regions,
-                    source.size,
-                )
-                if relevant_tail_light_regions
-                else None
-            )
-
-            explicit_protect_mask = None
-            if payload.protect_mask_base64:
-                explicit_protect_mask = decode_base64_image(
-                    payload.protect_mask_base64,
-                    "protect_mask_base64",
-                    "L",
-                )
-                explicit_protect_mask = resize_mask_to_processing_size(
-                    explicit_protect_mask,
-                    source.size,
-                )
-
-            effective_protect_mask = merge_protect_masks(
-                source.size,
-                [
-                    explicit_protect_mask,
-                    identity_protect_mask,
-                    tail_light_geometry_mask,
-                ],
-            )
-
-            if effective_protect_mask is not None:
-                guided_mask, _ = combine_edit_and_protect_masks(
-                    guided_mask,
-                    effective_protect_mask,
-                    source.size,
-                )
-                api_mask = alter_damage_area(guided_mask, 0)
-                mask_diagnostics.update({
-                    "dynamic_identity_regions": identity_regions,
-                    "dynamic_identity_region_count": len(
-                        identity_regions
-                    ),
-                    "hard_identity_region_count": len(
-                        hard_identity_regions
-                    ),
-                    "tail_light_geometry_region_count": len(
-                        relevant_tail_light_regions
-                    ),
-                    "dynamic_identity_protection_applied": True,
-                    "tail_light_geometry_lock_applied": (
-                        tail_light_geometry_mask is not None
-                    ),
-                    "identity_protect_pixels": int(
-                        (
-                            mask_to_binary(
-                                effective_protect_mask
-                            ) > 0
-                        ).sum()
-                    ),
-                })
-            else:
-                mask_diagnostics.update({
-                    "dynamic_identity_regions": [],
-                    "dynamic_identity_region_count": 0,
-                    "dynamic_identity_protection_applied": False,
-                    "identity_protect_pixels": 0,
-                })
-
             protected_components_prompt = (
                 build_strict_protected_components_prompt(
                     payload.protected_components
@@ -8002,7 +6816,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
             )
 
             collision_consequences_prompt = build_collision_consequences_prompt(
-                selected_components=selected_components,
+                selected_components=payload.selected_components,
                 protected_components=payload.protected_components,
                 severity_percent=severity_percent,
                 area_percent=area_percent,
@@ -8014,64 +6828,39 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 area_percent=area_percent,
                 severity_percent=severity_percent,
             )
+
             strict_identity_prompt = f"""
-    SOURCE-IMAGE IDENTITY LOCK — HIGHEST PRIORITY
+    STRICT CONSERVATIVE IMAGE EDIT OF THE PROVIDED ORIGINAL PHOTOGRAPH.
 
-    Edit the supplied original photograph conservatively.
-    This is an image-editing task, never a vehicle redesign task.
+    This is not a new image generation task.
 
-    The exact vehicle in the source image is immutable in identity.
+    Keep exactly the same:
+    - vehicle identity, make, model and body shape;
+    - paint colour and surface finish;
+    - headlights, grille, bumper, wheels, tyres, mirrors, glass and doors;
+    - workshop environment, floor, lift, surrounding vehicles and background;
+    - camera angle, perspective, framing, lighting and reflections.
 
-    ABSOLUTELY PRESERVE:
-    - the same manufacturer, model, generation and trim;
-    - the same body shell, roofline, hatch shape, glass openings and proportions;
-    - the same paint colour, finish and reflections;
-    - the same front and rear light designs and original outer silhouettes;
-    - the same wheels, tyres, mirrors, doors, windows, seals and trim;
-    - every manufacturer logo, emblem, model badge, trim badge and visible text;
-    - the exact original licence plate and every one of its characters;
-    - the same environment, background, camera angle, framing and perspective.
-
-    IDENTITY CHANGES ARE FORBIDDEN:
-    - never replace this vehicle with another vehicle;
-    - never change brand or model;
-    - never invent Renault, Clio, Volkswagen, Peugeot, Ford or any other identity;
-    - never redraw the manufacturer emblem;
-    - never replace or rewrite the model badge;
-    - never create a different licence plate;
-    - never substitute a different tail-light design;
-    - never reinterpret the vehicle based on visual similarity.
-
-    DAMAGE-ONLY PRINCIPLE:
-    Change only the physical condition of the selected original components.
-    The damaged result must remain unmistakably the same exact vehicle.
-
-    REAR-LIGHT GEOMETRY LOCK:
-    When a rear light is damaged, preserve its original outer footprint,
-    length, height, curvature, orientation and internal design identity.
-    Add cracks, shattered lens regions, broken mounts or slight displacement
-    inside that original geometry.
-    Do not redesign, shrink, enlarge, round off or replace the lamp.
-
-    BADGE, LOGO AND PLATE BEHAVIOUR:
-    If a deformed panel carries a badge, emblem or plate, these items may move
-    rigidly with that panel in perspective, but their design, text and identity
-    must remain exactly unchanged.
-    Do not paint over them, replace them or regenerate them.
+    Never replace the vehicle.
+    Never create a different make or model.
+    Never redesign unrelated panels.
+    Never change the workshop or viewpoint.
 
     User-guided damage instructions:
     {payload.user_instructions.strip()}
 
     Editing rules:
-    - modify only the requested components of this exact vehicle;
-    - begin deformation near the selected impact point;
-    - propagate deformation according to the requested impact direction;
-    - create one physically coherent collision event;
+    - modify only the requested component of this exact vehicle;
+    - begin the deformation near the selected impact point;
+    - propagate the metal deformation according to the requested impact direction;
+    - make it physically consistent with existing adjacent damage when requested;
     - preserve every explicitly protected component;
-    - use the manual perimeter as the real editable region when supplied;
-    - do not cross into unrelated or protected components;
-    - preserve panel gaps where physically possible;
-    - return the complete original photograph at the same dimensions.
+    - when a manual perimeter is supplied, use it as the real editable component
+      region and keep the rest of the photograph unchanged;
+    - do not let the deformation cross the selected panel boundary into a
+      protected component;
+    - preserve original panel gaps around protected components;
+    - return the complete edited original photograph with the same dimensions;
 
     {protected_components_prompt}
 
@@ -8083,15 +6872,11 @@ def edit_damage_base64(payload: DamageEditBase64Request):
 
     {balanced_continuity_prompt}
 
-    FINAL SELF-CHECK BEFORE OUTPUT:
-    Confirm that the edited image still shows the same exact vehicle.
-    Confirm that make, model, logos, badges, licence plate and lamp design have
-    not changed.
-    If any identity element would change, preserve it from the source image
-    instead of regenerating it.
-
-    Output only the complete edited photograph.
-    Do not return a crop, isolated component, layer, mask or black background.
+    Final output rules:
+    - do not return a crop, isolated component, transparent layer, mask or black
+      background;
+    - the output must look like this exact photograph after a local automotive
+      collision deformation.
     """.strip()
 
             if os.getenv("MOCK_MODE", "false").lower() == "true":
@@ -8107,8 +6892,8 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                     "result_is_full_frame": True,
                     "original_size": list(source.size),
                     "result_size": list(source.size),
-                    "direct_model_output_used": False,
-                    "post_composite_applied": True,
+                    "direct_model_output_used": True,
+                    "post_composite_applied": False,
                     "hybrid_result_validation_passed": True,
                     "mock": True,
                 }
@@ -8121,61 +6906,21 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 )
 
                 if has_manual_mask:
-                    conservative_composite_bytes = (
-                        smart_component_composite(
-                            source=source,
-                            generated_bytes=generated_bytes,
-                            source_mask=guided_mask,
-                            protect_mask=effective_protect_mask,
-                            expansion_px=0,
-                            feather_px=2,
-                        )
-                    )
-
                     result_bytes, result_diagnostics = (
                         validate_hybrid_guided_result(
                             source=source,
-                            candidate_bytes=conservative_composite_bytes,
+                            candidate_bytes=generated_bytes,
                             guided_mask=guided_mask,
                         )
                     )
-                    result_diagnostics.update({
-                        "conservative_component_composite_applied": True,
-                        "identity_regions_hard_excluded": (
-                            identity_protect_mask is not None
-                        ),
-                        "paint_color_correction_skipped_by_default": (
-                            not payload.identity_color_correction
-                        ),
-                    })
 
                     locality_validation = validate_deformation_locality(
-                            source=source,
-                            candidate_bytes=result_bytes,
-                            guided_mask=guided_mask,
-                            area_percent=area_percent,
-                            severity_percent=severity_percent,
-                            selected_components=selected_components,
-                        )
-                    result_diagnostics.update(locality_validation)
-
-                    result_bytes, identity_diagnostics = (
-                        preserve_identity_pixels(
-                            source=source,
-                            candidate_bytes=result_bytes,
-                            identity_mask=identity_protect_mask,
-                            identity_regions=hard_identity_regions,
-                            guided_mask=guided_mask,
-                            apply_color_correction=(
-                                payload.identity_color_correction
-                            ),
-                        )
+                        source=source,
+                        candidate_bytes=result_bytes,
+                        guided_mask=guided_mask,
+                        area_percent=area_percent,
                     )
-                    result_diagnostics.update(identity_diagnostics)
-                    result_diagnostics.update({
-                        "identity_regions": identity_regions,
-                        "identity_region_count": len(identity_regions),
-                    })
+                    result_diagnostics.update(locality_validation)
 
                     protected_validation = (
                         validate_protected_components_unchanged(
@@ -8196,28 +6941,9 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                             candidate_bytes=generated_bytes,
                         )
                     )
-                    result_bytes, identity_diagnostics = (
-                        preserve_identity_pixels(
-                            source=source,
-                            candidate_bytes=result_bytes,
-                            identity_mask=identity_protect_mask,
-                            identity_regions=hard_identity_regions,
-                            guided_mask=guided_mask,
-                            apply_color_correction=(
-                                payload.identity_color_correction
-                            ),
-                        )
-                    )
-                    result_diagnostics.update(identity_diagnostics)
                     result_diagnostics.update({
-                        "identity_regions": identity_regions,
-                        "identity_region_count": len(identity_regions),
-                        "direct_model_output_used": False,
-                        "post_composite_applied": (
-                            identity_diagnostics[
-                                "dynamic_identity_composite_applied"
-                            ]
-                        ),
+                        "direct_model_output_used": True,
+                        "post_composite_applied": False,
                         "hybrid_result_validation_passed": False,
                         "manual_mask_missing": True,
                         "protected_components_validation_applied": False,
@@ -8234,7 +6960,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 ).decode("ascii"),
                 "mime_type": "image/jpeg",
                 "prompt_version": (
-                    "damage-v17.0.28-protected-geometry-baseline"
+                    "damage-v17.0.16-diagnostic-502"
                 ),
                 "result_kind": "full_frame_jpeg",
                 "deformation_type": payload.deformation_type,
@@ -8245,8 +6971,8 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 "mask_used_as_api_edit_region": has_manual_mask,
                 "mask_diagnostics": mask_diagnostics,
                 "result_diagnostics": result_diagnostics,
-                "composite_strategy": "mask_exclusion_only_protected_geometry",
-                "post_composite_applied": True,
+                "composite_strategy": "none_direct_model_output",
+                "post_composite_applied": False,
                 "user_instructions_used": True,
                 "strict_vehicle_identity_prompt": True,
             "diagnostic_id": request_diagnostic_id,
@@ -8262,64 +6988,6 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 "collision_consequences_prompt_applied": True,
                 "license_plate_preservation_applied": True,
                 "fragile_component_consistency_applied": True,
-                "rear_light_damage_logic_applied": True,
-                "rear_window_damage_logic_applied": True,
-                "fragile_component_protection_override": True,
-            "selected_components_hotfix_applied": True,
-            "resolved_selected_components": selected_components,
-            "generic_body_panel_removed": (
-                any(
-                    str(item).lower() in {
-                        "bodypanel",
-                        "body_panel",
-                        "bodywork",
-                        "generic_body_panel",
-                    }
-                    for item in (
-                        payload.selected_components
-                        + list(payload.involved_components.keys())
-                    )
-                )
-                and all(
-                    str(item).lower() not in {
-                        "bodypanel",
-                        "body_panel",
-                        "bodywork",
-                        "generic_body_panel",
-                    }
-                    for item in selected_components
-                )
-            ),
-            "multicomponent_validation_applied": True,
-            "multicomponent_release_mode": True,
-            "backend_version": "1.7.0.28",
-            "protected_geometry_baseline_applied": True,
-            "identity_mask_exclusion_only_applied": True,
-            "taillight_full_geometry_protection_applied": True,
-            "panel_aware_identity_transform_applied": False,
-            "rigid_rectangle_restore_disabled": True,
-            "writable_array_hotfix_applied": True,
-            "imagedraw_hotfix_applied": True,
-            "conservative_identity_guard_applied": True,
-            "hard_identity_pixel_restore_applied": True,
-            "conservative_component_composite_enabled": True,
-            "plate_hard_restore_applied": False,
-            "plate_panel_aware_transform_applied": False,
-            "taillight_outer_geometry_lock_applied": (
-                tail_light_geometry_mask is not None
-            ),
-            "post_composite_result_forced": False,
-            "vehicle_identity_lock_applied": True,
-            "rear_light_geometry_lock_applied": True,
-            "badge_logo_plate_lock_applied": True,
-            "dynamic_identity_protection_enabled": (
-                payload.dynamic_identity_protection
-            ),
-            "dynamic_identity_region_count": len(identity_regions),
-            "dynamic_identity_regions": identity_regions,
-            "paint_color_correction_enabled": (
-                payload.identity_color_correction
-            ),
                 "mask_edge_margin_px": (
                     mask_diagnostics.get("edge_margin_px")
                 ),
@@ -8607,7 +7275,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
             "area_percent": area_percent,
             "result_base64": base64.b64encode(result_bytes).decode("ascii"),
             "mime_type": "image/jpeg",
-            "prompt_version": "damage-v17.0.28-protected-geometry-baseline",
+            "prompt_version": "damage-v17.0.16-diagnostic-502",
             "result_kind": "full_frame_jpeg",
             "full_frame_guard": full_frame_diagnostics,
             "deformation_type": payload.deformation_type,
@@ -8648,7 +7316,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 "detail": exc.detail,
                 "elapsed_ms": elapsed_ms,
                 "damage_mode": payload.damage_mode,
-                "selected_components": selected_components,
+                "selected_components": payload.selected_components,
                 "protected_components": payload.protected_components,
                 "severity_percent": payload.severity_percent,
                 "area_percent": payload.area_percent,
@@ -8672,7 +7340,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 "error": str(exc),
                 "elapsed_ms": elapsed_ms,
                 "damage_mode": payload.damage_mode,
-                "selected_components": selected_components,
+                "selected_components": payload.selected_components,
                 "protected_components": payload.protected_components,
                 "severity_percent": payload.severity_percent,
                 "area_percent": payload.area_percent,
