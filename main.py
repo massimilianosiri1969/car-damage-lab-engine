@@ -65,13 +65,13 @@ ALLOWED_ORIGINS = [
 ]
 
 print(
-    "=== CAR DAMAGE LAB BACKEND V17.0.27 PANEL-AWARE IDENTITY TRANSFORM ===",
+    "=== CAR DAMAGE LAB BACKEND V17.0.28 PROTECTED GEOMETRY BASELINE ===",
     flush=True,
 )
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.7.0.27",
+    version="1.7.0.28",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -2780,9 +2780,10 @@ Forbidden:
 - converting it into a lamp from another make or model;
 - damaging the opposite rear light unless the force physically reaches it.
 
-The light may crack or lose internal lens fragments, but its outer silhouette,
-size, orientation and mounting footprint must remain exactly the same as in the
-source photograph. Do not bend, shrink, stretch or redesign the lamp housing.
+The rear light is geometry-protected in this baseline. Preserve the complete
+original lamp exactly: outer silhouette, lens, internal pattern, size, colour,
+position and orientation. Do not crack, shatter, bend, shrink, stretch, move or
+redesign the lamp. Damage only the surrounding bodywork and mounting area.
 """.strip()
     else:
         rear_light_rule = """
@@ -3874,21 +3875,21 @@ def filter_relevant_tail_light_regions(
 def build_tail_light_geometry_mask(
     regions: list[dict[str, object]],
     target_size: tuple[int, int],
-    padding_percent: float = 0.5,
+    padding_percent: float = 0.7,
 ) -> Image.Image | None:
     """
-    Crea una maschera della sagoma esterna del fanale.
-    La zona viene esclusa dalla rigenerazione geometrica, poi una porzione
-    interna più piccola resta modificabile per consentire crepe/rotture.
+    V17.0.28 - Protegge integralmente la geometria del fanale.
+
+    Nessuna porzione del fanale viene rigenerata. La simulazione del danno
+    deve avvenire sulla carrozzeria e sui supporti circostanti, non sulla
+    sagoma o sulla lente del gruppo ottico.
     """
     if not regions:
         return None
 
     width, height = target_size
-    outer = Image.new("L", target_size, 0)
-    inner = Image.new("L", target_size, 0)
-    outer_draw = ImageDraw.Draw(outer)
-    inner_draw = ImageDraw.Draw(inner)
+    mask = Image.new("L", target_size, 0)
+    draw = ImageDraw.Draw(mask)
 
     base_pad_x = int(round(width * max(0.0, padding_percent) / 100.0))
     base_pad_y = int(round(height * max(0.0, padding_percent) / 100.0))
@@ -3905,34 +3906,13 @@ def build_tail_light_geometry_mask(
         x2 = min(width, x2 + base_pad_x)
         y2 = min(height, y2 + base_pad_y)
 
-        outer_draw.rounded_rectangle(
+        draw.rounded_rectangle(
             [x1, y1, x2, y2],
-            radius=max(2, min(12, (x2 - x1) // 12)),
+            radius=max(2, min(12, min(x2 - x1, y2 - y1) // 10)),
             fill=255,
         )
 
-        inset_x = max(2, int(round((x2 - x1) * 0.16)))
-        inset_y = max(2, int(round((y2 - y1) * 0.18)))
-        ix1 = min(x2 - 1, x1 + inset_x)
-        iy1 = min(y2 - 1, y1 + inset_y)
-        ix2 = max(ix1 + 1, x2 - inset_x)
-        iy2 = max(iy1 + 1, y2 - inset_y)
-
-        inner_draw.rounded_rectangle(
-            [ix1, iy1, ix2, iy2],
-            radius=max(1, min(8, (ix2 - ix1) // 14)),
-            fill=255,
-        )
-
-    outer_arr = mask_to_binary(outer)
-    inner_arr = mask_to_binary(inner)
-
-    # Protegge il bordo/sagoma esterna; l'interno resta editabile.
-    ring = cv2.bitwise_and(
-        outer_arr,
-        cv2.bitwise_not(inner_arr),
-    )
-    return Image.fromarray(ring, mode="L")
+    return mask
 
 
 def build_identity_protect_mask(
@@ -4296,8 +4276,10 @@ def preserve_identity_pixels(
     apply_color_correction: bool = False,
 ) -> tuple[bytes, dict[str, object]]:
     """
-    V17.0.27 - Targa, stemma e badge seguono il movimento locale del pannello.
-    Nessun ripristino rettangolare rigido.
+    V17.0.28 - Baseline conservativa.
+
+    Non reinserisce, non sposta e non trasforma targa, stemmi, badge o fanali.
+    Questi elementi devono essere esclusi a monte dalla maschera di editing.
     """
     try:
         candidate = Image.open(io.BytesIO(candidate_bytes))
@@ -4316,31 +4298,15 @@ def preserve_identity_pixels(
             Image.Resampling.LANCZOS,
         )
 
-    source_array = np.array(
-        source_rgb,
-        dtype=np.uint8,
-        copy=True,
-    )
     candidate_array = np.array(
         candidate,
         dtype=np.uint8,
         copy=True,
     )
 
+    # Nessuna correzione colore automatica: può cambiare la tinta del veicolo.
     color_corrected = False
-    if apply_color_correction and guided_mask is not None:
-        guided_binary = mask_to_binary(
-            resize_mask(guided_mask.convert("L"), source_rgb.size)
-        )
-        candidate_array = _lab_color_match_inside_mask(
-            source_rgb=source_array,
-            generated_rgb=candidate_array,
-            mask_binary=guided_binary,
-            strength=0.35,
-        )
-        color_corrected = True
 
-    hard_regions, _ = split_identity_regions(identity_regions or [])
     identity_pixels = 0
     if identity_mask is not None:
         identity_binary = mask_to_binary(
@@ -4348,16 +4314,8 @@ def preserve_identity_pixels(
         )
         identity_pixels = int((identity_binary > 0).sum())
 
-    transformed_array, transform_diagnostics = (
-        panel_aware_identity_composite(
-            source_array=source_array,
-            candidate_array=candidate_array,
-            identity_regions=hard_regions,
-        )
-    )
-
     output = io.BytesIO()
-    Image.fromarray(transformed_array, mode="RGB").save(
+    Image.fromarray(candidate_array, mode="RGB").save(
         output,
         format="JPEG",
         quality=96,
@@ -4366,22 +4324,15 @@ def preserve_identity_pixels(
     )
 
     return output.getvalue(), {
-        "dynamic_identity_composite_applied": bool(
-            transform_diagnostics
-        ),
+        "dynamic_identity_composite_applied": False,
         "identity_protected_pixels": identity_pixels,
         "paint_color_correction_applied": color_corrected,
-        "identity_composite_strategy": (
-            "panel_aware_affine_transform"
-            if transform_diagnostics
-            else "none"
-        ),
+        "identity_composite_strategy": "none_mask_exclusion_only",
         "identity_pixels_exactly_restored": False,
-        "panel_aware_identity_transform_applied": bool(
-            transform_diagnostics
-        ),
-        "identity_transform_count": len(transform_diagnostics),
-        "identity_transform_diagnostics": transform_diagnostics,
+        "panel_aware_identity_transform_applied": False,
+        "identity_transform_count": 0,
+        "identity_transform_diagnostics": [],
+        "protected_geometry_baseline_applied": True,
     }
 
 
@@ -4402,7 +4353,7 @@ def analyze_vehicle_identity(
 
     return {
         "status": "completed",
-        "version": "1.7.0.27",
+        "version": "1.7.0.28",
         "regions": regions,
         "region_count": len(regions),
         "dynamic_identity_protection": True,
@@ -4452,8 +4403,8 @@ def root():
 def get_backend_version() -> dict[str, object]:
     return {
         "service": "Car Damage Lab Engine",
-        "version": "1.7.0.27",
-        "prompt_version": "damage-v17.0.27-panel-aware-identity-transform",
+        "version": "1.7.0.28",
+        "prompt_version": "damage-v17.0.28-protected-geometry-baseline",
         "multicomponent_release": True,
         "generic_body_panel_filter": True,
         "fragile_rear_components": True,
@@ -4471,13 +4422,17 @@ def get_backend_version() -> dict[str, object]:
         "conservative_component_composite": True,
         "default_color_correction_disabled": True,
         "identity_model": "gpt-4.1",
-        "plate_hard_restore": True,
+        "plate_hard_restore": False,
         "taillight_outer_geometry_lock": True,
-        "post_composite_result_forced": True,
+        "post_composite_result_forced": False,
         "writable_array_hotfix": True,
-        "panel_aware_identity_transform": True,
+        "panel_aware_identity_transform": False,
         "rigid_rectangle_restore_disabled": True,
-        "local_affine_panel_tracking": True,
+        "local_affine_panel_tracking": False,
+        "protected_geometry_baseline": True,
+        "identity_mask_exclusion_only": True,
+        "taillight_full_geometry_protection": True,
+        "automatic_color_correction": False,
     }
 
 
@@ -4649,7 +4604,7 @@ def _replicate_json_request(
             status_code=500,
             detail={
                 "message": "REPLICATE_API_TOKEN non configurato su Render.",
-                "analysis_version": "vehicle-segmentation-v17.0.27-panel-aware-identity-transform",
+                "analysis_version": "vehicle-segmentation-v17.0.28-protected-geometry-baseline",
             },
         )
 
@@ -4692,7 +4647,7 @@ def _replicate_json_request(
                 "http_status": exc.code,
                 "request_url": url,
                 "replicate_detail": error_body[:2000],
-                "analysis_version": "vehicle-segmentation-v17.0.27-panel-aware-identity-transform",
+                "analysis_version": "vehicle-segmentation-v17.0.28-protected-geometry-baseline",
             },
         ) from exc
     except Exception as exc:
@@ -4701,7 +4656,7 @@ def _replicate_json_request(
             detail={
                 "message": "Connessione a Replicate non riuscita.",
                 "error": f"{type(exc).__name__}: {str(exc)}"[:1200],
-                "analysis_version": "vehicle-segmentation-v17.0.27-panel-aware-identity-transform",
+                "analysis_version": "vehicle-segmentation-v17.0.28-protected-geometry-baseline",
             },
         ) from exc
 
@@ -5596,7 +5551,7 @@ def _create_replicate_prediction(
                 "Limite Replicate ancora attivo dopo diversi tentativi."
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.27-panel-aware-identity-transform"
+                "vehicle-segmentation-v17.0.28-protected-geometry-baseline"
             ),
         },
     )
@@ -6648,7 +6603,7 @@ def smart_polygon_component_payload(
         "smooth_polygon": smooth_polygon,
         "feather_radius": feather_radius,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.27-panel-aware-identity-transform"
+            "vehicle-segmentation-v17.0.28-protected-geometry-baseline"
         ),
     }
 
@@ -6972,7 +6927,7 @@ def normalize_vehicle_analysis(
         "manual_polygon_required_only_for_selected_components": True,
         "segmentation_strategy": "manual_smart_polygon",
         "analysis_version": (
-            "vehicle-segmentation-v17.0.27-panel-aware-identity-transform"
+            "vehicle-segmentation-v17.0.28-protected-geometry-baseline"
         ),
     }
 
@@ -7117,7 +7072,7 @@ Bounding-box rules:
                 "model": configured_model,
                 "primary_error": primary_message[:800],
                 "fallback_error": fallback_message[:800],
-                "analysis_version": "vehicle-segmentation-v17.0.27-panel-aware-identity-transform",
+                "analysis_version": "vehicle-segmentation-v17.0.28-protected-geometry-baseline",
             },
         ) from fallback_exc
 
@@ -7272,7 +7227,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     ),
                     "raw_component_count": len(raw_components),
                     "analysis_version": (
-                        "vehicle-segmentation-v17.0.27-panel-aware-identity-transform"
+                        "vehicle-segmentation-v17.0.28-protected-geometry-baseline"
                     ),
                 },
             )
@@ -7285,7 +7240,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                 "gpt-4.1-mini",
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.27-panel-aware-identity-transform"
+                "vehicle-segmentation-v17.0.28-protected-geometry-baseline"
             ),
             "mask_format": "data:image/png;base64",
             "mask_semantics": "white_component_black_background",
@@ -7333,7 +7288,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     "error_type": type(exc).__name__,
                     "error": str(exc)[:1600],
                     "analysis_version": (
-                        "vehicle-segmentation-v17.0.27-panel-aware-identity-transform"
+                        "vehicle-segmentation-v17.0.28-protected-geometry-baseline"
                     ),
                 },
             },
@@ -7375,7 +7330,7 @@ def start_vehicle_component_analysis(
             "result": None,
             "error": None,
             "analysis_version": (
-                "vehicle-segmentation-v17.0.27-panel-aware-identity-transform"
+                "vehicle-segmentation-v17.0.28-protected-geometry-baseline"
             ),
         }
 
@@ -7393,7 +7348,7 @@ def start_vehicle_component_analysis(
             f"/v1/vehicle/analyze-components/status/{job_id}"
         ),
         "analysis_version": (
-            "vehicle-segmentation-v17.0.27-panel-aware-identity-transform"
+            "vehicle-segmentation-v17.0.28-protected-geometry-baseline"
         ),
     }
 
@@ -7491,7 +7446,7 @@ def snap_vehicle_polygon_points(
         ),
         "snap_radius": payload.snap_radius,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.27-panel-aware-identity-transform"
+            "vehicle-segmentation-v17.0.28-protected-geometry-baseline"
         ),
     }
 
@@ -7703,7 +7658,7 @@ def refine_vehicle_component(payload: ComponentRefineRequest):
         "requires_review": diagnostics.get("refinement_status") != "refined",
         "refinement": diagnostics,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.27-panel-aware-identity-transform"
+            "vehicle-segmentation-v17.0.28-protected-geometry-baseline"
         ),
     }
 
@@ -7727,7 +7682,7 @@ def analyze_vehicle_components_sync_disabled(
                 "/v1/vehicle/analyze-components/status/{job_id}"
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.27-panel-aware-identity-transform"
+                "vehicle-segmentation-v17.0.28-protected-geometry-baseline"
             ),
         },
     )
@@ -7810,7 +7765,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v17.0.27-panel-aware-identity-transform",
+        "prompt_version": "damage-v17.0.28-protected-geometry-baseline",
         "result_kind": "full_frame_jpeg",
         "full_frame_guard": full_frame_diagnostics,
     }
@@ -7819,7 +7774,7 @@ async def edit_damage(
 @app.post("/v1/damage/edit-base64")
 def edit_damage_base64(payload: DamageEditBase64Request):
     """
-    V17.0.27 Panel-Aware Identity Transform
+    V17.0.28 Protected Geometry Baseline
 
     - con maschera manuale: foto completa + perimetro reale + prompt naturale,
       output diretto del modello e validazione anti-cambio-auto;
@@ -8279,7 +8234,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 ).decode("ascii"),
                 "mime_type": "image/jpeg",
                 "prompt_version": (
-                    "damage-v17.0.27-panel-aware-identity-transform"
+                    "damage-v17.0.28-protected-geometry-baseline"
                 ),
                 "result_kind": "full_frame_jpeg",
                 "deformation_type": payload.deformation_type,
@@ -8290,7 +8245,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 "mask_used_as_api_edit_region": has_manual_mask,
                 "mask_diagnostics": mask_diagnostics,
                 "result_diagnostics": result_diagnostics,
-                "composite_strategy": "panel_aware_identity_transform_and_taillight_geometry_lock",
+                "composite_strategy": "mask_exclusion_only_protected_geometry",
                 "post_composite_applied": True,
                 "user_instructions_used": True,
                 "strict_vehicle_identity_prompt": True,
@@ -8337,8 +8292,11 @@ def edit_damage_base64(payload: DamageEditBase64Request):
             ),
             "multicomponent_validation_applied": True,
             "multicomponent_release_mode": True,
-            "backend_version": "1.7.0.27",
-            "panel_aware_identity_transform_applied": True,
+            "backend_version": "1.7.0.28",
+            "protected_geometry_baseline_applied": True,
+            "identity_mask_exclusion_only_applied": True,
+            "taillight_full_geometry_protection_applied": True,
+            "panel_aware_identity_transform_applied": False,
             "rigid_rectangle_restore_disabled": True,
             "writable_array_hotfix_applied": True,
             "imagedraw_hotfix_applied": True,
@@ -8346,11 +8304,11 @@ def edit_damage_base64(payload: DamageEditBase64Request):
             "hard_identity_pixel_restore_applied": True,
             "conservative_component_composite_enabled": True,
             "plate_hard_restore_applied": False,
-            "plate_panel_aware_transform_applied": True,
+            "plate_panel_aware_transform_applied": False,
             "taillight_outer_geometry_lock_applied": (
                 tail_light_geometry_mask is not None
             ),
-            "post_composite_result_forced": True,
+            "post_composite_result_forced": False,
             "vehicle_identity_lock_applied": True,
             "rear_light_geometry_lock_applied": True,
             "badge_logo_plate_lock_applied": True,
@@ -8649,7 +8607,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
             "area_percent": area_percent,
             "result_base64": base64.b64encode(result_bytes).decode("ascii"),
             "mime_type": "image/jpeg",
-            "prompt_version": "damage-v17.0.27-panel-aware-identity-transform",
+            "prompt_version": "damage-v17.0.28-protected-geometry-baseline",
             "result_kind": "full_frame_jpeg",
             "full_frame_guard": full_frame_diagnostics,
             "deformation_type": payload.deformation_type,
