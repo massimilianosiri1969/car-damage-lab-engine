@@ -21,7 +21,7 @@ from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadF
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from openai import OpenAI
-from PIL import Image, ImageEnhance, ImageFile, ImageFilter
+from PIL import Image, ImageDraw, ImageEnhance, ImageFile, ImageFilter
 
 try:
     from pillow_heif import register_heif_opener
@@ -65,13 +65,13 @@ ALLOWED_ORIGINS = [
 ]
 
 print(
-    "=== CAR DAMAGE LAB BACKEND V17.0.22 DYNAMIC IDENTITY PROTECTION ===",
+    "=== CAR DAMAGE LAB BACKEND V17.0.23 IMAGEDRAW HOTFIX ===",
     flush=True,
 )
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.7.0.22",
+    version="1.7.0.23",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -3965,7 +3965,7 @@ def analyze_vehicle_identity(
 
     return {
         "status": "completed",
-        "version": "1.7.0.22",
+        "version": "1.7.0.23",
         "regions": regions,
         "region_count": len(regions),
         "dynamic_identity_protection": True,
@@ -4015,8 +4015,8 @@ def root():
 def get_backend_version() -> dict[str, object]:
     return {
         "service": "Car Damage Lab Engine",
-        "version": "1.7.0.22",
-        "prompt_version": "damage-v17.0.22-dynamic-identity-protection",
+        "version": "1.7.0.23",
+        "prompt_version": "damage-v17.0.23-imagedraw-hotfix",
         "multicomponent_release": True,
         "generic_body_panel_filter": True,
         "fragile_rear_components": True,
@@ -4028,6 +4028,7 @@ def get_backend_version() -> dict[str, object]:
         "dynamic_identity_composite": True,
         "paint_color_correction": True,
         "identity_analysis_endpoint": "/v1/vehicle/analyze-identity",
+        "imagedraw_hotfix": True,
     }
 
 
@@ -4199,7 +4200,7 @@ def _replicate_json_request(
             status_code=500,
             detail={
                 "message": "REPLICATE_API_TOKEN non configurato su Render.",
-                "analysis_version": "vehicle-segmentation-v17.0.22-dynamic-identity-protection",
+                "analysis_version": "vehicle-segmentation-v17.0.23-imagedraw-hotfix",
             },
         )
 
@@ -4242,7 +4243,7 @@ def _replicate_json_request(
                 "http_status": exc.code,
                 "request_url": url,
                 "replicate_detail": error_body[:2000],
-                "analysis_version": "vehicle-segmentation-v17.0.22-dynamic-identity-protection",
+                "analysis_version": "vehicle-segmentation-v17.0.23-imagedraw-hotfix",
             },
         ) from exc
     except Exception as exc:
@@ -4251,7 +4252,7 @@ def _replicate_json_request(
             detail={
                 "message": "Connessione a Replicate non riuscita.",
                 "error": f"{type(exc).__name__}: {str(exc)}"[:1200],
-                "analysis_version": "vehicle-segmentation-v17.0.22-dynamic-identity-protection",
+                "analysis_version": "vehicle-segmentation-v17.0.23-imagedraw-hotfix",
             },
         ) from exc
 
@@ -5146,7 +5147,7 @@ def _create_replicate_prediction(
                 "Limite Replicate ancora attivo dopo diversi tentativi."
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.22-dynamic-identity-protection"
+                "vehicle-segmentation-v17.0.23-imagedraw-hotfix"
             ),
         },
     )
@@ -6198,7 +6199,7 @@ def smart_polygon_component_payload(
         "smooth_polygon": smooth_polygon,
         "feather_radius": feather_radius,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.22-dynamic-identity-protection"
+            "vehicle-segmentation-v17.0.23-imagedraw-hotfix"
         ),
     }
 
@@ -6522,7 +6523,7 @@ def normalize_vehicle_analysis(
         "manual_polygon_required_only_for_selected_components": True,
         "segmentation_strategy": "manual_smart_polygon",
         "analysis_version": (
-            "vehicle-segmentation-v17.0.22-dynamic-identity-protection"
+            "vehicle-segmentation-v17.0.23-imagedraw-hotfix"
         ),
     }
 
@@ -6667,7 +6668,7 @@ Bounding-box rules:
                 "model": configured_model,
                 "primary_error": primary_message[:800],
                 "fallback_error": fallback_message[:800],
-                "analysis_version": "vehicle-segmentation-v17.0.22-dynamic-identity-protection",
+                "analysis_version": "vehicle-segmentation-v17.0.23-imagedraw-hotfix",
             },
         ) from fallback_exc
 
@@ -6822,7 +6823,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     ),
                     "raw_component_count": len(raw_components),
                     "analysis_version": (
-                        "vehicle-segmentation-v17.0.22-dynamic-identity-protection"
+                        "vehicle-segmentation-v17.0.23-imagedraw-hotfix"
                     ),
                 },
             )
@@ -6835,7 +6836,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                 "gpt-4.1-mini",
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.22-dynamic-identity-protection"
+                "vehicle-segmentation-v17.0.23-imagedraw-hotfix"
             ),
             "mask_format": "data:image/png;base64",
             "mask_semantics": "white_component_black_background",
@@ -6883,7 +6884,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     "error_type": type(exc).__name__,
                     "error": str(exc)[:1600],
                     "analysis_version": (
-                        "vehicle-segmentation-v17.0.22-dynamic-identity-protection"
+                        "vehicle-segmentation-v17.0.23-imagedraw-hotfix"
                     ),
                 },
             },
@@ -6925,7 +6926,7 @@ def start_vehicle_component_analysis(
             "result": None,
             "error": None,
             "analysis_version": (
-                "vehicle-segmentation-v17.0.22-dynamic-identity-protection"
+                "vehicle-segmentation-v17.0.23-imagedraw-hotfix"
             ),
         }
 
@@ -6943,7 +6944,7 @@ def start_vehicle_component_analysis(
             f"/v1/vehicle/analyze-components/status/{job_id}"
         ),
         "analysis_version": (
-            "vehicle-segmentation-v17.0.22-dynamic-identity-protection"
+            "vehicle-segmentation-v17.0.23-imagedraw-hotfix"
         ),
     }
 
@@ -7041,7 +7042,7 @@ def snap_vehicle_polygon_points(
         ),
         "snap_radius": payload.snap_radius,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.22-dynamic-identity-protection"
+            "vehicle-segmentation-v17.0.23-imagedraw-hotfix"
         ),
     }
 
@@ -7253,7 +7254,7 @@ def refine_vehicle_component(payload: ComponentRefineRequest):
         "requires_review": diagnostics.get("refinement_status") != "refined",
         "refinement": diagnostics,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.22-dynamic-identity-protection"
+            "vehicle-segmentation-v17.0.23-imagedraw-hotfix"
         ),
     }
 
@@ -7277,7 +7278,7 @@ def analyze_vehicle_components_sync_disabled(
                 "/v1/vehicle/analyze-components/status/{job_id}"
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.22-dynamic-identity-protection"
+                "vehicle-segmentation-v17.0.23-imagedraw-hotfix"
             ),
         },
     )
@@ -7360,7 +7361,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v17.0.22-dynamic-identity-protection",
+        "prompt_version": "damage-v17.0.23-imagedraw-hotfix",
         "result_kind": "full_frame_jpeg",
         "full_frame_guard": full_frame_diagnostics,
     }
@@ -7369,7 +7370,7 @@ async def edit_damage(
 @app.post("/v1/damage/edit-base64")
 def edit_damage_base64(payload: DamageEditBase64Request):
     """
-    V17.0.22 Dynamic Identity Protection
+    V17.0.23 ImageDraw Hotfix
 
     - con maschera manuale: foto completa + perimetro reale + prompt naturale,
       output diretto del modello e validazione anti-cambio-auto;
@@ -7778,7 +7779,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 ).decode("ascii"),
                 "mime_type": "image/jpeg",
                 "prompt_version": (
-                    "damage-v17.0.22-dynamic-identity-protection"
+                    "damage-v17.0.23-imagedraw-hotfix"
                 ),
                 "result_kind": "full_frame_jpeg",
                 "deformation_type": payload.deformation_type,
@@ -7836,7 +7837,8 @@ def edit_damage_base64(payload: DamageEditBase64Request):
             ),
             "multicomponent_validation_applied": True,
             "multicomponent_release_mode": True,
-            "backend_version": "1.7.0.21",
+            "backend_version": "1.7.0.23",
+            "imagedraw_hotfix_applied": True,
             "vehicle_identity_lock_applied": True,
             "rear_light_geometry_lock_applied": True,
             "badge_logo_plate_lock_applied": True,
@@ -8135,7 +8137,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
             "area_percent": area_percent,
             "result_base64": base64.b64encode(result_bytes).decode("ascii"),
             "mime_type": "image/jpeg",
-            "prompt_version": "damage-v17.0.22-dynamic-identity-protection",
+            "prompt_version": "damage-v17.0.23-imagedraw-hotfix",
             "result_kind": "full_frame_jpeg",
             "full_frame_guard": full_frame_diagnostics,
             "deformation_type": payload.deformation_type,
