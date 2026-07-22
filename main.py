@@ -66,7 +66,7 @@ ALLOWED_ORIGINS = [
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.7.0.14",
+    version="1.7.0.17",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -2574,6 +2574,195 @@ def validate_protected_components_unchanged(
 
 
 
+
+def build_collision_consequences_prompt(
+    selected_components: list[str],
+    protected_components: list[str],
+    severity_percent: int,
+    area_percent: int,
+    impact_direction: str,
+) -> str:
+    """
+    V17.0.17 - Conseguenze fisiche coerenti su fanali posteriori e lunotto.
+    Le protezioni esplicite prevalgono sempre.
+    """
+    selected = {
+        str(item).strip().lower()
+        for item in selected_components or []
+    }
+    protected = {
+        str(item).strip().lower()
+        for item in protected_components or []
+    }
+
+    severity = max(0, min(100, abs(int(severity_percent))))
+    area = max(0, min(100, abs(int(area_percent))))
+
+    rear_body_components = {
+        "rear_bumper",
+        "bumper_rear",
+        "rear_fender",
+        "rear_fender_left",
+        "rear_fender_right",
+        "rear_quarter_panel",
+        "rear_quarter_panel_left",
+        "rear_quarter_panel_right",
+        "tailgate",
+        "trunk_lid",
+        "rear_panel",
+    }
+
+    rear_light_components = {
+        "rear_light",
+        "tail_light",
+        "left_tail_light",
+        "right_tail_light",
+        "rear_lamp",
+        "rear_light_left",
+        "rear_light_right",
+    }
+
+    rear_glass_components = {
+        "rear_window",
+        "rear_windscreen",
+        "back_glass",
+        "tailgate_glass",
+        "lunotto",
+    }
+
+    rear_collision = (
+        bool(selected & rear_body_components)
+        or impact_direction == "rear_to_front"
+    )
+    rear_light_selected = bool(selected & rear_light_components)
+    rear_light_protected = bool(protected & rear_light_components)
+    rear_glass_selected = bool(selected & rear_glass_components)
+    rear_glass_protected = bool(protected & rear_glass_components)
+
+    severe_rear_collision = (
+        rear_collision
+        and severity >= 65
+        and area >= 35
+    )
+    very_severe_rear_collision = (
+        rear_collision
+        and severity >= 78
+        and area >= 50
+    )
+
+    if rear_light_protected:
+        rear_light_rule = """
+REAR LIGHT PROTECTION — ABSOLUTE
+
+A rear light is explicitly protected.
+
+Preserve exactly its lens outline, internal geometry, housing position,
+mounting points, reflections and panel gaps.
+
+Do not crack, displace, shatter, blur or regenerate the protected rear light.
+""".strip()
+    elif severe_rear_collision or rear_light_selected:
+        rear_light_rule = """
+REAR LIGHT DAMAGE — REQUIRED WHEN PHYSICALLY REACHED
+
+The rear collision is severe enough to affect the rear light mounting area.
+
+The rear light nearest the impact must show physically plausible damage:
+- cracked or partially shattered lens;
+- displaced or tilted housing;
+- broken mounting points;
+- partial separation from the body;
+- internal elements visibly misaligned.
+
+Do not leave the affected rear light perfectly intact when the surrounding
+bumper, rear quarter panel or tailgate is heavily crushed around it.
+
+Preserve its recognizable original design and colour.
+Do not damage the opposite rear light unless the collision force reaches it.
+""".strip()
+    else:
+        rear_light_rule = """
+REAR LIGHT CONSISTENCY
+
+Keep the rear light intact only when the force does not reach its housing or
+mounting area. Do not add arbitrary breakage.
+""".strip()
+
+    if rear_glass_protected:
+        rear_glass_rule = """
+REAR WINDOW PROTECTION — ABSOLUTE
+
+The rear window is explicitly protected.
+
+Preserve its exact outline, transparency, reflections, heating lines,
+seal position and mounting within the tailgate frame.
+
+Do not crack, detach, shatter or regenerate the protected rear window.
+""".strip()
+    elif rear_glass_selected or very_severe_rear_collision:
+        rear_glass_rule = """
+REAR WINDOW DAMAGE — REQUIRED WHEN THE FRAME IS HEAVILY DISTORTED
+
+The tailgate and rear frame are deformed strongly enough that the rear
+window cannot remain perfectly intact.
+
+Create a physically plausible consequence according to frame distortion:
+- cracks starting from stressed edges;
+- partial fracture;
+- separation from part of the rubber seal;
+- localized shattering;
+- complete breakage only when frame distortion is extreme.
+
+Glass damage must follow stress transmitted through the distorted tailgate
+frame. Do not create decorative cracks or damage unrelated windows.
+""".strip()
+    elif severe_rear_collision:
+        rear_glass_rule = """
+REAR WINDOW CONDITIONAL DAMAGE
+
+Inspect the tailgate frame.
+
+If the window opening is twisted, compressed or displaced, add realistic
+edge cracks or partial detachment from the seal.
+
+If the frame remains geometrically stable, the glass may remain intact.
+Do not keep the glass perfect when its surrounding frame is severely bent.
+""".strip()
+    else:
+        rear_glass_rule = """
+REAR WINDOW CONSISTENCY
+
+Keep the rear window intact unless the tailgate frame transmits enough
+physical stress to crack or detach it.
+""".strip()
+
+    return f"""
+COLLISION CONSEQUENCES AND IDENTITY PRESERVATION — STRICT
+
+LICENSE PLATE:
+- preserve the exact original license plate;
+- preserve text, characters, spacing, colour, size and position;
+- do not remove, blur, replace, distort or regenerate it;
+- do not invent a different plate;
+- if its mounting panel moves, the plate may move with it, but all characters
+  must remain exactly readable and unchanged.
+
+{rear_light_rule}
+
+{rear_glass_rule}
+
+MULTI-COMPONENT CONSISTENCY:
+- all selected damaged components belong to one collision event;
+- deformation follows one impact origin and one force direction;
+- plastic, sheet metal, lights and glass react according to their material;
+- fragile parts must react consistently with surrounding damage;
+- do not preserve a fragile part unrealistically when its mounting area or
+  supporting frame is clearly crushed;
+- do not break fragile parts outside the collision path;
+- explicit protected components always override automatic consequences.
+""".strip()
+
+
 def build_impact_direction_prompt(
     impact_direction: str,
 ) -> str:
@@ -3189,9 +3378,23 @@ def call_openai_image_edit(
 
     except Exception as exc:
         request_id = getattr(exc, "request_id", None)
-        print("OPENAI IMAGE ERROR:", repr(exc), flush=True)
-        if request_id:
-            print("OPENAI REQUEST ID:", request_id, flush=True)
+        print(
+            "[OPENAI IMAGE ERROR]",
+            {
+                "type": type(exc).__name__,
+                "error": str(exc),
+                "request_id": request_id,
+                "model": os.getenv(
+                    "OPENAI_IMAGE_MODEL",
+                    "gpt-image-2",
+                ),
+                "quality": quality,
+                "source_size": list(source.size),
+                "mask_size": list(api_mask.size),
+                "prompt_length": len(prompt),
+            },
+            flush=True,
+        )
         traceback.print_exc()
 
         raise HTTPException(
@@ -3423,7 +3626,7 @@ def _replicate_json_request(
             status_code=500,
             detail={
                 "message": "REPLICATE_API_TOKEN non configurato su Render.",
-                "analysis_version": "vehicle-segmentation-v17.0.14-heic-normalize",
+                "analysis_version": "vehicle-segmentation-v17.0.17-fragile-rear-components",
             },
         )
 
@@ -3466,7 +3669,7 @@ def _replicate_json_request(
                 "http_status": exc.code,
                 "request_url": url,
                 "replicate_detail": error_body[:2000],
-                "analysis_version": "vehicle-segmentation-v17.0.14-heic-normalize",
+                "analysis_version": "vehicle-segmentation-v17.0.17-fragile-rear-components",
             },
         ) from exc
     except Exception as exc:
@@ -3475,7 +3678,7 @@ def _replicate_json_request(
             detail={
                 "message": "Connessione a Replicate non riuscita.",
                 "error": f"{type(exc).__name__}: {str(exc)}"[:1200],
-                "analysis_version": "vehicle-segmentation-v17.0.14-heic-normalize",
+                "analysis_version": "vehicle-segmentation-v17.0.17-fragile-rear-components",
             },
         ) from exc
 
@@ -4370,7 +4573,7 @@ def _create_replicate_prediction(
                 "Limite Replicate ancora attivo dopo diversi tentativi."
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.14-heic-normalize"
+                "vehicle-segmentation-v17.0.17-fragile-rear-components"
             ),
         },
     )
@@ -5422,7 +5625,7 @@ def smart_polygon_component_payload(
         "smooth_polygon": smooth_polygon,
         "feather_radius": feather_radius,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.14-heic-normalize"
+            "vehicle-segmentation-v17.0.17-fragile-rear-components"
         ),
     }
 
@@ -5746,7 +5949,7 @@ def normalize_vehicle_analysis(
         "manual_polygon_required_only_for_selected_components": True,
         "segmentation_strategy": "manual_smart_polygon",
         "analysis_version": (
-            "vehicle-segmentation-v17.0.14-heic-normalize"
+            "vehicle-segmentation-v17.0.17-fragile-rear-components"
         ),
     }
 
@@ -5891,7 +6094,7 @@ Bounding-box rules:
                 "model": configured_model,
                 "primary_error": primary_message[:800],
                 "fallback_error": fallback_message[:800],
-                "analysis_version": "vehicle-segmentation-v17.0.14-heic-normalize",
+                "analysis_version": "vehicle-segmentation-v17.0.17-fragile-rear-components",
             },
         ) from fallback_exc
 
@@ -6046,7 +6249,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     ),
                     "raw_component_count": len(raw_components),
                     "analysis_version": (
-                        "vehicle-segmentation-v17.0.14-heic-normalize"
+                        "vehicle-segmentation-v17.0.17-fragile-rear-components"
                     ),
                 },
             )
@@ -6059,7 +6262,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                 "gpt-4.1-mini",
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.14-heic-normalize"
+                "vehicle-segmentation-v17.0.17-fragile-rear-components"
             ),
             "mask_format": "data:image/png;base64",
             "mask_semantics": "white_component_black_background",
@@ -6107,7 +6310,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     "error_type": type(exc).__name__,
                     "error": str(exc)[:1600],
                     "analysis_version": (
-                        "vehicle-segmentation-v17.0.14-heic-normalize"
+                        "vehicle-segmentation-v17.0.17-fragile-rear-components"
                     ),
                 },
             },
@@ -6149,7 +6352,7 @@ def start_vehicle_component_analysis(
             "result": None,
             "error": None,
             "analysis_version": (
-                "vehicle-segmentation-v17.0.14-heic-normalize"
+                "vehicle-segmentation-v17.0.17-fragile-rear-components"
             ),
         }
 
@@ -6167,7 +6370,7 @@ def start_vehicle_component_analysis(
             f"/v1/vehicle/analyze-components/status/{job_id}"
         ),
         "analysis_version": (
-            "vehicle-segmentation-v17.0.14-heic-normalize"
+            "vehicle-segmentation-v17.0.17-fragile-rear-components"
         ),
     }
 
@@ -6265,7 +6468,7 @@ def snap_vehicle_polygon_points(
         ),
         "snap_radius": payload.snap_radius,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.14-heic-normalize"
+            "vehicle-segmentation-v17.0.17-fragile-rear-components"
         ),
     }
 
@@ -6477,7 +6680,7 @@ def refine_vehicle_component(payload: ComponentRefineRequest):
         "requires_review": diagnostics.get("refinement_status") != "refined",
         "refinement": diagnostics,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.14-heic-normalize"
+            "vehicle-segmentation-v17.0.17-fragile-rear-components"
         ),
     }
 
@@ -6501,7 +6704,7 @@ def analyze_vehicle_components_sync_disabled(
                 "/v1/vehicle/analyze-components/status/{job_id}"
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.14-heic-normalize"
+                "vehicle-segmentation-v17.0.17-fragile-rear-components"
             ),
         },
     )
@@ -6584,7 +6787,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v17.0.14-heic-normalize",
+        "prompt_version": "damage-v17.0.17-fragile-rear-components",
         "result_kind": "full_frame_jpeg",
         "full_frame_guard": full_frame_diagnostics,
     }
@@ -6593,233 +6796,588 @@ async def edit_damage(
 @app.post("/v1/damage/edit-base64")
 def edit_damage_base64(payload: DamageEditBase64Request):
     """
-    V17.0.14 HEIC Normalize
+    V17.0.17 Fragile Rear Components
 
     - con maschera manuale: foto completa + perimetro reale + prompt naturale,
       output diretto del modello e validazione anti-cambio-auto;
     - senza maschera: fallback guidato full-frame;
     - modalità storiche: comportamento precedente.
     """
-    if payload.component_masks_base64 is None:
-        payload = copy_request_model(
-            payload,
-            {"component_masks_base64": {}},
+    request_diagnostic_id = str(uuid.uuid4())
+    request_started_at = time.time()
+    print(
+        "[DAMAGE EDIT START]",
+        {
+            "diagnostic_id": request_diagnostic_id,
+            "damage_mode": payload.damage_mode,
+            "selected_components": payload.selected_components,
+            "protected_components": payload.protected_components,
+            "severity_percent": payload.severity_percent,
+            "area_percent": payload.area_percent,
+            "impact_direction": payload.impact_direction,
+            "deformation_type": payload.deformation_type,
+            "output_quality": payload.output_quality,
+            "has_mask": bool(payload.mask_base64),
+            "image_base64_length": len(payload.image_base64 or ""),
+            "mask_base64_length": len(payload.mask_base64 or ""),
+            "user_instructions_length": len(
+                payload.user_instructions or ""
+            ),
+        },
+        flush=True,
+    )
+    try:
+        if payload.component_masks_base64 is None:
+            payload = copy_request_model(
+                payload,
+                {"component_masks_base64": {}},
+            )
+
+        severity_percent = clamp_percentage(payload.severity_percent)
+        area_percent = clamp_percentage(payload.area_percent)
+
+        source = decode_base64_image(
+            payload.image_base64,
+            "image_base64",
+            "RGB",
+        )
+        source, original_source_size, processing_scale = (
+            resize_in_place_for_memory(
+                source,
+                MAX_PROCESSING_SIDE,
+            )
+        )
+        processing_size = source.size
+        gc.collect()
+
+        guided_mode = payload.damage_mode in {
+            "simple_guided",
+            "hybrid_guided",
+        } or (
+            payload.damage_mode == "auto"
+            and bool(payload.user_instructions.strip())
         )
 
-    severity_percent = clamp_percentage(payload.severity_percent)
-    area_percent = clamp_percentage(payload.area_percent)
+        job_id = str(uuid.uuid4())
 
-    source = decode_base64_image(
-        payload.image_base64,
-        "image_base64",
-        "RGB",
-    )
-    source, original_source_size, processing_scale = (
-        resize_in_place_for_memory(
-            source,
-            MAX_PROCESSING_SIDE,
-        )
-    )
-    processing_size = source.size
-    gc.collect()
+        if guided_mode:
+            if not payload.user_instructions.strip():
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "La modalità guidata richiede user_instructions "
+                        "con la descrizione completa del danno."
+                    ),
+                )
 
-    guided_mode = payload.damage_mode in {
-        "simple_guided",
-        "hybrid_guided",
-    } or (
-        payload.damage_mode == "auto"
-        and bool(payload.user_instructions.strip())
-    )
+            has_manual_mask = bool(payload.mask_base64)
 
-    job_id = str(uuid.uuid4())
+            if has_manual_mask:
+                raw_manual_mask = decode_base64_image(
+                    payload.mask_base64,
+                    "mask_base64",
+                    "L",
+                )
+                raw_manual_mask = resize_mask_to_processing_size(
+                    raw_manual_mask,
+                    source.size,
+                )
+                guided_mask, api_mask, mask_diagnostics = (
+                    prepare_hybrid_guided_api_mask(
+                        manual_mask=raw_manual_mask,
+                        target_size=source.size,
+                        edge_margin_px=1,
+                    )
+                )
+                resolved_guided_mode = "hybrid_guided"
+            else:
+                # Fallback semplice: resta disponibile, ma è meno protetto.
+                guided_mask = Image.new(
+                    "L",
+                    source.size,
+                    color=255,
+                )
+                api_mask = alter_damage_area(guided_mask, 0)
+                mask_diagnostics = {
+                    "manual_mask_pixels": 0,
+                    "guided_mask_pixels": int(
+                        source.size[0] * source.size[1]
+                    ),
+                    "edge_margin_px": 0,
+                    "mask_geometry_source": "full_frame_fallback",
+                }
+                resolved_guided_mode = "simple_guided"
 
-    if guided_mode:
-        if not payload.user_instructions.strip():
+            protected_components_prompt = (
+                build_strict_protected_components_prompt(
+                    payload.protected_components
+                )
+            )
+
+            deformation_quality_prompt = build_deformation_quality_prompt(
+                severity_percent=severity_percent,
+                area_percent=area_percent,
+                deformation_type=payload.deformation_type,
+            )
+
+            impact_direction_prompt = build_impact_direction_prompt(
+                payload.impact_direction
+            )
+
+            collision_consequences_prompt = build_collision_consequences_prompt(
+                selected_components=payload.selected_components,
+                protected_components=payload.protected_components,
+                severity_percent=severity_percent,
+                area_percent=area_percent,
+                impact_direction=payload.impact_direction,
+            )
+
+            balanced_continuity_prompt = build_balanced_continuity_prompt(
+                damage_continuity_text=payload.user_instructions,
+                area_percent=area_percent,
+                severity_percent=severity_percent,
+            )
+
+            strict_identity_prompt = f"""
+    STRICT CONSERVATIVE IMAGE EDIT OF THE PROVIDED ORIGINAL PHOTOGRAPH.
+
+    This is not a new image generation task.
+
+    Keep exactly the same:
+    - vehicle identity, make, model and body shape;
+    - paint colour and surface finish;
+    - headlights, grille, bumper, wheels, tyres, mirrors, glass and doors;
+    - workshop environment, floor, lift, surrounding vehicles and background;
+    - camera angle, perspective, framing, lighting and reflections.
+
+    Never replace the vehicle.
+    Never create a different make or model.
+    Never redesign unrelated panels.
+    Never change the workshop or viewpoint.
+
+    User-guided damage instructions:
+    {payload.user_instructions.strip()}
+
+    Editing rules:
+    - modify only the requested component of this exact vehicle;
+    - begin the deformation near the selected impact point;
+    - propagate the metal deformation according to the requested impact direction;
+    - make it physically consistent with existing adjacent damage when requested;
+    - preserve every explicitly protected component;
+    - when a manual perimeter is supplied, use it as the real editable component
+      region and keep the rest of the photograph unchanged;
+    - do not let the deformation cross the selected panel boundary into a
+      protected component;
+    - preserve original panel gaps around protected components;
+    - return the complete edited original photograph with the same dimensions;
+
+    {protected_components_prompt}
+
+    {deformation_quality_prompt}
+
+    {impact_direction_prompt}
+
+    {collision_consequences_prompt}
+
+    {balanced_continuity_prompt}
+
+    Final output rules:
+    - do not return a crop, isolated component, transparent layer, mask or black
+      background;
+    - the output must look like this exact photograph after a local automotive
+      collision deformation.
+    """.strip()
+
+            if os.getenv("MOCK_MODE", "false").lower() == "true":
+                output = io.BytesIO()
+                source.save(
+                    output,
+                    format="JPEG",
+                    quality=95,
+                    subsampling=0,
+                )
+                result_bytes = output.getvalue()
+                result_diagnostics = {
+                    "result_is_full_frame": True,
+                    "original_size": list(source.size),
+                    "result_size": list(source.size),
+                    "direct_model_output_used": True,
+                    "post_composite_applied": False,
+                    "hybrid_result_validation_passed": True,
+                    "mock": True,
+                }
+            else:
+                generated_bytes = call_openai_image_edit(
+                    source,
+                    api_mask,
+                    strict_identity_prompt,
+                    payload.output_quality,
+                )
+
+                if has_manual_mask:
+                    result_bytes, result_diagnostics = (
+                        validate_hybrid_guided_result(
+                            source=source,
+                            candidate_bytes=generated_bytes,
+                            guided_mask=guided_mask,
+                        )
+                    )
+
+                    locality_validation = validate_deformation_locality(
+                        source=source,
+                        candidate_bytes=result_bytes,
+                        guided_mask=guided_mask,
+                        area_percent=area_percent,
+                    )
+                    result_diagnostics.update(locality_validation)
+
+                    protected_validation = (
+                        validate_protected_components_unchanged(
+                            source=source,
+                            candidate_bytes=result_bytes,
+                            protected_masks_base64=(
+                                payload.protected_component_masks_base64
+                            ),
+                        )
+                    )
+                    result_diagnostics.update(protected_validation)
+                else:
+                    # Senza perimetro non possiamo misurare in modo affidabile
+                    # le modifiche fuori componente; controlliamo solo il full frame.
+                    result_bytes, result_diagnostics = (
+                        lightweight_full_frame_validation(
+                            source=source,
+                            candidate_bytes=generated_bytes,
+                        )
+                    )
+                    result_diagnostics.update({
+                        "direct_model_output_used": True,
+                        "post_composite_applied": False,
+                        "hybrid_result_validation_passed": False,
+                        "manual_mask_missing": True,
+                        "protected_components_validation_applied": False,
+                    })
+
+            return {
+                "job_id": job_id,
+                "status": "completed",
+                "mode": "ai",
+                "severity_percent": severity_percent,
+                "area_percent": area_percent,
+                "result_base64": base64.b64encode(
+                    result_bytes
+                ).decode("ascii"),
+                "mime_type": "image/jpeg",
+                "prompt_version": (
+                    "damage-v17.0.17-fragile-rear-components"
+                ),
+                "result_kind": "full_frame_jpeg",
+                "deformation_type": payload.deformation_type,
+                "impact_direction": payload.impact_direction,
+                "damage_mode": resolved_guided_mode,
+                "mask_required": False,
+                "mask_received": has_manual_mask,
+                "mask_used_as_api_edit_region": has_manual_mask,
+                "mask_diagnostics": mask_diagnostics,
+                "result_diagnostics": result_diagnostics,
+                "composite_strategy": "none_direct_model_output",
+                "post_composite_applied": False,
+                "user_instructions_used": True,
+                "strict_vehicle_identity_prompt": True,
+            "diagnostic_id": request_diagnostic_id,
+                "protected_components": payload.protected_components,
+                "protected_components_prompt_applied": True,
+                "deformation_quality_prompt_applied": True,
+                "deformation_quality_profile": "balanced_local_continuity",
+                "balanced_continuity_prompt_applied": True,
+                "max_secondary_tension_lines_requested": 2,
+                "point_like_dent_forbidden": True,
+                "impact_direction_prompt_applied": True,
+                "rear_impact_supported": True,
+                "collision_consequences_prompt_applied": True,
+                "license_plate_preservation_applied": True,
+                "fragile_component_consistency_applied": True,
+                "rear_light_damage_logic_applied": True,
+                "rear_window_damage_logic_applied": True,
+                "fragile_component_protection_override": True,
+                "mask_edge_margin_px": (
+                    mask_diagnostics.get("edge_margin_px")
+                ),
+                "memory_optimized": True,
+                "max_processing_side": MAX_PROCESSING_SIDE,
+                "original_source_size": list(original_source_size),
+                "processing_size": list(processing_size),
+                "processing_scale": round(processing_scale, 6),
+                "heic_support_enabled": HEIC_SUPPORT_ENABLED,
+            }
+
+        # --------------------------------------------------------------
+        # Flusso storico con maschera obbligatoria.
+        # --------------------------------------------------------------
+        if not payload.mask_base64:
             raise HTTPException(
                 status_code=422,
                 detail=(
-                    "La modalità guidata richiede user_instructions "
-                    "con la descrizione completa del danno."
+                    "mask_base64 è obbligatoria nelle modalità bodywork, "
+                    "component_only e mixed."
                 ),
             )
 
-        has_manual_mask = bool(payload.mask_base64)
+        raw_edit_mask = decode_base64_image(
+            payload.mask_base64,
+            "mask_base64",
+            "L",
+        )
 
-        if has_manual_mask:
-            raw_manual_mask = decode_base64_image(
-                payload.mask_base64,
-                "mask_base64",
+        raw_protect_mask = (
+            decode_base64_image(
+                payload.protect_mask_base64,
+                "protect_mask_base64",
                 "L",
             )
-            raw_manual_mask = resize_mask_to_processing_size(
-                raw_manual_mask,
-                source.size,
-            )
-            guided_mask, api_mask, mask_diagnostics = (
-                prepare_hybrid_guided_api_mask(
-                    manual_mask=raw_manual_mask,
-                    target_size=source.size,
-                    edge_margin_px=1,
-                )
-            )
-            resolved_guided_mode = "hybrid_guided"
-        else:
-            # Fallback semplice: resta disponibile, ma è meno protetto.
-            guided_mask = Image.new(
-                "L",
-                source.size,
-                color=255,
-            )
-            api_mask = alter_damage_area(guided_mask, 0)
-            mask_diagnostics = {
-                "manual_mask_pixels": 0,
-                "guided_mask_pixels": int(
-                    source.size[0] * source.size[1]
-                ),
-                "edge_margin_px": 0,
-                "mask_geometry_source": "full_frame_fallback",
-            }
-            resolved_guided_mode = "simple_guided"
-
-        protected_components_prompt = (
-            build_strict_protected_components_prompt(
-                payload.protected_components
-            )
+            if payload.protect_mask_base64
+            else None
         )
 
-        deformation_quality_prompt = build_deformation_quality_prompt(
-            severity_percent=severity_percent,
-            area_percent=area_percent,
-            deformation_type=payload.deformation_type,
+        source_mask, protect_mask = combine_edit_and_protect_masks(
+            raw_edit_mask,
+            raw_protect_mask,
+            source.size,
         )
 
-        impact_direction_prompt = build_impact_direction_prompt(
-            payload.impact_direction
-        )
-
-        balanced_continuity_prompt = build_balanced_continuity_prompt(
-            damage_continuity_text=payload.user_instructions,
-            area_percent=area_percent,
-            severity_percent=severity_percent,
-        )
-
-        strict_identity_prompt = f"""
-STRICT CONSERVATIVE IMAGE EDIT OF THE PROVIDED ORIGINAL PHOTOGRAPH.
-
-This is not a new image generation task.
-
-Keep exactly the same:
-- vehicle identity, make, model and body shape;
-- paint colour and surface finish;
-- headlights, grille, bumper, wheels, tyres, mirrors, glass and doors;
-- workshop environment, floor, lift, surrounding vehicles and background;
-- camera angle, perspective, framing, lighting and reflections.
-
-Never replace the vehicle.
-Never create a different make or model.
-Never redesign unrelated panels.
-Never change the workshop or viewpoint.
-
-User-guided damage instructions:
-{payload.user_instructions.strip()}
-
-Editing rules:
-- modify only the requested component of this exact vehicle;
-- begin the deformation near the selected impact point;
-- propagate the metal deformation according to the requested impact direction;
-- make it physically consistent with existing adjacent damage when requested;
-- preserve every explicitly protected component;
-- when a manual perimeter is supplied, use it as the real editable component
-  region and keep the rest of the photograph unchanged;
-- do not let the deformation cross the selected panel boundary into a
-  protected component;
-- preserve original panel gaps around protected components;
-- return the complete edited original photograph with the same dimensions;
-
-{protected_components_prompt}
-
-{deformation_quality_prompt}
-
-{impact_direction_prompt}
-
-{balanced_continuity_prompt}
-
-Final output rules:
-- do not return a crop, isolated component, transparent layer, mask or black
-  background;
-- the output must look like this exact photograph after a local automotive
-  collision deformation.
-""".strip()
+        resolved_damage_mode = infer_damage_mode(payload)
 
         if os.getenv("MOCK_MODE", "false").lower() == "true":
+            adjusted_mock_mask = apply_area_percent_to_edit_mask(
+                source_mask,
+                area_percent,
+            )
+            api_mock_mask = alter_damage_area(adjusted_mock_mask, 0)
+            return make_mock_result(
+                source,
+                api_mock_mask,
+                job_id,
+                severity_percent,
+                area_percent,
+            )
+
+        if (
+            severity_percent == 0
+            and area_percent == 0
+            and payload.deformation_type == "dent"
+            and not payload.contact_traces_enabled
+            and not has_component_damage_request(payload)
+        ):
+            buffer = io.BytesIO()
+            source.save(buffer, format="JPEG", quality=95, subsampling=0)
+            result_bytes = buffer.getvalue()
+
+        elif resolved_damage_mode != "mixed":
+            effective_mask = apply_area_percent_to_edit_mask(
+                source_mask,
+                area_percent,
+            )
+            api_mask = alter_damage_area(effective_mask, 0)
+
+            prompt = build_prompt(
+                severity=severity_percent,
+                area=area_percent,
+                damage_mode=resolved_damage_mode,
+                deformation_type=payload.deformation_type,
+                impact_direction=payload.impact_direction,
+                component_instructions=build_component_instructions(payload),
+                contact_trace_instructions=build_contact_trace_instructions(payload),
+            )
+
+            generated_bytes = call_openai_image_edit(
+                source,
+                api_mask,
+                prompt,
+                payload.output_quality,
+            )
+
+            result_bytes = smart_component_composite(
+                source=source,
+                generated_bytes=generated_bytes,
+                source_mask=effective_mask,
+                protect_mask=protect_mask,
+                expansion_px=area_transition_expansion_px(area_percent),
+                feather_px=area_transition_feather_px(
+                    source.size,
+                    area_percent,
+                ),
+            )
+
+        else:
+            bodywork_codes = selected_bodywork_component_codes(payload)
+            component_codes = selected_non_body_component_codes(payload)
+
+            if bodywork_codes and not payload.bodywork_mask_base64:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "La modalità mixed richiede bodywork_mask_base64 per separare "
+                        "la lamiera dagli altri componenti."
+                    ),
+                )
+
+            missing_component_masks = [
+                code
+                for code in component_codes
+                if not (payload.component_masks_base64 or {}).get(code)
+            ]
+            if missing_component_masks:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "Mancano le maschere separate per: "
+                        + ", ".join(missing_component_masks)
+                    ),
+                )
+
+            current_image = source
+            sequential_steps: list[str] = []
+
+            if bodywork_codes:
+                raw_bodywork_mask = decode_base64_image(
+                    payload.bodywork_mask_base64,
+                    "bodywork_mask_base64",
+                    "L",
+                )
+                bodywork_mask, _ = combine_edit_and_protect_masks(
+                    raw_bodywork_mask,
+                    raw_protect_mask,
+                    source.size,
+                )
+                effective_bodywork_mask = apply_area_percent_to_edit_mask(
+                    bodywork_mask,
+                    area_percent,
+                )
+                api_bodywork_mask = alter_damage_area(
+                    effective_bodywork_mask,
+                    0,
+                )
+
+                bodywork_payload = copy_request_model(
+                    payload,
+                    {
+                        "damage_mode": "bodywork",
+                        "involved_components": {
+                            code: True for code in bodywork_codes
+                        },
+                        "component_damage_types": {
+                            code: damage_type
+                            for code, damage_type in (
+                                payload.component_damage_types or {}
+                            ).items()
+                            if code in bodywork_codes
+                        },
+                        "bodywork_mask_base64": None,
+                        "component_masks_base64": {},
+                    }
+                )
+
+                bodywork_prompt = build_prompt(
+                    severity=severity_percent,
+                    area=area_percent,
+                    damage_mode="bodywork",
+                    deformation_type=payload.deformation_type,
+                    impact_direction=payload.impact_direction,
+                    component_instructions=build_component_instructions(
+                        bodywork_payload
+                    ),
+                    contact_trace_instructions=build_contact_trace_instructions(
+                        bodywork_payload
+                    ),
+                )
+
+                generated_bodywork = call_openai_image_edit(
+                    current_image,
+                    api_bodywork_mask,
+                    bodywork_prompt,
+                    payload.output_quality,
+                )
+
+                bodywork_result = smart_component_composite(
+                    source=current_image,
+                    generated_bytes=generated_bodywork,
+                    source_mask=effective_bodywork_mask,
+                    protect_mask=protect_mask,
+                    expansion_px=area_transition_expansion_px(area_percent),
+                    feather_px=area_transition_feather_px(
+                        current_image.size,
+                        area_percent,
+                    ),
+                )
+                current_image = jpeg_bytes_to_rgb_image(bodywork_result)
+                sequential_steps.append("bodywork")
+
+            for component_code in component_codes:
+                raw_component_mask = decode_base64_image(
+                    (payload.component_masks_base64 or {})[component_code],
+                    f"component_masks_base64[{component_code}]",
+                    "L",
+                )
+                component_mask, _ = combine_edit_and_protect_masks(
+                    raw_component_mask,
+                    raw_protect_mask,
+                    source.size,
+                )
+                api_component_mask = alter_damage_area(component_mask, 0)
+                component_payload = payload_for_single_component(
+                    payload,
+                    component_code,
+                )
+
+                component_prompt = build_prompt(
+                    severity=severity_percent,
+                    area=0,
+                    damage_mode="component_only",
+                    deformation_type=payload.deformation_type,
+                    impact_direction=payload.impact_direction,
+                    component_instructions=build_component_instructions(
+                        component_payload
+                    ),
+                    contact_trace_instructions=build_contact_trace_instructions(
+                        component_payload
+                    ),
+                )
+
+                generated_component = call_openai_image_edit(
+                    current_image,
+                    api_component_mask,
+                    component_prompt,
+                    payload.output_quality,
+                )
+
+                component_result = smart_component_composite(
+                    source=current_image,
+                    generated_bytes=generated_component,
+                    source_mask=component_mask,
+                    protect_mask=protect_mask,
+                )
+                current_image = jpeg_bytes_to_rgb_image(component_result)
+                sequential_steps.append(component_code)
+
             output = io.BytesIO()
-            source.save(
+            current_image.save(
                 output,
                 format="JPEG",
                 quality=95,
                 subsampling=0,
             )
             result_bytes = output.getvalue()
-            result_diagnostics = {
-                "result_is_full_frame": True,
-                "original_size": list(source.size),
-                "result_size": list(source.size),
-                "direct_model_output_used": True,
-                "post_composite_applied": False,
-                "hybrid_result_validation_passed": True,
-                "mock": True,
-            }
-        else:
-            generated_bytes = call_openai_image_edit(
-                source,
-                api_mask,
-                strict_identity_prompt,
-                payload.output_quality,
-            )
 
-            if has_manual_mask:
-                result_bytes, result_diagnostics = (
-                    validate_hybrid_guided_result(
-                        source=source,
-                        candidate_bytes=generated_bytes,
-                        guided_mask=guided_mask,
-                    )
-                )
-
-                locality_validation = validate_deformation_locality(
-                    source=source,
-                    candidate_bytes=result_bytes,
-                    guided_mask=guided_mask,
-                    area_percent=area_percent,
-                )
-                result_diagnostics.update(locality_validation)
-
-                protected_validation = (
-                    validate_protected_components_unchanged(
-                        source=source,
-                        candidate_bytes=result_bytes,
-                        protected_masks_base64=(
-                            payload.protected_component_masks_base64
-                        ),
-                    )
-                )
-                result_diagnostics.update(protected_validation)
-            else:
-                # Senza perimetro non possiamo misurare in modo affidabile
-                # le modifiche fuori componente; controlliamo solo il full frame.
-                result_bytes, result_diagnostics = (
-                    lightweight_full_frame_validation(
-                        source=source,
-                        candidate_bytes=generated_bytes,
-                    )
-                )
-                result_diagnostics.update({
-                    "direct_model_output_used": True,
-                    "post_composite_applied": False,
-                    "hybrid_result_validation_passed": False,
-                    "manual_mask_missing": True,
-                    "protected_components_validation_applied": False,
-                })
+        result_bytes, full_frame_diagnostics = enforce_full_frame_result(
+            source=source,
+            candidate_bytes=result_bytes,
+            edit_mask=source_mask,
+            protect_mask=protect_mask,
+            feather_px=area_transition_feather_px(
+                source.size,
+                area_percent,
+            ),
+        )
 
         return {
             "job_id": job_id,
@@ -6827,351 +7385,96 @@ Final output rules:
             "mode": "ai",
             "severity_percent": severity_percent,
             "area_percent": area_percent,
-            "result_base64": base64.b64encode(
-                result_bytes
-            ).decode("ascii"),
+            "result_base64": base64.b64encode(result_bytes).decode("ascii"),
             "mime_type": "image/jpeg",
-            "prompt_version": (
-                "damage-v17.0.14-heic-normalize"
-            ),
+            "prompt_version": "damage-v17.0.17-fragile-rear-components",
             "result_kind": "full_frame_jpeg",
+            "full_frame_guard": full_frame_diagnostics,
             "deformation_type": payload.deformation_type,
             "impact_direction": payload.impact_direction,
-            "damage_mode": resolved_guided_mode,
-            "mask_required": False,
-            "mask_received": has_manual_mask,
-            "mask_used_as_api_edit_region": has_manual_mask,
-            "mask_diagnostics": mask_diagnostics,
-            "result_diagnostics": result_diagnostics,
-            "composite_strategy": "none_direct_model_output",
-            "post_composite_applied": False,
-            "user_instructions_used": True,
-            "strict_vehicle_identity_prompt": True,
-            "protected_components": payload.protected_components,
-            "protected_components_prompt_applied": True,
-            "deformation_quality_prompt_applied": True,
-            "deformation_quality_profile": "balanced_local_continuity",
-            "balanced_continuity_prompt_applied": True,
-            "max_secondary_tension_lines_requested": 2,
-            "point_like_dent_forbidden": True,
-            "impact_direction_prompt_applied": True,
-            "rear_impact_supported": True,
-            "mask_edge_margin_px": (
-                mask_diagnostics.get("edge_margin_px")
+            "contact_traces_enabled": payload.contact_traces_enabled,
+            "involved_components": payload.involved_components,
+            "damage_mode": resolved_damage_mode,
+            "area_control": "manual_mask_geometry_unchanged",
+            "area_transition_feather_px": area_transition_feather_px(
+                source.size,
+                area_percent,
             ),
-            "memory_optimized": True,
-            "max_processing_side": MAX_PROCESSING_SIDE,
-            "original_source_size": list(original_source_size),
-            "processing_size": list(processing_size),
-            "processing_scale": round(processing_scale, 6),
-            "heic_support_enabled": HEIC_SUPPORT_ENABLED,
+            "composite_strategy": "single_protected_composite",
+            "segmentation_contract": "per_component_png_masks",
+            "strict_mask_boundary": True,
+            "outside_mask_preserved": True,
+            "mask_expansion_outside_component": False,
+            "mixed_strategy": (
+                "sequential_per_component"
+                if resolved_damage_mode == "mixed"
+                else "single_pass"
+            ),
+            "sequential_steps": (
+                sequential_steps
+                if resolved_damage_mode == "mixed"
+                else []
+            ),
         }
-
-    # --------------------------------------------------------------
-    # Flusso storico con maschera obbligatoria.
-    # --------------------------------------------------------------
-    if not payload.mask_base64:
+    except HTTPException as exc:
+        elapsed_ms = round(
+            (time.time() - request_started_at) * 1000
+        )
+        print(
+            "[DAMAGE EDIT HTTP ERROR]",
+            {
+                "diagnostic_id": request_diagnostic_id,
+                "status_code": exc.status_code,
+                "detail": exc.detail,
+                "elapsed_ms": elapsed_ms,
+                "damage_mode": payload.damage_mode,
+                "selected_components": payload.selected_components,
+                "protected_components": payload.protected_components,
+                "severity_percent": payload.severity_percent,
+                "area_percent": payload.area_percent,
+                "impact_direction": payload.impact_direction,
+                "deformation_type": payload.deformation_type,
+                "output_quality": payload.output_quality,
+                "has_mask": bool(payload.mask_base64),
+            },
+            flush=True,
+        )
+        raise
+    except Exception as exc:
+        elapsed_ms = round(
+            (time.time() - request_started_at) * 1000
+        )
+        print(
+            "[DAMAGE EDIT UNHANDLED ERROR]",
+            {
+                "diagnostic_id": request_diagnostic_id,
+                "type": type(exc).__name__,
+                "error": str(exc),
+                "elapsed_ms": elapsed_ms,
+                "damage_mode": payload.damage_mode,
+                "selected_components": payload.selected_components,
+                "protected_components": payload.protected_components,
+                "severity_percent": payload.severity_percent,
+                "area_percent": payload.area_percent,
+                "impact_direction": payload.impact_direction,
+                "deformation_type": payload.deformation_type,
+                "output_quality": payload.output_quality,
+                "has_mask": bool(payload.mask_base64),
+            },
+            flush=True,
+        )
+        traceback.print_exc()
         raise HTTPException(
-            status_code=422,
-            detail=(
-                "mask_base64 è obbligatoria nelle modalità bodywork, "
-                "component_only e mixed."
-            ),
-        )
-
-    raw_edit_mask = decode_base64_image(
-        payload.mask_base64,
-        "mask_base64",
-        "L",
-    )
-
-    raw_protect_mask = (
-        decode_base64_image(
-            payload.protect_mask_base64,
-            "protect_mask_base64",
-            "L",
-        )
-        if payload.protect_mask_base64
-        else None
-    )
-
-    source_mask, protect_mask = combine_edit_and_protect_masks(
-        raw_edit_mask,
-        raw_protect_mask,
-        source.size,
-    )
-
-    resolved_damage_mode = infer_damage_mode(payload)
-
-    if os.getenv("MOCK_MODE", "false").lower() == "true":
-        adjusted_mock_mask = apply_area_percent_to_edit_mask(
-            source_mask,
-            area_percent,
-        )
-        api_mock_mask = alter_damage_area(adjusted_mock_mask, 0)
-        return make_mock_result(
-            source,
-            api_mock_mask,
-            job_id,
-            severity_percent,
-            area_percent,
-        )
-
-    if (
-        severity_percent == 0
-        and area_percent == 0
-        and payload.deformation_type == "dent"
-        and not payload.contact_traces_enabled
-        and not has_component_damage_request(payload)
-    ):
-        buffer = io.BytesIO()
-        source.save(buffer, format="JPEG", quality=95, subsampling=0)
-        result_bytes = buffer.getvalue()
-
-    elif resolved_damage_mode != "mixed":
-        effective_mask = apply_area_percent_to_edit_mask(
-            source_mask,
-            area_percent,
-        )
-        api_mask = alter_damage_area(effective_mask, 0)
-
-        prompt = build_prompt(
-            severity=severity_percent,
-            area=area_percent,
-            damage_mode=resolved_damage_mode,
-            deformation_type=payload.deformation_type,
-            impact_direction=payload.impact_direction,
-            component_instructions=build_component_instructions(payload),
-            contact_trace_instructions=build_contact_trace_instructions(payload),
-        )
-
-        generated_bytes = call_openai_image_edit(
-            source,
-            api_mask,
-            prompt,
-            payload.output_quality,
-        )
-
-        result_bytes = smart_component_composite(
-            source=source,
-            generated_bytes=generated_bytes,
-            source_mask=effective_mask,
-            protect_mask=protect_mask,
-            expansion_px=area_transition_expansion_px(area_percent),
-            feather_px=area_transition_feather_px(
-                source.size,
-                area_percent,
-            ),
-        )
-
-    else:
-        bodywork_codes = selected_bodywork_component_codes(payload)
-        component_codes = selected_non_body_component_codes(payload)
-
-        if bodywork_codes and not payload.bodywork_mask_base64:
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    "La modalità mixed richiede bodywork_mask_base64 per separare "
-                    "la lamiera dagli altri componenti."
+            status_code=500,
+            detail={
+                "message": (
+                    "Errore interno durante la generazione."
                 ),
-            )
-
-        missing_component_masks = [
-            code
-            for code in component_codes
-            if not (payload.component_masks_base64 or {}).get(code)
-        ]
-        if missing_component_masks:
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    "Mancano le maschere separate per: "
-                    + ", ".join(missing_component_masks)
-                ),
-            )
-
-        current_image = source
-        sequential_steps: list[str] = []
-
-        if bodywork_codes:
-            raw_bodywork_mask = decode_base64_image(
-                payload.bodywork_mask_base64,
-                "bodywork_mask_base64",
-                "L",
-            )
-            bodywork_mask, _ = combine_edit_and_protect_masks(
-                raw_bodywork_mask,
-                raw_protect_mask,
-                source.size,
-            )
-            effective_bodywork_mask = apply_area_percent_to_edit_mask(
-                bodywork_mask,
-                area_percent,
-            )
-            api_bodywork_mask = alter_damage_area(
-                effective_bodywork_mask,
-                0,
-            )
-
-            bodywork_payload = copy_request_model(
-                payload,
-                {
-                    "damage_mode": "bodywork",
-                    "involved_components": {
-                        code: True for code in bodywork_codes
-                    },
-                    "component_damage_types": {
-                        code: damage_type
-                        for code, damage_type in (
-                            payload.component_damage_types or {}
-                        ).items()
-                        if code in bodywork_codes
-                    },
-                    "bodywork_mask_base64": None,
-                    "component_masks_base64": {},
-                }
-            )
-
-            bodywork_prompt = build_prompt(
-                severity=severity_percent,
-                area=area_percent,
-                damage_mode="bodywork",
-                deformation_type=payload.deformation_type,
-                impact_direction=payload.impact_direction,
-                component_instructions=build_component_instructions(
-                    bodywork_payload
-                ),
-                contact_trace_instructions=build_contact_trace_instructions(
-                    bodywork_payload
-                ),
-            )
-
-            generated_bodywork = call_openai_image_edit(
-                current_image,
-                api_bodywork_mask,
-                bodywork_prompt,
-                payload.output_quality,
-            )
-
-            bodywork_result = smart_component_composite(
-                source=current_image,
-                generated_bytes=generated_bodywork,
-                source_mask=effective_bodywork_mask,
-                protect_mask=protect_mask,
-                expansion_px=area_transition_expansion_px(area_percent),
-                feather_px=area_transition_feather_px(
-                    current_image.size,
-                    area_percent,
-                ),
-            )
-            current_image = jpeg_bytes_to_rgb_image(bodywork_result)
-            sequential_steps.append("bodywork")
-
-        for component_code in component_codes:
-            raw_component_mask = decode_base64_image(
-                (payload.component_masks_base64 or {})[component_code],
-                f"component_masks_base64[{component_code}]",
-                "L",
-            )
-            component_mask, _ = combine_edit_and_protect_masks(
-                raw_component_mask,
-                raw_protect_mask,
-                source.size,
-            )
-            api_component_mask = alter_damage_area(component_mask, 0)
-            component_payload = payload_for_single_component(
-                payload,
-                component_code,
-            )
-
-            component_prompt = build_prompt(
-                severity=severity_percent,
-                area=0,
-                damage_mode="component_only",
-                deformation_type=payload.deformation_type,
-                impact_direction=payload.impact_direction,
-                component_instructions=build_component_instructions(
-                    component_payload
-                ),
-                contact_trace_instructions=build_contact_trace_instructions(
-                    component_payload
-                ),
-            )
-
-            generated_component = call_openai_image_edit(
-                current_image,
-                api_component_mask,
-                component_prompt,
-                payload.output_quality,
-            )
-
-            component_result = smart_component_composite(
-                source=current_image,
-                generated_bytes=generated_component,
-                source_mask=component_mask,
-                protect_mask=protect_mask,
-            )
-            current_image = jpeg_bytes_to_rgb_image(component_result)
-            sequential_steps.append(component_code)
-
-        output = io.BytesIO()
-        current_image.save(
-            output,
-            format="JPEG",
-            quality=95,
-            subsampling=0,
-        )
-        result_bytes = output.getvalue()
-
-    result_bytes, full_frame_diagnostics = enforce_full_frame_result(
-        source=source,
-        candidate_bytes=result_bytes,
-        edit_mask=source_mask,
-        protect_mask=protect_mask,
-        feather_px=area_transition_feather_px(
-            source.size,
-            area_percent,
-        ),
-    )
-
-    return {
-        "job_id": job_id,
-        "status": "completed",
-        "mode": "ai",
-        "severity_percent": severity_percent,
-        "area_percent": area_percent,
-        "result_base64": base64.b64encode(result_bytes).decode("ascii"),
-        "mime_type": "image/jpeg",
-        "prompt_version": "damage-v17.0.14-heic-normalize",
-        "result_kind": "full_frame_jpeg",
-        "full_frame_guard": full_frame_diagnostics,
-        "deformation_type": payload.deformation_type,
-        "impact_direction": payload.impact_direction,
-        "contact_traces_enabled": payload.contact_traces_enabled,
-        "involved_components": payload.involved_components,
-        "damage_mode": resolved_damage_mode,
-        "area_control": "manual_mask_geometry_unchanged",
-        "area_transition_feather_px": area_transition_feather_px(
-            source.size,
-            area_percent,
-        ),
-        "composite_strategy": "single_protected_composite",
-        "segmentation_contract": "per_component_png_masks",
-        "strict_mask_boundary": True,
-        "outside_mask_preserved": True,
-        "mask_expansion_outside_component": False,
-        "mixed_strategy": (
-            "sequential_per_component"
-            if resolved_damage_mode == "mixed"
-            else "single_pass"
-        ),
-        "sequential_steps": (
-            sequential_steps
-            if resolved_damage_mode == "mixed"
-            else []
-        ),
-    }
+                "type": type(exc).__name__,
+                "error": str(exc),
+                "diagnostic_id": request_diagnostic_id,
+            },
+        ) from exc
 
 
 def finalize_without_regeneration(
