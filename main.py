@@ -65,13 +65,13 @@ ALLOWED_ORIGINS = [
 ]
 
 print(
-    "=== CAR DAMAGE LAB BACKEND V17.0.21 IDENTITY LOCK ===",
+    "=== CAR DAMAGE LAB BACKEND V17.0.22 DYNAMIC IDENTITY PROTECTION ===",
     flush=True,
 )
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.7.0.21",
+    version="1.7.0.22",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -170,6 +170,16 @@ class DamageEditBase64Request(BaseModel):
     protected_component_masks_base64: dict[str, str] = Field(
         default_factory=dict
     )
+
+    # V17.0.22 - Protezione identità dinamica e indipendente dal modello auto.
+    dynamic_identity_protection: bool = True
+    identity_regions: list[dict[str, object]] = Field(default_factory=list)
+    identity_detection_padding_percent: float = Field(
+        default=1.2,
+        ge=0.0,
+        le=6.0,
+    )
+    identity_color_correction: bool = True
 
 
 def resolve_selected_components(
@@ -3597,6 +3607,371 @@ def call_openai_image_edit(
 
 
 
+IDENTITY_REGION_TYPES = {
+    "license_plate",
+    "manufacturer_emblem",
+    "model_badge",
+    "trim_badge",
+    "visible_brand_text",
+}
+
+
+def normalize_identity_regions(
+    raw_regions: list[dict[str, object]] | None,
+) -> list[dict[str, object]]:
+    normalized: list[dict[str, object]] = []
+
+    for item in raw_regions or []:
+        if not isinstance(item, dict):
+            continue
+
+        region_type = str(item.get("type", "")).strip().lower()
+        if region_type not in IDENTITY_REGION_TYPES:
+            continue
+
+        box = item.get("bounding_box")
+        if not isinstance(box, dict):
+            continue
+
+        try:
+            x1 = max(0, min(1000, int(box.get("x1", 0))))
+            y1 = max(0, min(1000, int(box.get("y1", 0))))
+            x2 = max(0, min(1000, int(box.get("x2", 0))))
+            y2 = max(0, min(1000, int(box.get("y2", 0))))
+            confidence = float(item.get("confidence", 0.0))
+        except (TypeError, ValueError):
+            continue
+
+        if x2 <= x1 or y2 <= y1:
+            continue
+
+        # Conserviamo solo rilevamenti con una confidenza ragionevole.
+        if confidence < 0.45:
+            continue
+
+        normalized.append({
+            "type": region_type,
+            "confidence": round(max(0.0, min(1.0, confidence)), 4),
+            "bounding_box": {
+                "x1": x1,
+                "y1": y1,
+                "x2": x2,
+                "y2": y2,
+            },
+            "text": str(item.get("text", "") or "").strip()[:80],
+        })
+
+    # Deduplicazione semplice per tipo e forte sovrapposizione.
+    deduplicated: list[dict[str, object]] = []
+
+    for candidate in sorted(
+        normalized,
+        key=lambda region: float(region["confidence"]),
+        reverse=True,
+    ):
+        candidate_box = candidate["bounding_box"]
+        duplicate = False
+
+        for existing in deduplicated:
+            if existing["type"] != candidate["type"]:
+                continue
+
+            existing_box = existing["bounding_box"]
+
+            ix1 = max(candidate_box["x1"], existing_box["x1"])
+            iy1 = max(candidate_box["y1"], existing_box["y1"])
+            ix2 = min(candidate_box["x2"], existing_box["x2"])
+            iy2 = min(candidate_box["y2"], existing_box["y2"])
+
+            intersection = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+            candidate_area = (
+                (candidate_box["x2"] - candidate_box["x1"])
+                * (candidate_box["y2"] - candidate_box["y1"])
+            )
+
+            if candidate_area > 0 and intersection / candidate_area > 0.65:
+                duplicate = True
+                break
+
+        if not duplicate:
+            deduplicated.append(candidate)
+
+    return deduplicated
+
+
+def call_openai_identity_analysis(
+    source: Image.Image,
+) -> list[dict[str, object]]:
+    """
+    Rileva dinamicamente targa, stemma, badge e scritte identitarie.
+    Le coordinate sono normalizzate 0..1000 e valgono per qualsiasi auto.
+    """
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return []
+
+    image_data_url = image_to_data_url(source)
+    model = os.getenv("OPENAI_VISION_MODEL", "gpt-4.1-mini")
+    client = OpenAI(api_key=api_key)
+
+    prompt = """
+Analyze the exact vehicle in this photograph and locate only identity-critical
+visual elements that must never be regenerated during a damage simulation.
+
+Return ONLY valid JSON:
+{
+  "regions": [
+    {
+      "type": one of [
+        "license_plate",
+        "manufacturer_emblem",
+        "model_badge",
+        "trim_badge",
+        "visible_brand_text"
+      ],
+      "confidence": number from 0 to 1,
+      "text": readable text when present, otherwise "",
+      "bounding_box": {
+        "x1": integer 0..1000,
+        "y1": integer 0..1000,
+        "x2": integer 0..1000,
+        "y2": integer 0..1000
+      }
+    }
+  ]
+}
+
+Rules:
+- Coordinates refer to the complete photograph.
+- Use tight boxes around the exact visible element.
+- Detect the actual license plate, manufacturer emblem, model name badge,
+  trim badge and any visible brand/model text on the vehicle.
+- Do not include lamps, windows, body panels, reflections or background.
+- Do not invent elements that are not visible.
+- A damaged or tilted element must still be located.
+- Return JSON only.
+""".strip()
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You locate automotive identity elements precisely. "
+                "Return valid JSON only."
+            ),
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": image_data_url,
+                        "detail": "high",
+                    },
+                },
+            ],
+        },
+    ]
+
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            temperature=0,
+            response_format={"type": "json_object"},
+            messages=messages,
+        )
+        parsed = extract_json_object(
+            response.choices[0].message.content or "{}"
+        )
+        return normalize_identity_regions(
+            parsed.get("regions", [])
+            if isinstance(parsed, dict)
+            else []
+        )
+    except Exception as exc:
+        print(
+            "[IDENTITY ANALYSIS WARNING]",
+            {
+                "type": type(exc).__name__,
+                "error": str(exc),
+                "model": model,
+            },
+            flush=True,
+        )
+        return []
+
+
+def build_identity_protect_mask(
+    regions: list[dict[str, object]],
+    target_size: tuple[int, int],
+    padding_percent: float = 1.2,
+) -> Image.Image:
+    width, height = target_size
+    mask = Image.new("L", target_size, 0)
+    draw = ImageDraw.Draw(mask)
+
+    pad_x = int(round(width * max(0.0, padding_percent) / 100.0))
+    pad_y = int(round(height * max(0.0, padding_percent) / 100.0))
+
+    for region in regions:
+        box = region["bounding_box"]
+
+        x1 = int(round(width * int(box["x1"]) / 1000.0)) - pad_x
+        y1 = int(round(height * int(box["y1"]) / 1000.0)) - pad_y
+        x2 = int(round(width * int(box["x2"]) / 1000.0)) + pad_x
+        y2 = int(round(height * int(box["y2"]) / 1000.0)) + pad_y
+
+        x1 = max(0, min(width - 1, x1))
+        y1 = max(0, min(height - 1, y1))
+        x2 = max(x1 + 1, min(width, x2))
+        y2 = max(y1 + 1, min(height, y2))
+
+        draw.rounded_rectangle(
+            [x1, y1, x2, y2],
+            radius=max(1, min(pad_x, pad_y, 8)),
+            fill=255,
+        )
+
+    return mask
+
+
+def merge_protect_masks(
+    target_size: tuple[int, int],
+    masks: list[Image.Image | None],
+) -> Image.Image | None:
+    merged = np.zeros(
+        (target_size[1], target_size[0]),
+        dtype=np.uint8,
+    )
+    found = False
+
+    for mask in masks:
+        if mask is None:
+            continue
+        resized = resize_mask(mask.convert("L"), target_size)
+        binary = mask_to_binary(resized)
+        if int((binary > 0).sum()) == 0:
+            continue
+        merged = cv2.bitwise_or(merged, binary)
+        found = True
+
+    return Image.fromarray(merged, mode="L") if found else None
+
+
+def preserve_identity_pixels(
+    source: Image.Image,
+    candidate_bytes: bytes,
+    identity_mask: Image.Image | None,
+    guided_mask: Image.Image | None = None,
+    apply_color_correction: bool = True,
+) -> tuple[bytes, dict[str, object]]:
+    """
+    Reinserisce i pixel identitari originali e riallinea la tinta della
+    carrozzeria nella zona modificata. Funziona con posizioni dinamiche.
+    """
+    try:
+        candidate = Image.open(io.BytesIO(candidate_bytes))
+        candidate.load()
+        candidate = candidate.convert("RGB")
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Risultato non decodificabile per identity protection.",
+        ) from exc
+
+    source_rgb = source.convert("RGB")
+    if candidate.size != source_rgb.size:
+        candidate = candidate.resize(
+            source_rgb.size,
+            Image.Resampling.LANCZOS,
+        )
+
+    source_array = np.asarray(source_rgb, dtype=np.uint8)
+    candidate_array = np.asarray(candidate, dtype=np.uint8)
+
+    color_corrected = False
+    if apply_color_correction and guided_mask is not None:
+        guided_binary = mask_to_binary(
+            resize_mask(guided_mask.convert("L"), source_rgb.size)
+        )
+        candidate_array = _lab_color_match_inside_mask(
+            source_rgb=source_array,
+            generated_rgb=candidate_array,
+            mask_binary=guided_binary,
+            strength=0.58,
+        )
+        color_corrected = True
+
+    identity_pixels = 0
+    if identity_mask is not None:
+        identity_binary = mask_to_binary(
+            resize_mask(identity_mask.convert("L"), source_rgb.size)
+        )
+        identity_pixels = int((identity_binary > 0).sum())
+
+        # Bordo netto al centro e feather minimo sul perimetro.
+        hard = identity_binary > 0
+        feather = cv2.GaussianBlur(
+            identity_binary,
+            (0, 0),
+            sigmaX=1.2,
+        ).astype(np.float32) / 255.0
+        feather = feather[:, :, None]
+
+        composite = (
+            source_array.astype(np.float32) * feather
+            + candidate_array.astype(np.float32) * (1.0 - feather)
+        )
+        composite[hard] = source_array[hard]
+        candidate_array = np.clip(composite, 0, 255).astype(np.uint8)
+
+    output = io.BytesIO()
+    Image.fromarray(candidate_array, mode="RGB").save(
+        output,
+        format="JPEG",
+        quality=96,
+        subsampling=0,
+        optimize=True,
+    )
+
+    return output.getvalue(), {
+        "dynamic_identity_composite_applied": identity_pixels > 0,
+        "identity_protected_pixels": identity_pixels,
+        "paint_color_correction_applied": color_corrected,
+        "identity_composite_strategy": (
+            "dynamic_original_pixel_restore"
+            if identity_pixels > 0
+            else "none"
+        ),
+    }
+
+
+@app.post("/v1/vehicle/analyze-identity")
+def analyze_vehicle_identity(
+    payload: ImageNormalizeRequest,
+) -> dict[str, object]:
+    source = decode_base64_image(
+        payload.image_base64,
+        "image_base64",
+        "RGB",
+    )
+    source, _, _ = resize_in_place_for_memory(
+        source,
+        min(MAX_PROCESSING_SIDE, 1400),
+    )
+    regions = call_openai_identity_analysis(source)
+
+    return {
+        "status": "completed",
+        "version": "1.7.0.22",
+        "regions": regions,
+        "region_count": len(regions),
+        "dynamic_identity_protection": True,
+    }
+
+
 @app.post("/v1/image/normalize")
 def normalize_image(payload: ImageNormalizeRequest) -> dict[str, object]:
     """V17.0.14: normalizza HEIC/HEIF/JPEG/PNG per Base44 e browser."""
@@ -3640,14 +4015,19 @@ def root():
 def get_backend_version() -> dict[str, object]:
     return {
         "service": "Car Damage Lab Engine",
-        "version": "1.7.0.21",
-        "prompt_version": "damage-v17.0.21-identity-lock",
+        "version": "1.7.0.22",
+        "prompt_version": "damage-v17.0.22-dynamic-identity-protection",
         "multicomponent_release": True,
         "generic_body_panel_filter": True,
         "fragile_rear_components": True,
         "vehicle_identity_lock": True,
         "rear_light_geometry_lock": True,
         "badge_logo_plate_lock": True,
+        "dynamic_identity_detection": True,
+        "dynamic_identity_masking": True,
+        "dynamic_identity_composite": True,
+        "paint_color_correction": True,
+        "identity_analysis_endpoint": "/v1/vehicle/analyze-identity",
     }
 
 
@@ -3819,7 +4199,7 @@ def _replicate_json_request(
             status_code=500,
             detail={
                 "message": "REPLICATE_API_TOKEN non configurato su Render.",
-                "analysis_version": "vehicle-segmentation-v17.0.21-identity-lock",
+                "analysis_version": "vehicle-segmentation-v17.0.22-dynamic-identity-protection",
             },
         )
 
@@ -3862,7 +4242,7 @@ def _replicate_json_request(
                 "http_status": exc.code,
                 "request_url": url,
                 "replicate_detail": error_body[:2000],
-                "analysis_version": "vehicle-segmentation-v17.0.21-identity-lock",
+                "analysis_version": "vehicle-segmentation-v17.0.22-dynamic-identity-protection",
             },
         ) from exc
     except Exception as exc:
@@ -3871,7 +4251,7 @@ def _replicate_json_request(
             detail={
                 "message": "Connessione a Replicate non riuscita.",
                 "error": f"{type(exc).__name__}: {str(exc)}"[:1200],
-                "analysis_version": "vehicle-segmentation-v17.0.21-identity-lock",
+                "analysis_version": "vehicle-segmentation-v17.0.22-dynamic-identity-protection",
             },
         ) from exc
 
@@ -4766,7 +5146,7 @@ def _create_replicate_prediction(
                 "Limite Replicate ancora attivo dopo diversi tentativi."
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.21-identity-lock"
+                "vehicle-segmentation-v17.0.22-dynamic-identity-protection"
             ),
         },
     )
@@ -5818,7 +6198,7 @@ def smart_polygon_component_payload(
         "smooth_polygon": smooth_polygon,
         "feather_radius": feather_radius,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.21-identity-lock"
+            "vehicle-segmentation-v17.0.22-dynamic-identity-protection"
         ),
     }
 
@@ -6142,7 +6522,7 @@ def normalize_vehicle_analysis(
         "manual_polygon_required_only_for_selected_components": True,
         "segmentation_strategy": "manual_smart_polygon",
         "analysis_version": (
-            "vehicle-segmentation-v17.0.21-identity-lock"
+            "vehicle-segmentation-v17.0.22-dynamic-identity-protection"
         ),
     }
 
@@ -6287,7 +6667,7 @@ Bounding-box rules:
                 "model": configured_model,
                 "primary_error": primary_message[:800],
                 "fallback_error": fallback_message[:800],
-                "analysis_version": "vehicle-segmentation-v17.0.21-identity-lock",
+                "analysis_version": "vehicle-segmentation-v17.0.22-dynamic-identity-protection",
             },
         ) from fallback_exc
 
@@ -6442,7 +6822,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     ),
                     "raw_component_count": len(raw_components),
                     "analysis_version": (
-                        "vehicle-segmentation-v17.0.21-identity-lock"
+                        "vehicle-segmentation-v17.0.22-dynamic-identity-protection"
                     ),
                 },
             )
@@ -6455,7 +6835,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                 "gpt-4.1-mini",
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.21-identity-lock"
+                "vehicle-segmentation-v17.0.22-dynamic-identity-protection"
             ),
             "mask_format": "data:image/png;base64",
             "mask_semantics": "white_component_black_background",
@@ -6503,7 +6883,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     "error_type": type(exc).__name__,
                     "error": str(exc)[:1600],
                     "analysis_version": (
-                        "vehicle-segmentation-v17.0.21-identity-lock"
+                        "vehicle-segmentation-v17.0.22-dynamic-identity-protection"
                     ),
                 },
             },
@@ -6545,7 +6925,7 @@ def start_vehicle_component_analysis(
             "result": None,
             "error": None,
             "analysis_version": (
-                "vehicle-segmentation-v17.0.21-identity-lock"
+                "vehicle-segmentation-v17.0.22-dynamic-identity-protection"
             ),
         }
 
@@ -6563,7 +6943,7 @@ def start_vehicle_component_analysis(
             f"/v1/vehicle/analyze-components/status/{job_id}"
         ),
         "analysis_version": (
-            "vehicle-segmentation-v17.0.21-identity-lock"
+            "vehicle-segmentation-v17.0.22-dynamic-identity-protection"
         ),
     }
 
@@ -6661,7 +7041,7 @@ def snap_vehicle_polygon_points(
         ),
         "snap_radius": payload.snap_radius,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.21-identity-lock"
+            "vehicle-segmentation-v17.0.22-dynamic-identity-protection"
         ),
     }
 
@@ -6873,7 +7253,7 @@ def refine_vehicle_component(payload: ComponentRefineRequest):
         "requires_review": diagnostics.get("refinement_status") != "refined",
         "refinement": diagnostics,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.21-identity-lock"
+            "vehicle-segmentation-v17.0.22-dynamic-identity-protection"
         ),
     }
 
@@ -6897,7 +7277,7 @@ def analyze_vehicle_components_sync_disabled(
                 "/v1/vehicle/analyze-components/status/{job_id}"
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.21-identity-lock"
+                "vehicle-segmentation-v17.0.22-dynamic-identity-protection"
             ),
         },
     )
@@ -6980,7 +7360,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v17.0.21-identity-lock",
+        "prompt_version": "damage-v17.0.22-dynamic-identity-protection",
         "result_kind": "full_frame_jpeg",
         "full_frame_guard": full_frame_diagnostics,
     }
@@ -6989,7 +7369,7 @@ async def edit_damage(
 @app.post("/v1/damage/edit-base64")
 def edit_damage_base64(payload: DamageEditBase64Request):
     """
-    V17.0.21 Identity Lock
+    V17.0.22 Dynamic Identity Protection
 
     - con maschera manuale: foto completa + perimetro reale + prompt naturale,
       output diretto del modello e validazione anti-cambio-auto;
@@ -7101,6 +7481,75 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                     "mask_geometry_source": "full_frame_fallback",
                 }
                 resolved_guided_mode = "simple_guided"
+
+            identity_regions = normalize_identity_regions(
+                payload.identity_regions
+            )
+
+            if (
+                payload.dynamic_identity_protection
+                and not identity_regions
+            ):
+                identity_regions = call_openai_identity_analysis(source)
+
+            identity_protect_mask = (
+                build_identity_protect_mask(
+                    identity_regions,
+                    source.size,
+                    payload.identity_detection_padding_percent,
+                )
+                if identity_regions
+                else None
+            )
+
+            explicit_protect_mask = None
+            if payload.protect_mask_base64:
+                explicit_protect_mask = decode_base64_image(
+                    payload.protect_mask_base64,
+                    "protect_mask_base64",
+                    "L",
+                )
+                explicit_protect_mask = resize_mask_to_processing_size(
+                    explicit_protect_mask,
+                    source.size,
+                )
+
+            effective_protect_mask = merge_protect_masks(
+                source.size,
+                [
+                    explicit_protect_mask,
+                    identity_protect_mask,
+                ],
+            )
+
+            if effective_protect_mask is not None:
+                guided_mask, _ = combine_edit_and_protect_masks(
+                    guided_mask,
+                    effective_protect_mask,
+                    source.size,
+                )
+                api_mask = alter_damage_area(guided_mask, 0)
+                mask_diagnostics.update({
+                    "dynamic_identity_regions": identity_regions,
+                    "dynamic_identity_region_count": len(
+                        identity_regions
+                    ),
+                    "dynamic_identity_protection_applied": True,
+                    "identity_protect_pixels": int(
+                        (
+                            mask_to_binary(
+                                effective_protect_mask
+                            ) > 0
+                        ).sum()
+                    ),
+                })
+            else:
+                mask_diagnostics.update({
+                    "dynamic_identity_regions": [],
+                    "dynamic_identity_region_count": 0,
+                    "dynamic_identity_protection_applied": False,
+                    "identity_protect_pixels": 0,
+                })
 
             protected_components_prompt = (
                 build_strict_protected_components_prompt(
@@ -7256,6 +7705,23 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                         )
                     result_diagnostics.update(locality_validation)
 
+                    result_bytes, identity_diagnostics = (
+                        preserve_identity_pixels(
+                            source=source,
+                            candidate_bytes=result_bytes,
+                            identity_mask=identity_protect_mask,
+                            guided_mask=guided_mask,
+                            apply_color_correction=(
+                                payload.identity_color_correction
+                            ),
+                        )
+                    )
+                    result_diagnostics.update(identity_diagnostics)
+                    result_diagnostics.update({
+                        "identity_regions": identity_regions,
+                        "identity_region_count": len(identity_regions),
+                    })
+
                     protected_validation = (
                         validate_protected_components_unchanged(
                             source=source,
@@ -7275,9 +7741,27 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                             candidate_bytes=generated_bytes,
                         )
                     )
+                    result_bytes, identity_diagnostics = (
+                        preserve_identity_pixels(
+                            source=source,
+                            candidate_bytes=result_bytes,
+                            identity_mask=identity_protect_mask,
+                            guided_mask=guided_mask,
+                            apply_color_correction=(
+                                payload.identity_color_correction
+                            ),
+                        )
+                    )
+                    result_diagnostics.update(identity_diagnostics)
                     result_diagnostics.update({
+                        "identity_regions": identity_regions,
+                        "identity_region_count": len(identity_regions),
                         "direct_model_output_used": True,
-                        "post_composite_applied": False,
+                        "post_composite_applied": (
+                            identity_diagnostics[
+                                "dynamic_identity_composite_applied"
+                            ]
+                        ),
                         "hybrid_result_validation_passed": False,
                         "manual_mask_missing": True,
                         "protected_components_validation_applied": False,
@@ -7294,7 +7778,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 ).decode("ascii"),
                 "mime_type": "image/jpeg",
                 "prompt_version": (
-                    "damage-v17.0.21-identity-lock"
+                    "damage-v17.0.22-dynamic-identity-protection"
                 ),
                 "result_kind": "full_frame_jpeg",
                 "deformation_type": payload.deformation_type,
@@ -7356,6 +7840,14 @@ def edit_damage_base64(payload: DamageEditBase64Request):
             "vehicle_identity_lock_applied": True,
             "rear_light_geometry_lock_applied": True,
             "badge_logo_plate_lock_applied": True,
+            "dynamic_identity_protection_enabled": (
+                payload.dynamic_identity_protection
+            ),
+            "dynamic_identity_region_count": len(identity_regions),
+            "dynamic_identity_regions": identity_regions,
+            "paint_color_correction_enabled": (
+                payload.identity_color_correction
+            ),
                 "mask_edge_margin_px": (
                     mask_diagnostics.get("edge_margin_px")
                 ),
@@ -7643,7 +8135,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
             "area_percent": area_percent,
             "result_base64": base64.b64encode(result_bytes).decode("ascii"),
             "mime_type": "image/jpeg",
-            "prompt_version": "damage-v17.0.21-identity-lock",
+            "prompt_version": "damage-v17.0.22-dynamic-identity-protection",
             "result_kind": "full_frame_jpeg",
             "full_frame_guard": full_frame_diagnostics,
             "deformation_type": payload.deformation_type,
