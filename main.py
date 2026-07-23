@@ -65,13 +65,13 @@ ALLOWED_ORIGINS = [
 ]
 
 print(
-    "=== CAR DAMAGE LAB BACKEND V17.0.19 IMPACT ZONE MODE ===",
+    "=== CAR DAMAGE LAB BACKEND V17.0.20 PAINT COLOUR PRESERVATION ===",
     flush=True,
 )
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.7.0.19",
+    version="1.7.0.20",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -3385,6 +3385,227 @@ def validate_hybrid_guided_result(
     return output.getvalue(), diagnostics
 
 
+def validate_paint_colour_consistency(
+    source: Image.Image,
+    candidate_bytes: bytes,
+    guided_mask: Image.Image | None,
+) -> dict[str, object]:
+    """
+    Confronto numerico conservativo della vernice.
+
+    Non modifica l'immagine. Misura:
+    - deviazione della tonalità;
+    - variazione di saturazione;
+    - scurimento delle alte luci;
+    - variazione cromatica fuori dalla zona editabile.
+
+    Le alte luci vengono usate per distinguere un reale cambio di tinta
+    dalle normali ombre prodotte dalle pieghe.
+    """
+    try:
+        candidate = Image.open(io.BytesIO(candidate_bytes))
+        candidate.load()
+        candidate = candidate.convert("RGB")
+    except Exception as exc:
+        return {
+            "passed": False,
+            "applied": False,
+            "reason": "candidate_decode_error",
+            "error": str(exc),
+        }
+
+    source_rgb = source.convert("RGB")
+    if candidate.size != source_rgb.size:
+        candidate = candidate.resize(
+            source_rgb.size,
+            Image.Resampling.LANCZOS,
+        )
+
+    source_array = np.asarray(source_rgb, dtype=np.uint8)
+    candidate_array = np.asarray(candidate, dtype=np.uint8)
+
+    source_hsv = cv2.cvtColor(source_array, cv2.COLOR_RGB2HSV)
+    candidate_hsv = cv2.cvtColor(candidate_array, cv2.COLOR_RGB2HSV)
+
+    source_lab = cv2.cvtColor(source_array, cv2.COLOR_RGB2LAB)
+    candidate_lab = cv2.cvtColor(candidate_array, cv2.COLOR_RGB2LAB)
+
+    height, width = source_array.shape[:2]
+
+    if guided_mask is not None:
+        editable = (
+            mask_to_binary(
+                resize_mask(guided_mask.convert("L"), (width, height))
+            ) > 0
+        )
+    else:
+        editable = np.ones((height, width), dtype=bool)
+
+    # Seleziona pixel con colore carrozzeria sufficientemente saturo.
+    # Esclude vetri, pneumatici, targa, riflessi bianchi e zone quasi nere.
+    source_s = source_hsv[:, :, 1]
+    source_v = source_hsv[:, :, 2]
+    paint_like = (
+        (source_s >= 55)
+        & (source_v >= 45)
+        & (source_v <= 245)
+    )
+
+    inside = paint_like & editable
+    outside = paint_like & (~editable)
+
+    min_inside_pixels = max(500, int(width * height * 0.002))
+    if int(inside.sum()) < min_inside_pixels:
+        return {
+            "passed": True,
+            "applied": False,
+            "reason": "insufficient_paint_pixels",
+            "inside_paint_pixels": int(inside.sum()),
+        }
+
+    def circular_hue_delta(
+        first: np.ndarray,
+        second: np.ndarray,
+    ) -> np.ndarray:
+        # OpenCV usa hue 0..179, equivalente a 0..360 gradi.
+        raw = np.abs(
+            first.astype(np.int16)
+            - second.astype(np.int16)
+        )
+        return np.minimum(raw, 180 - raw).astype(np.float32) * 2.0
+
+    hue_delta_inside = circular_hue_delta(
+        source_hsv[:, :, 0][inside],
+        candidate_hsv[:, :, 0][inside],
+    )
+
+    saturation_delta_inside = (
+        candidate_hsv[:, :, 1][inside].astype(np.float32)
+        - source_hsv[:, :, 1][inside].astype(np.float32)
+    )
+
+    source_lightness_inside = source_lab[:, :, 0][inside].astype(np.float32)
+    candidate_lightness_inside = candidate_lab[:, :, 0][inside].astype(
+        np.float32
+    )
+
+    hue_delta_median_deg = float(np.median(hue_delta_inside))
+    hue_delta_p90_deg = float(np.percentile(hue_delta_inside, 90))
+
+    saturation_delta_median = float(
+        np.median(saturation_delta_inside)
+    )
+
+    # Il percentile alto confronta le zone illuminate e riduce l'effetto
+    # delle nuove ombre fisicamente plausibili prodotte dalle pieghe.
+    source_lightness_p75 = float(
+        np.percentile(source_lightness_inside, 75)
+    )
+    candidate_lightness_p75 = float(
+        np.percentile(candidate_lightness_inside, 75)
+    )
+    lightness_p75_delta = (
+        candidate_lightness_p75 - source_lightness_p75
+    )
+
+    source_lightness_median = float(
+        np.median(source_lightness_inside)
+    )
+    candidate_lightness_median = float(
+        np.median(candidate_lightness_inside)
+    )
+    lightness_median_delta = (
+        candidate_lightness_median - source_lightness_median
+    )
+
+    outside_delta_e_median = 0.0
+    outside_paint_pixels = int(outside.sum())
+    if outside_paint_pixels >= min_inside_pixels:
+        source_outside = source_lab[outside].astype(np.float32)
+        candidate_outside = candidate_lab[outside].astype(np.float32)
+        outside_delta_e = np.linalg.norm(
+            candidate_outside - source_outside,
+            axis=1,
+        )
+        outside_delta_e_median = float(np.median(outside_delta_e))
+
+    # Soglie volutamente conservative ma non eccessivamente rigide:
+    # ombre locali sì, cambio globale di tinta/luminosità no.
+    hue_ok = (
+        hue_delta_median_deg <= 5.5
+        and hue_delta_p90_deg <= 18.0
+    )
+    saturation_ok = saturation_delta_median >= -16.0
+    brightness_ok = lightness_p75_delta >= -11.0
+    outside_ok = outside_delta_e_median <= 7.5
+
+    passed = bool(
+        hue_ok
+        and saturation_ok
+        and brightness_ok
+        and outside_ok
+    )
+
+    failure_reasons: list[str] = []
+    if not hue_ok:
+        failure_reasons.append(
+            "paint hue changed beyond tolerance"
+        )
+    if not saturation_ok:
+        failure_reasons.append(
+            "paint saturation was reduced too much"
+        )
+    if not brightness_ok:
+        failure_reasons.append(
+            "vehicle paint became globally darker"
+        )
+    if not outside_ok:
+        failure_reasons.append(
+            "paint outside the editable zone changed"
+        )
+
+    return {
+        "passed": passed,
+        "applied": True,
+        "validation_profile": "v17.0.20_paint_colour",
+        "inside_paint_pixels": int(inside.sum()),
+        "outside_paint_pixels": outside_paint_pixels,
+        "hue_delta_median_degrees": round(
+            hue_delta_median_deg,
+            3,
+        ),
+        "hue_delta_p90_degrees": round(
+            hue_delta_p90_deg,
+            3,
+        ),
+        "saturation_delta_median": round(
+            saturation_delta_median,
+            3,
+        ),
+        "source_lightness_p75": round(
+            source_lightness_p75,
+            3,
+        ),
+        "candidate_lightness_p75": round(
+            candidate_lightness_p75,
+            3,
+        ),
+        "lightness_p75_delta": round(
+            lightness_p75_delta,
+            3,
+        ),
+        "lightness_median_delta": round(
+            lightness_median_delta,
+            3,
+        ),
+        "outside_delta_e_median": round(
+            outside_delta_e_median,
+            3,
+        ),
+        "failure_reasons": failure_reasons,
+    }
+
+
 def call_openai_identity_validation(
     source: Image.Image,
     candidate_bytes: bytes,
@@ -3447,6 +3668,10 @@ Return ONLY valid JSON in this exact structure:
   "same_manufacturer_emblem": true or false,
   "same_model_badges": true or false,
   "same_paint_colour": true or false,
+  "same_paint_hue": true or false,
+  "same_paint_saturation": true or false,
+  "same_paint_brightness": true or false,
+  "vehicle_globally_darker": true or false,
   "tail_light_outer_geometry_preserved": true or false,
   "vehicle_identity_changed": true or false,
   "failure_reasons": ["short reason"],
@@ -3457,7 +3682,11 @@ Strict rules:
 - The license plate characters must be exactly identical.
 - Manufacturer emblem and model badges must remain the same.
 - The vehicle must not change make, model, generation or body architecture.
-- Paint colour must remain the same, allowing only natural lighting variation.
+- Paint must preserve the same original hue, saturation, apparent brightness
+  and gloss. Local shadows caused by new folds are allowed, but the vehicle
+  must not become globally darker, duller, desaturated or differently tinted.
+- Compare healthy illuminated paint areas in both photographs, not only the
+  darkest folds.
 - A selected tail light may be cracked internally, but its original outer
   silhouette, size and design must remain recognizable.
 - Deformation of selected body panels is allowed.
@@ -3521,6 +3750,10 @@ Strict rules:
             bool(parsed.get("same_manufacturer_emblem")),
             bool(parsed.get("same_model_badges")),
             bool(parsed.get("same_paint_colour")),
+            bool(parsed.get("same_paint_hue")),
+            bool(parsed.get("same_paint_saturation")),
+            bool(parsed.get("same_paint_brightness")),
+            not bool(parsed.get("vehicle_globally_darker")),
             bool(parsed.get("tail_light_outer_geometry_preserved")),
         ]
 
@@ -3608,7 +3841,14 @@ Rules:
   lighting;
 - do not create separate isolated dents on each component;
 - do not redraw the vehicle or replace it with another make or model;
-- do not change the plate, badges, emblems, paint colour or lamp design;
+- preserve the exact original body-paint hue, saturation, apparent brightness
+  and gloss;
+- do not darken, desaturate, recolour or apply a global colour cast to the
+  vehicle;
+- new shadows and highlights are allowed only locally where physically caused
+  by folds, creases and changed reflections;
+- compare undamaged illuminated paint areas and keep them visually identical;
+- do not change the plate, badges, emblems or lamp design;
 - protected elements must remain unchanged;
 - do not modify anything outside the supplied impact-zone mask;
 - prefer a less dramatic but continuous deformation over fragmented,
@@ -3639,11 +3879,12 @@ Absolute priorities for this retry:
 1. preserve the exact original license plate characters;
 2. preserve the exact manufacturer emblem and model badges;
 3. preserve the exact make and model;
-4. preserve the original paint colour;
-5. preserve the complete outer geometry of every rear light;
-6. reduce deformation rather than changing vehicle identity;
-7. modify only the selected bodywork inside the supplied mask;
-8. do not regenerate the entire rear of the vehicle.
+4. preserve the original paint hue, saturation, brightness and gloss;
+5. do not make the vehicle globally darker or duller; local fold shadows only;
+6. preserve the complete outer geometry of every rear light;
+7. reduce deformation rather than changing vehicle identity;
+8. modify only the selected bodywork inside the supplied mask;
+9. do not regenerate the entire rear of the vehicle.
 
 A less severe but identity-correct result is preferable to a dramatic result
 that changes the vehicle.
@@ -3763,7 +4004,7 @@ def root():
     return {
         "service": APP_NAME,
         "status": "ok",
-        "version": "1.7.0.19",
+        "version": "1.7.0.20",
         "docs": "/docs",
         "health": "/health",
     }
@@ -3773,9 +4014,9 @@ def root():
 def get_backend_version() -> dict[str, object]:
     return {
         "service": APP_NAME,
-        "version": "1.7.0.19",
+        "version": "1.7.0.20",
         "prompt_version": (
-            "damage-v17.0.19-impact-zone-mode"
+            "damage-v17.0.20-paint-colour-preservation"
         ),
         "staged_identity_validation": True,
         "maximum_generation_attempts": 2,
@@ -3798,6 +4039,13 @@ def get_backend_version() -> dict[str, object]:
             "impact_zone",
         ],
         "component_mode_preserved": True,
+        "paint_colour_preservation": True,
+        "paint_colour_numeric_validation": True,
+        "paint_colour_ai_validation": True,
+        "automatic_colour_postprocessing": False,
+        "paint_colour_validation_profile": (
+            "v17.0.20_paint_colour"
+        ),
     }
 
 
@@ -3968,7 +4216,7 @@ def _replicate_json_request(
             status_code=500,
             detail={
                 "message": "REPLICATE_API_TOKEN non configurato su Render.",
-                "analysis_version": "vehicle-segmentation-v17.0.19-impact-zone-mode",
+                "analysis_version": "vehicle-segmentation-v17.0.20-paint-colour-preservation",
             },
         )
 
@@ -4011,7 +4259,7 @@ def _replicate_json_request(
                 "http_status": exc.code,
                 "request_url": url,
                 "replicate_detail": error_body[:2000],
-                "analysis_version": "vehicle-segmentation-v17.0.19-impact-zone-mode",
+                "analysis_version": "vehicle-segmentation-v17.0.20-paint-colour-preservation",
             },
         ) from exc
     except Exception as exc:
@@ -4020,7 +4268,7 @@ def _replicate_json_request(
             detail={
                 "message": "Connessione a Replicate non riuscita.",
                 "error": f"{type(exc).__name__}: {str(exc)}"[:1200],
-                "analysis_version": "vehicle-segmentation-v17.0.19-impact-zone-mode",
+                "analysis_version": "vehicle-segmentation-v17.0.20-paint-colour-preservation",
             },
         ) from exc
 
@@ -4915,7 +5163,7 @@ def _create_replicate_prediction(
                 "Limite Replicate ancora attivo dopo diversi tentativi."
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.19-impact-zone-mode"
+                "vehicle-segmentation-v17.0.20-paint-colour-preservation"
             ),
         },
     )
@@ -5967,7 +6215,7 @@ def smart_polygon_component_payload(
         "smooth_polygon": smooth_polygon,
         "feather_radius": feather_radius,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.19-impact-zone-mode"
+            "vehicle-segmentation-v17.0.20-paint-colour-preservation"
         ),
     }
 
@@ -6291,7 +6539,7 @@ def normalize_vehicle_analysis(
         "manual_polygon_required_only_for_selected_components": True,
         "segmentation_strategy": "manual_smart_polygon",
         "analysis_version": (
-            "vehicle-segmentation-v17.0.19-impact-zone-mode"
+            "vehicle-segmentation-v17.0.20-paint-colour-preservation"
         ),
     }
 
@@ -6436,7 +6684,7 @@ Bounding-box rules:
                 "model": configured_model,
                 "primary_error": primary_message[:800],
                 "fallback_error": fallback_message[:800],
-                "analysis_version": "vehicle-segmentation-v17.0.19-impact-zone-mode",
+                "analysis_version": "vehicle-segmentation-v17.0.20-paint-colour-preservation",
             },
         ) from fallback_exc
 
@@ -6591,7 +6839,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     ),
                     "raw_component_count": len(raw_components),
                     "analysis_version": (
-                        "vehicle-segmentation-v17.0.19-impact-zone-mode"
+                        "vehicle-segmentation-v17.0.20-paint-colour-preservation"
                     ),
                 },
             )
@@ -6604,7 +6852,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                 "gpt-4.1-mini",
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.19-impact-zone-mode"
+                "vehicle-segmentation-v17.0.20-paint-colour-preservation"
             ),
             "mask_format": "data:image/png;base64",
             "mask_semantics": "white_component_black_background",
@@ -6652,7 +6900,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     "error_type": type(exc).__name__,
                     "error": str(exc)[:1600],
                     "analysis_version": (
-                        "vehicle-segmentation-v17.0.19-impact-zone-mode"
+                        "vehicle-segmentation-v17.0.20-paint-colour-preservation"
                     ),
                 },
             },
@@ -6694,7 +6942,7 @@ def start_vehicle_component_analysis(
             "result": None,
             "error": None,
             "analysis_version": (
-                "vehicle-segmentation-v17.0.19-impact-zone-mode"
+                "vehicle-segmentation-v17.0.20-paint-colour-preservation"
             ),
         }
 
@@ -6712,7 +6960,7 @@ def start_vehicle_component_analysis(
             f"/v1/vehicle/analyze-components/status/{job_id}"
         ),
         "analysis_version": (
-            "vehicle-segmentation-v17.0.19-impact-zone-mode"
+            "vehicle-segmentation-v17.0.20-paint-colour-preservation"
         ),
     }
 
@@ -6810,7 +7058,7 @@ def snap_vehicle_polygon_points(
         ),
         "snap_radius": payload.snap_radius,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.19-impact-zone-mode"
+            "vehicle-segmentation-v17.0.20-paint-colour-preservation"
         ),
     }
 
@@ -7022,7 +7270,7 @@ def refine_vehicle_component(payload: ComponentRefineRequest):
         "requires_review": diagnostics.get("refinement_status") != "refined",
         "refinement": diagnostics,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.19-impact-zone-mode"
+            "vehicle-segmentation-v17.0.20-paint-colour-preservation"
         ),
     }
 
@@ -7046,7 +7294,7 @@ def analyze_vehicle_components_sync_disabled(
                 "/v1/vehicle/analyze-components/status/{job_id}"
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.19-impact-zone-mode"
+                "vehicle-segmentation-v17.0.20-paint-colour-preservation"
             ),
         },
     )
@@ -7129,7 +7377,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v17.0.19-impact-zone-mode",
+        "prompt_version": "damage-v17.0.20-paint-colour-preservation",
         "result_kind": "full_frame_jpeg",
         "full_frame_guard": full_frame_diagnostics,
     }
@@ -7138,7 +7386,7 @@ async def edit_damage(
 @app.post("/v1/damage/edit-base64")
 def edit_damage_base64(payload: DamageEditBase64Request):
     """
-    V17.0.19 Impact Zone Mode
+    V17.0.20 Paint Colour Preservation
 
     - con maschera manuale: foto completa + perimetro reale + prompt naturale,
       output diretto del modello e validazione anti-cambio-auto;
@@ -7357,7 +7605,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
 
     Keep exactly the same:
     - vehicle identity, make, model and body shape;
-    - paint colour and surface finish;
+    - exact paint hue, saturation, apparent brightness and surface gloss;
     - headlights, grille, bumper, wheels, tyres, mirrors, glass and doors;
     - workshop environment, floor, lift, surrounding vehicles and background;
     - camera angle, perspective, framing, lighting and reflections.
@@ -7499,10 +7747,77 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                         )
                     )
 
+                    paint_colour_validation = (
+                        validate_paint_colour_consistency(
+                            source=source,
+                            candidate_bytes=candidate_bytes,
+                            guided_mask=guided_mask,
+                        )
+                    )
+
+                    candidate_diagnostics.update({
+                        "paint_colour_validation": (
+                            paint_colour_validation
+                        ),
+                        "paint_colour_validation_passed": bool(
+                            paint_colour_validation.get("passed")
+                        ),
+                    })
+
+                    if not bool(
+                        paint_colour_validation.get("passed")
+                    ):
+                        identity_validation["passed"] = False
+                        identity_validation[
+                            "same_paint_colour"
+                        ] = False
+                        identity_validation[
+                            "same_paint_hue"
+                        ] = False
+                        identity_validation[
+                            "same_paint_saturation"
+                        ] = False
+                        identity_validation[
+                            "same_paint_brightness"
+                        ] = False
+
+                        numeric_reasons = (
+                            paint_colour_validation.get(
+                                "failure_reasons"
+                            )
+                            or []
+                        )
+                        existing_reasons = (
+                            identity_validation.get(
+                                "failure_reasons"
+                            )
+                            or []
+                        )
+
+                        identity_validation[
+                            "failure_reasons"
+                        ] = list(existing_reasons) + [
+                            str(reason)
+                            for reason in numeric_reasons
+                        ]
+
                     generation_attempts.append({
                         "attempt": attempt_number,
                         "identity_validation": identity_validation,
+                        "paint_colour_validation": (
+                            paint_colour_validation
+                        ),
                     })
+
+                    print(
+                        "[PAINT COLOUR VALIDATION RESULT]",
+                        {
+                            "diagnostic_id": request_diagnostic_id,
+                            "attempt": attempt_number,
+                            "validation": paint_colour_validation,
+                        },
+                        flush=True,
+                    )
 
                     print(
                         "[IDENTITY VALIDATION RESULT]",
@@ -7522,6 +7837,10 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                             "identity_validation_passed": True,
                             "generation_attempt_used": attempt_number,
                             "generation_attempts": generation_attempts,
+                            "paint_colour_validation": (
+                                paint_colour_validation
+                            ),
+                            "paint_colour_preservation_applied": True,
                         })
                         break
 
@@ -7560,7 +7879,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 ).decode("ascii"),
                 "mime_type": "image/jpeg",
                 "prompt_version": (
-                    "damage-v17.0.19-impact-zone-mode"
+                    "damage-v17.0.20-paint-colour-preservation"
                 ),
                 "result_kind": "full_frame_jpeg",
                 "deformation_type": payload.deformation_type,
@@ -7897,7 +8216,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
             "area_percent": area_percent,
             "result_base64": base64.b64encode(result_bytes).decode("ascii"),
             "mime_type": "image/jpeg",
-            "prompt_version": "damage-v17.0.19-impact-zone-mode",
+            "prompt_version": "damage-v17.0.20-paint-colour-preservation",
             "result_kind": "full_frame_jpeg",
             "full_frame_guard": full_frame_diagnostics,
             "deformation_type": payload.deformation_type,
@@ -8168,7 +8487,7 @@ def start_async_damage_generation(
             "result_path": None,
             "error": None,
             "generation_version": (
-                "damage-v17.0.19-impact-zone-mode"
+                "damage-v17.0.20-paint-colour-preservation"
             ),
         }
 
@@ -8189,7 +8508,7 @@ def start_async_damage_generation(
         "poll_url": f"/v1/damage/edit-base64/status/{job_id}",
         "delete_url": f"/v1/damage/edit-base64/status/{job_id}",
         "generation_version": (
-            "damage-v17.0.19-impact-zone-mode"
+            "damage-v17.0.20-paint-colour-preservation"
         ),
         "poll_interval_ms": 3500,
     }
