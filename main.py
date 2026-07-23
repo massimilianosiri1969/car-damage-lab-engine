@@ -65,13 +65,13 @@ ALLOWED_ORIGINS = [
 ]
 
 print(
-    "=== CAR DAMAGE LAB BACKEND V17.0.22 CLEAN BASELINE ===",
+    "=== CAR DAMAGE LAB BACKEND V17.0.22A PROTECT MASK INITIALIZATION HOTFIX ===",
     flush=True,
 )
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.7.0.22",
+    version="1.7.0.22a",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -4288,7 +4288,7 @@ def root():
     return {
         "service": APP_NAME,
         "status": "ok",
-        "version": "1.7.0.22",
+        "version": "1.7.0.22a",
         "docs": "/docs",
         "health": "/health",
     }
@@ -4298,9 +4298,9 @@ def root():
 def get_backend_version() -> dict[str, object]:
     return {
         "service": APP_NAME,
-        "version": "1.7.0.22",
+        "version": "1.7.0.22a",
         "prompt_version": (
-            "damage-v17.0.22-clean-baseline"
+            "damage-v17.0.22a-protect-mask-initialization-hotfix"
         ),
         "staged_identity_validation": True,
         "maximum_generation_attempts": 2,
@@ -4340,6 +4340,10 @@ def get_backend_version() -> dict[str, object]:
         "validation_channels_separated": True,
         "ai_plate_validation_overridden_when_mask_present": True,
         "automatic_geometry_postprocessing": False,
+        "protect_mask_initialization_hotfix": True,
+        "protect_mask_initialized_before_guided_flow": True,
+        "protect_mask_subtracted_server_side": True,
+        "undefined_protect_mask_regression_fixed": True,
     }
 
 
@@ -4510,7 +4514,7 @@ def _replicate_json_request(
             status_code=500,
             detail={
                 "message": "REPLICATE_API_TOKEN non configurato su Render.",
-                "analysis_version": "vehicle-segmentation-v17.0.22-clean-baseline",
+                "analysis_version": "vehicle-segmentation-v17.0.22a-protect-mask-initialization-hotfix",
             },
         )
 
@@ -4553,7 +4557,7 @@ def _replicate_json_request(
                 "http_status": exc.code,
                 "request_url": url,
                 "replicate_detail": error_body[:2000],
-                "analysis_version": "vehicle-segmentation-v17.0.22-clean-baseline",
+                "analysis_version": "vehicle-segmentation-v17.0.22a-protect-mask-initialization-hotfix",
             },
         ) from exc
     except Exception as exc:
@@ -4562,7 +4566,7 @@ def _replicate_json_request(
             detail={
                 "message": "Connessione a Replicate non riuscita.",
                 "error": f"{type(exc).__name__}: {str(exc)}"[:1200],
-                "analysis_version": "vehicle-segmentation-v17.0.22-clean-baseline",
+                "analysis_version": "vehicle-segmentation-v17.0.22a-protect-mask-initialization-hotfix",
             },
         ) from exc
 
@@ -5457,7 +5461,7 @@ def _create_replicate_prediction(
                 "Limite Replicate ancora attivo dopo diversi tentativi."
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.22-clean-baseline"
+                "vehicle-segmentation-v17.0.22a-protect-mask-initialization-hotfix"
             ),
         },
     )
@@ -6509,7 +6513,7 @@ def smart_polygon_component_payload(
         "smooth_polygon": smooth_polygon,
         "feather_radius": feather_radius,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.22-clean-baseline"
+            "vehicle-segmentation-v17.0.22a-protect-mask-initialization-hotfix"
         ),
     }
 
@@ -6833,7 +6837,7 @@ def normalize_vehicle_analysis(
         "manual_polygon_required_only_for_selected_components": True,
         "segmentation_strategy": "manual_smart_polygon",
         "analysis_version": (
-            "vehicle-segmentation-v17.0.22-clean-baseline"
+            "vehicle-segmentation-v17.0.22a-protect-mask-initialization-hotfix"
         ),
     }
 
@@ -6978,7 +6982,7 @@ Bounding-box rules:
                 "model": configured_model,
                 "primary_error": primary_message[:800],
                 "fallback_error": fallback_message[:800],
-                "analysis_version": "vehicle-segmentation-v17.0.22-clean-baseline",
+                "analysis_version": "vehicle-segmentation-v17.0.22a-protect-mask-initialization-hotfix",
             },
         ) from fallback_exc
 
@@ -7133,7 +7137,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     ),
                     "raw_component_count": len(raw_components),
                     "analysis_version": (
-                        "vehicle-segmentation-v17.0.22-clean-baseline"
+                        "vehicle-segmentation-v17.0.22a-protect-mask-initialization-hotfix"
                     ),
                 },
             )
@@ -7146,7 +7150,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                 "gpt-4.1-mini",
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.22-clean-baseline"
+                "vehicle-segmentation-v17.0.22a-protect-mask-initialization-hotfix"
             ),
             "mask_format": "data:image/png;base64",
             "mask_semantics": "white_component_black_background",
@@ -7194,7 +7198,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     "error_type": type(exc).__name__,
                     "error": str(exc)[:1600],
                     "analysis_version": (
-                        "vehicle-segmentation-v17.0.22-clean-baseline"
+                        "vehicle-segmentation-v17.0.22a-protect-mask-initialization-hotfix"
                     ),
                 },
             },
@@ -7236,7 +7240,7 @@ def start_vehicle_component_analysis(
             "result": None,
             "error": None,
             "analysis_version": (
-                "vehicle-segmentation-v17.0.22-clean-baseline"
+                "vehicle-segmentation-v17.0.22a-protect-mask-initialization-hotfix"
             ),
         }
 
@@ -7254,7 +7258,7 @@ def start_vehicle_component_analysis(
             f"/v1/vehicle/analyze-components/status/{job_id}"
         ),
         "analysis_version": (
-            "vehicle-segmentation-v17.0.22-clean-baseline"
+            "vehicle-segmentation-v17.0.22a-protect-mask-initialization-hotfix"
         ),
     }
 
@@ -7352,7 +7356,7 @@ def snap_vehicle_polygon_points(
         ),
         "snap_radius": payload.snap_radius,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.22-clean-baseline"
+            "vehicle-segmentation-v17.0.22a-protect-mask-initialization-hotfix"
         ),
     }
 
@@ -7564,7 +7568,7 @@ def refine_vehicle_component(payload: ComponentRefineRequest):
         "requires_review": diagnostics.get("refinement_status") != "refined",
         "refinement": diagnostics,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.22-clean-baseline"
+            "vehicle-segmentation-v17.0.22a-protect-mask-initialization-hotfix"
         ),
     }
 
@@ -7588,7 +7592,7 @@ def analyze_vehicle_components_sync_disabled(
                 "/v1/vehicle/analyze-components/status/{job_id}"
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.22-clean-baseline"
+                "vehicle-segmentation-v17.0.22a-protect-mask-initialization-hotfix"
             ),
         },
     )
@@ -7671,7 +7675,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v17.0.22-clean-baseline",
+        "prompt_version": "damage-v17.0.22a-protect-mask-initialization-hotfix",
         "result_kind": "full_frame_jpeg",
         "full_frame_guard": full_frame_diagnostics,
     }
@@ -7680,7 +7684,7 @@ async def edit_damage(
 @app.post("/v1/damage/edit-base64")
 def edit_damage_base64(payload: DamageEditBase64Request):
     """
-    V17.0.22 Clean Baseline
+    V17.0.22a Protect Mask Initialization Hotfix
 
     - con maschera manuale: foto completa + perimetro reale + prompt naturale,
       output diretto del modello e validazione anti-cambio-auto;
@@ -7740,6 +7744,52 @@ def edit_damage_base64(payload: DamageEditBase64Request):
             )
         )
         processing_size = source.size
+
+        raw_protect_mask: Image.Image | None = None
+        protect_mask: Image.Image | None = None
+
+        if payload.protect_mask_base64:
+            raw_protect_mask = decode_base64_image(
+                payload.protect_mask_base64,
+                "protect_mask_base64",
+                "L",
+            )
+            raw_protect_mask = resize_mask_to_processing_size(
+                raw_protect_mask,
+                processing_size,
+            )
+            protect_mask = resize_mask(
+                raw_protect_mask.convert("L"),
+                processing_size,
+            )
+
+        print(
+            "[PROTECT MASK INITIALIZATION]",
+            {
+                "diagnostic_id": request_diagnostic_id,
+                "has_protect_mask_base64": bool(
+                    payload.protect_mask_base64
+                ),
+                "protect_mask_initialized": (
+                    protect_mask is not None
+                ),
+                "processing_size": list(processing_size),
+                "protected_pixels": (
+                    int(
+                        (
+                            np.asarray(
+                                protect_mask,
+                                dtype=np.uint8,
+                            ) > 127
+                        ).sum()
+                    )
+                    if protect_mask is not None
+                    else 0
+                ),
+            },
+            flush=True,
+        )
+
         gc.collect()
 
         guided_mode = (
@@ -7804,9 +7854,18 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                     raw_manual_mask,
                     source.size,
                 )
+
+                effective_manual_mask, protect_mask = (
+                    combine_edit_and_protect_masks(
+                        edit_mask=raw_manual_mask,
+                        protect_mask=protect_mask,
+                        target_size=source.size,
+                    )
+                )
+
                 guided_mask, api_mask, mask_diagnostics = (
                     prepare_hybrid_guided_api_mask(
-                        manual_mask=raw_manual_mask,
+                        manual_mask=effective_manual_mask,
                         target_size=source.size,
                         edge_margin_px=1,
                     )
@@ -7817,6 +7876,21 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                     else "hybrid_guided"
                 )
                 mask_diagnostics.update({
+                    "protect_mask_applied_server_side": (
+                        protect_mask is not None
+                    ),
+                    "protect_mask_pixels": (
+                        int(
+                            (
+                                np.asarray(
+                                    protect_mask,
+                                    dtype=np.uint8,
+                                ) > 127
+                            ).sum()
+                        )
+                        if protect_mask is not None
+                        else 0
+                    ),
                     "simulation_mode": payload.simulation_mode,
                     "impact_zone_mode": is_impact_zone_mode,
                     "mask_geometry_source": (
@@ -7834,6 +7908,13 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                     "L",
                     source.size,
                     color=255,
+                )
+                guided_mask, protect_mask = (
+                    combine_edit_and_protect_masks(
+                        edit_mask=guided_mask,
+                        protect_mask=protect_mask,
+                        target_size=source.size,
+                    )
                 )
                 api_mask = alter_damage_area(guided_mask, 0)
                 mask_diagnostics = {
@@ -8427,7 +8508,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 ).decode("ascii"),
                 "mime_type": "image/jpeg",
                 "prompt_version": (
-                    "damage-v17.0.22-clean-baseline"
+                    "damage-v17.0.22a-protect-mask-initialization-hotfix"
                 ),
                 "result_kind": "full_frame_jpeg",
                 "deformation_type": payload.deformation_type,
@@ -8504,16 +8585,6 @@ def edit_damage_base64(payload: DamageEditBase64Request):
             payload.mask_base64,
             "mask_base64",
             "L",
-        )
-
-        raw_protect_mask = (
-            decode_base64_image(
-                payload.protect_mask_base64,
-                "protect_mask_base64",
-                "L",
-            )
-            if payload.protect_mask_base64
-            else None
         )
 
         source_mask, protect_mask = combine_edit_and_protect_masks(
@@ -8764,7 +8835,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
             "area_percent": area_percent,
             "result_base64": base64.b64encode(result_bytes).decode("ascii"),
             "mime_type": "image/jpeg",
-            "prompt_version": "damage-v17.0.22-clean-baseline",
+            "prompt_version": "damage-v17.0.22a-protect-mask-initialization-hotfix",
             "result_kind": "full_frame_jpeg",
             "full_frame_guard": full_frame_diagnostics,
             "deformation_type": payload.deformation_type,
@@ -9035,7 +9106,7 @@ def start_async_damage_generation(
             "result_path": None,
             "error": None,
             "generation_version": (
-                "damage-v17.0.22-clean-baseline"
+                "damage-v17.0.22a-protect-mask-initialization-hotfix"
             ),
         }
 
@@ -9056,7 +9127,7 @@ def start_async_damage_generation(
         "poll_url": f"/v1/damage/edit-base64/status/{job_id}",
         "delete_url": f"/v1/damage/edit-base64/status/{job_id}",
         "generation_version": (
-            "damage-v17.0.22-clean-baseline"
+            "damage-v17.0.22a-protect-mask-initialization-hotfix"
         ),
         "poll_interval_ms": 3500,
     }
