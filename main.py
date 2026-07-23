@@ -65,13 +65,13 @@ ALLOWED_ORIGINS = [
 ]
 
 print(
-    "=== CAR DAMAGE LAB BACKEND V17.0.22A PROTECT MASK INITIALIZATION HOTFIX ===",
+    "=== CAR DAMAGE LAB BACKEND V17.0.20 PAINT COLOUR PRESERVATION ===",
     flush=True,
 )
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.7.0.22a",
+    version="1.7.0.20",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -3385,281 +3385,6 @@ def validate_hybrid_guided_result(
     return output.getvalue(), diagnostics
 
 
-def validate_protected_region_preservation(
-    source: Image.Image,
-    candidate_bytes: bytes,
-    protect_mask: Image.Image | None,
-) -> dict[str, object]:
-    """
-    Verifica deterministica dei pixel nella protect_mask.
-
-    È pensata soprattutto per la targa: quando esiste una maschera reale,
-    questo risultato ha priorità sul giudizio AI di same_license_plate.
-    """
-    if protect_mask is None:
-        return {
-            "passed": True,
-            "applied": False,
-            "reason": "protect_mask_missing",
-        }
-
-    try:
-        candidate = Image.open(io.BytesIO(candidate_bytes))
-        candidate.load()
-        candidate = candidate.convert("RGB")
-    except Exception as exc:
-        return {
-            "passed": False,
-            "applied": True,
-            "reason": "candidate_decode_error",
-            "error": str(exc),
-        }
-
-    source_rgb = source.convert("RGB")
-    if candidate.size != source_rgb.size:
-        candidate = candidate.resize(
-            source_rgb.size,
-            Image.Resampling.LANCZOS,
-        )
-
-    width, height = source_rgb.size
-    mask = resize_mask(
-        protect_mask.convert("L"),
-        (width, height),
-    )
-    mask_array = np.asarray(mask, dtype=np.uint8)
-    protected = mask_array > 127
-
-    protected_pixels = int(protected.sum())
-    if protected_pixels < 50:
-        return {
-            "passed": False,
-            "applied": True,
-            "reason": "protect_mask_too_small",
-            "protected_pixels": protected_pixels,
-        }
-
-    source_array = np.asarray(source_rgb, dtype=np.int16)
-    candidate_array = np.asarray(candidate, dtype=np.int16)
-
-    diff = np.abs(
-        candidate_array[protected]
-        - source_array[protected]
-    ).astype(np.float32)
-
-    per_pixel_mean = diff.mean(axis=1)
-
-    mean_absolute_difference = float(diff.mean())
-    p95_absolute_difference = float(
-        np.percentile(per_pixel_mean, 95)
-    )
-    changed_pixel_ratio = float(
-        np.mean(per_pixel_mean > 10.0)
-    )
-    strongly_changed_pixel_ratio = float(
-        np.mean(per_pixel_mean > 25.0)
-    )
-
-    # Tolleranza per compressione JPEG e minime variazioni antialias.
-    passed = bool(
-        mean_absolute_difference <= 4.5
-        and changed_pixel_ratio <= 0.035
-        and strongly_changed_pixel_ratio <= 0.01
-    )
-
-    failure_reasons: list[str] = []
-    if mean_absolute_difference > 4.5:
-        failure_reasons.append(
-            "protected region average pixel difference too high"
-        )
-    if changed_pixel_ratio > 0.035:
-        failure_reasons.append(
-            "too many changed pixels inside protected region"
-        )
-    if strongly_changed_pixel_ratio > 0.01:
-        failure_reasons.append(
-            "strong changes detected inside protected region"
-        )
-
-    return {
-        "passed": passed,
-        "applied": True,
-        "validation_profile": "v17.0.22_protected_region",
-        "protected_pixels": protected_pixels,
-        "mean_absolute_difference": round(
-            mean_absolute_difference,
-            4,
-        ),
-        "p95_absolute_difference": round(
-            p95_absolute_difference,
-            4,
-        ),
-        "changed_pixel_ratio": round(
-            changed_pixel_ratio,
-            6,
-        ),
-        "strongly_changed_pixel_ratio": round(
-            strongly_changed_pixel_ratio,
-            6,
-        ),
-        "failure_reasons": failure_reasons,
-    }
-
-
-def call_openai_damage_refinement_validation(
-    source: Image.Image,
-    candidate_bytes: bytes,
-    selected_components: list[str],
-) -> dict[str, object]:
-    """
-    Controllo separato e non identitario di fanale e pieghe.
-    Non modifica identity_validation.
-    """
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        return {
-            "passed": True,
-            "skipped": True,
-            "reason": "OPENAI_API_KEY missing",
-        }
-
-    try:
-        candidate = Image.open(io.BytesIO(candidate_bytes))
-        candidate.load()
-        candidate = candidate.convert("RGB")
-    except Exception as exc:
-        return {
-            "passed": False,
-            "skipped": False,
-            "reason": "candidate_decode_error",
-            "error": str(exc),
-        }
-
-    if candidate.size != source.size:
-        candidate = candidate.resize(
-            source.size,
-            Image.Resampling.LANCZOS,
-        )
-
-    client = OpenAI(api_key=api_key)
-    model = os.getenv(
-        "OPENAI_REFINEMENT_VALIDATION_MODEL",
-        "gpt-4.1",
-    )
-
-    prompt = f"""
-Compare the ORIGINAL and EDITED vehicle photographs.
-
-Selected components:
-{", ".join(selected_components)}
-
-Return ONLY valid JSON:
-{{
-  "passed": true or false,
-  "tail_light_shape_preserved": true or false,
-  "tail_light_size_preserved": true or false,
-  "tail_light_orientation_preserved": true or false,
-  "tail_light_internal_damage_plausible": true or false,
-  "creases_physically_coherent": true or false,
-  "creases_too_soft_or_wavy": true or false,
-  "creases_too_repetitive": true or false,
-  "panel_transitions_coherent": true or false,
-  "failure_reasons": ["short reason"],
-  "confidence": number from 0 to 1
-}}
-
-TAIL LIGHT
-- Preserve the exact original outer silhouette, size, curvature,
-  orientation and mounting footprint.
-- Internal cracking, localized shattering and missing lens fragments
-  are allowed.
-- Fail if the lamp is reshaped, compressed, shortened, widened,
-  rounded, rotated, replaced or redesigned.
-
-CREASES
-- Creases must follow one plausible force path.
-- Sheet metal may have sharper primary ridges and softer secondary buckling.
-- Plastic bumper deformation must be broader and smoother than sheet metal.
-- Fail if surfaces look melted, rubbery, uniformly wavy, repetitive,
-  decorative or disconnected from impact direction.
-- Adjacent panel transitions must remain continuous and plausible.
-""".strip()
-
-    try:
-        response = client.chat.completions.create(
-            model=model,
-            temperature=0,
-            response_format={"type": "json_object"},
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a strict automotive collision-damage "
-                        "quality inspector. Return JSON only."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {
-                            "type": "text",
-                            "text": "ORIGINAL PHOTOGRAPH:",
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": image_to_data_url(source),
-                                "detail": "high",
-                            },
-                        },
-                        {
-                            "type": "text",
-                            "text": "EDITED PHOTOGRAPH:",
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": image_to_data_url(candidate),
-                                "detail": "high",
-                            },
-                        },
-                    ],
-                },
-            ],
-        )
-
-        parsed = extract_json_object(
-            response.choices[0].message.content or "{}"
-        )
-
-        passed = (
-            bool(parsed.get("passed"))
-            and bool(parsed.get("tail_light_shape_preserved"))
-            and bool(parsed.get("tail_light_size_preserved"))
-            and bool(parsed.get("tail_light_orientation_preserved"))
-            and bool(parsed.get("tail_light_internal_damage_plausible"))
-            and bool(parsed.get("creases_physically_coherent"))
-            and not bool(parsed.get("creases_too_soft_or_wavy"))
-            and not bool(parsed.get("creases_too_repetitive"))
-            and bool(parsed.get("panel_transitions_coherent"))
-        )
-
-        parsed["passed"] = passed
-        parsed["model"] = model
-        parsed["skipped"] = False
-        return parsed
-
-    except Exception as exc:
-        return {
-            "passed": False,
-            "skipped": False,
-            "reason": "refinement_validation_error",
-            "error": str(exc),
-            "model": model,
-        }
-
-
 def validate_paint_colour_consistency(
     source: Image.Image,
     candidate_bytes: bytes,
@@ -4112,17 +3837,8 @@ Requested deformation:
 Rules:
 - create one coherent deformation field across the whole zone;
 - propagate force continuously across adjacent panels;
-- create one dominant force path with a limited number of primary creases;
-- use sharper directional ridges on sheet metal near structural joints;
-- use broader and smoother deformation on plastic bumpers;
-- avoid repetitive ripples, melted surfaces, rubber-like waviness and
-  decorative folds;
 - preserve realistic material differences between metal, plastic, glass and
   lighting;
-- preserve the exact original outer silhouette, size, curvature,
-  orientation and mounting footprint of every tail light;
-- allow only internal cracking, localized shattering or missing lens
-  fragments without redesigning the lamp;
 - do not create separate isolated dents on each component;
 - do not redraw the vehicle or replace it with another make or model;
 - preserve the exact original body-paint hue, saturation, apparent brightness
@@ -4288,7 +4004,7 @@ def root():
     return {
         "service": APP_NAME,
         "status": "ok",
-        "version": "1.7.0.22a",
+        "version": "1.7.0.20",
         "docs": "/docs",
         "health": "/health",
     }
@@ -4298,9 +4014,9 @@ def root():
 def get_backend_version() -> dict[str, object]:
     return {
         "service": APP_NAME,
-        "version": "1.7.0.22a",
+        "version": "1.7.0.20",
         "prompt_version": (
-            "damage-v17.0.22a-protect-mask-initialization-hotfix"
+            "damage-v17.0.20-paint-colour-preservation"
         ),
         "staged_identity_validation": True,
         "maximum_generation_attempts": 2,
@@ -4330,20 +4046,6 @@ def get_backend_version() -> dict[str, object]:
         "paint_colour_validation_profile": (
             "v17.0.20_paint_colour"
         ),
-        "clean_baseline_from_v17_0_20": True,
-        "protected_region_numeric_validation": True,
-        "protected_region_validation_profile": (
-            "v17.0.22_protected_region"
-        ),
-        "taillight_refinement": True,
-        "crease_refinement": True,
-        "validation_channels_separated": True,
-        "ai_plate_validation_overridden_when_mask_present": True,
-        "automatic_geometry_postprocessing": False,
-        "protect_mask_initialization_hotfix": True,
-        "protect_mask_initialized_before_guided_flow": True,
-        "protect_mask_subtracted_server_side": True,
-        "undefined_protect_mask_regression_fixed": True,
     }
 
 
@@ -4514,7 +4216,7 @@ def _replicate_json_request(
             status_code=500,
             detail={
                 "message": "REPLICATE_API_TOKEN non configurato su Render.",
-                "analysis_version": "vehicle-segmentation-v17.0.22a-protect-mask-initialization-hotfix",
+                "analysis_version": "vehicle-segmentation-v17.0.20-paint-colour-preservation",
             },
         )
 
@@ -4557,7 +4259,7 @@ def _replicate_json_request(
                 "http_status": exc.code,
                 "request_url": url,
                 "replicate_detail": error_body[:2000],
-                "analysis_version": "vehicle-segmentation-v17.0.22a-protect-mask-initialization-hotfix",
+                "analysis_version": "vehicle-segmentation-v17.0.20-paint-colour-preservation",
             },
         ) from exc
     except Exception as exc:
@@ -4566,7 +4268,7 @@ def _replicate_json_request(
             detail={
                 "message": "Connessione a Replicate non riuscita.",
                 "error": f"{type(exc).__name__}: {str(exc)}"[:1200],
-                "analysis_version": "vehicle-segmentation-v17.0.22a-protect-mask-initialization-hotfix",
+                "analysis_version": "vehicle-segmentation-v17.0.20-paint-colour-preservation",
             },
         ) from exc
 
@@ -5461,7 +5163,7 @@ def _create_replicate_prediction(
                 "Limite Replicate ancora attivo dopo diversi tentativi."
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.22a-protect-mask-initialization-hotfix"
+                "vehicle-segmentation-v17.0.20-paint-colour-preservation"
             ),
         },
     )
@@ -6513,7 +6215,7 @@ def smart_polygon_component_payload(
         "smooth_polygon": smooth_polygon,
         "feather_radius": feather_radius,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.22a-protect-mask-initialization-hotfix"
+            "vehicle-segmentation-v17.0.20-paint-colour-preservation"
         ),
     }
 
@@ -6837,7 +6539,7 @@ def normalize_vehicle_analysis(
         "manual_polygon_required_only_for_selected_components": True,
         "segmentation_strategy": "manual_smart_polygon",
         "analysis_version": (
-            "vehicle-segmentation-v17.0.22a-protect-mask-initialization-hotfix"
+            "vehicle-segmentation-v17.0.20-paint-colour-preservation"
         ),
     }
 
@@ -6982,7 +6684,7 @@ Bounding-box rules:
                 "model": configured_model,
                 "primary_error": primary_message[:800],
                 "fallback_error": fallback_message[:800],
-                "analysis_version": "vehicle-segmentation-v17.0.22a-protect-mask-initialization-hotfix",
+                "analysis_version": "vehicle-segmentation-v17.0.20-paint-colour-preservation",
             },
         ) from fallback_exc
 
@@ -7137,7 +6839,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     ),
                     "raw_component_count": len(raw_components),
                     "analysis_version": (
-                        "vehicle-segmentation-v17.0.22a-protect-mask-initialization-hotfix"
+                        "vehicle-segmentation-v17.0.20-paint-colour-preservation"
                     ),
                 },
             )
@@ -7150,7 +6852,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                 "gpt-4.1-mini",
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.22a-protect-mask-initialization-hotfix"
+                "vehicle-segmentation-v17.0.20-paint-colour-preservation"
             ),
             "mask_format": "data:image/png;base64",
             "mask_semantics": "white_component_black_background",
@@ -7198,7 +6900,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     "error_type": type(exc).__name__,
                     "error": str(exc)[:1600],
                     "analysis_version": (
-                        "vehicle-segmentation-v17.0.22a-protect-mask-initialization-hotfix"
+                        "vehicle-segmentation-v17.0.20-paint-colour-preservation"
                     ),
                 },
             },
@@ -7240,7 +6942,7 @@ def start_vehicle_component_analysis(
             "result": None,
             "error": None,
             "analysis_version": (
-                "vehicle-segmentation-v17.0.22a-protect-mask-initialization-hotfix"
+                "vehicle-segmentation-v17.0.20-paint-colour-preservation"
             ),
         }
 
@@ -7258,7 +6960,7 @@ def start_vehicle_component_analysis(
             f"/v1/vehicle/analyze-components/status/{job_id}"
         ),
         "analysis_version": (
-            "vehicle-segmentation-v17.0.22a-protect-mask-initialization-hotfix"
+            "vehicle-segmentation-v17.0.20-paint-colour-preservation"
         ),
     }
 
@@ -7356,7 +7058,7 @@ def snap_vehicle_polygon_points(
         ),
         "snap_radius": payload.snap_radius,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.22a-protect-mask-initialization-hotfix"
+            "vehicle-segmentation-v17.0.20-paint-colour-preservation"
         ),
     }
 
@@ -7568,7 +7270,7 @@ def refine_vehicle_component(payload: ComponentRefineRequest):
         "requires_review": diagnostics.get("refinement_status") != "refined",
         "refinement": diagnostics,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.22a-protect-mask-initialization-hotfix"
+            "vehicle-segmentation-v17.0.20-paint-colour-preservation"
         ),
     }
 
@@ -7592,7 +7294,7 @@ def analyze_vehicle_components_sync_disabled(
                 "/v1/vehicle/analyze-components/status/{job_id}"
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.22a-protect-mask-initialization-hotfix"
+                "vehicle-segmentation-v17.0.20-paint-colour-preservation"
             ),
         },
     )
@@ -7675,7 +7377,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v17.0.22a-protect-mask-initialization-hotfix",
+        "prompt_version": "damage-v17.0.20-paint-colour-preservation",
         "result_kind": "full_frame_jpeg",
         "full_frame_guard": full_frame_diagnostics,
     }
@@ -7684,7 +7386,7 @@ async def edit_damage(
 @app.post("/v1/damage/edit-base64")
 def edit_damage_base64(payload: DamageEditBase64Request):
     """
-    V17.0.22a Protect Mask Initialization Hotfix
+    V17.0.20 Paint Colour Preservation
 
     - con maschera manuale: foto completa + perimetro reale + prompt naturale,
       output diretto del modello e validazione anti-cambio-auto;
@@ -7744,52 +7446,6 @@ def edit_damage_base64(payload: DamageEditBase64Request):
             )
         )
         processing_size = source.size
-
-        raw_protect_mask: Image.Image | None = None
-        protect_mask: Image.Image | None = None
-
-        if payload.protect_mask_base64:
-            raw_protect_mask = decode_base64_image(
-                payload.protect_mask_base64,
-                "protect_mask_base64",
-                "L",
-            )
-            raw_protect_mask = resize_mask_to_processing_size(
-                raw_protect_mask,
-                processing_size,
-            )
-            protect_mask = resize_mask(
-                raw_protect_mask.convert("L"),
-                processing_size,
-            )
-
-        print(
-            "[PROTECT MASK INITIALIZATION]",
-            {
-                "diagnostic_id": request_diagnostic_id,
-                "has_protect_mask_base64": bool(
-                    payload.protect_mask_base64
-                ),
-                "protect_mask_initialized": (
-                    protect_mask is not None
-                ),
-                "processing_size": list(processing_size),
-                "protected_pixels": (
-                    int(
-                        (
-                            np.asarray(
-                                protect_mask,
-                                dtype=np.uint8,
-                            ) > 127
-                        ).sum()
-                    )
-                    if protect_mask is not None
-                    else 0
-                ),
-            },
-            flush=True,
-        )
-
         gc.collect()
 
         guided_mode = (
@@ -7854,18 +7510,9 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                     raw_manual_mask,
                     source.size,
                 )
-
-                effective_manual_mask, protect_mask = (
-                    combine_edit_and_protect_masks(
-                        edit_mask=raw_manual_mask,
-                        protect_mask=protect_mask,
-                        target_size=source.size,
-                    )
-                )
-
                 guided_mask, api_mask, mask_diagnostics = (
                     prepare_hybrid_guided_api_mask(
-                        manual_mask=effective_manual_mask,
+                        manual_mask=raw_manual_mask,
                         target_size=source.size,
                         edge_margin_px=1,
                     )
@@ -7876,21 +7523,6 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                     else "hybrid_guided"
                 )
                 mask_diagnostics.update({
-                    "protect_mask_applied_server_side": (
-                        protect_mask is not None
-                    ),
-                    "protect_mask_pixels": (
-                        int(
-                            (
-                                np.asarray(
-                                    protect_mask,
-                                    dtype=np.uint8,
-                                ) > 127
-                            ).sum()
-                        )
-                        if protect_mask is not None
-                        else 0
-                    ),
                     "simulation_mode": payload.simulation_mode,
                     "impact_zone_mode": is_impact_zone_mode,
                     "mask_geometry_source": (
@@ -7908,13 +7540,6 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                     "L",
                     source.size,
                     color=255,
-                )
-                guided_mask, protect_mask = (
-                    combine_edit_and_protect_masks(
-                        edit_mask=guided_mask,
-                        protect_mask=protect_mask,
-                        target_size=source.size,
-                    )
                 )
                 api_mask = alter_damage_area(guided_mask, 0)
                 mask_diagnostics = {
@@ -8130,109 +7755,12 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                         )
                     )
 
-                    protected_region_validation = (
-                        validate_protected_region_preservation(
-                            source=source,
-                            candidate_bytes=candidate_bytes,
-                            protect_mask=protect_mask,
-                        )
-                    )
-
-                    refinement_validation = (
-                        call_openai_damage_refinement_validation(
-                            source=source,
-                            candidate_bytes=candidate_bytes,
-                            selected_components=selected_components,
-                        )
-                    )
-
-                    # La targa protetta viene valutata numericamente.
-                    # Il giudizio AI sulla targa non può sovrascriverla.
-                    if bool(
-                        protected_region_validation.get("applied")
-                    ):
-                        identity_validation["same_license_plate"] = bool(
-                            protected_region_validation.get("passed")
-                        )
-                        if bool(
-                            protected_region_validation.get("passed")
-                        ):
-                            identity_validation[
-                                "vehicle_identity_changed"
-                            ] = False
-
-                    identity_validation_passed = bool(
-                        identity_validation.get("passed")
-                    )
-                    protected_region_validation_passed = bool(
-                        protected_region_validation.get("passed")
-                    )
-                    paint_colour_validation_passed = bool(
-                        paint_colour_validation.get("passed")
-                    )
-                    damage_refinement_validation_passed = bool(
-                        refinement_validation.get("passed")
-                    )
-
-                    # Se la regione protetta passa, same_license_plate
-                    # non può causare un falso negativo.
-                    if bool(
-                        protected_region_validation.get("applied")
-                    ):
-                        ai_identity_fields = [
-                            bool(identity_validation.get("same_make")),
-                            bool(identity_validation.get("same_model")),
-                            bool(
-                                identity_validation.get(
-                                    "same_manufacturer_emblem"
-                                )
-                            ),
-                            bool(
-                                identity_validation.get(
-                                    "same_model_badges"
-                                )
-                            ),
-                            bool(
-                                identity_validation.get(
-                                    "tail_light_outer_geometry_preserved"
-                                )
-                            ),
-                        ]
-                        identity_validation_passed = all(
-                            ai_identity_fields
-                        )
-
-                    overall_validation_passed = bool(
-                        identity_validation_passed
-                        and protected_region_validation_passed
-                        and paint_colour_validation_passed
-                        and damage_refinement_validation_passed
-                    )
-
                     candidate_diagnostics.update({
                         "paint_colour_validation": (
                             paint_colour_validation
                         ),
-                        "paint_colour_validation_passed": (
-                            paint_colour_validation_passed
-                        ),
-                        "protected_region_validation": (
-                            protected_region_validation
-                        ),
-                        "protected_region_validation_passed": (
-                            protected_region_validation_passed
-                        ),
-                        "damage_refinement_validation": (
-                            refinement_validation
-                        ),
-                        "damage_refinement_validation_passed": (
-                            damage_refinement_validation_passed
-                        ),
-                        "identity_validation_passed": (
-                            identity_validation_passed
-                        ),
-                        "overall_validation_passed": (
-                            overall_validation_passed
+                        "paint_colour_validation_passed": bool(
+                            paint_colour_validation.get("passed")
                         ),
                     })
 
@@ -8276,51 +7804,10 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                     generation_attempts.append({
                         "attempt": attempt_number,
                         "identity_validation": identity_validation,
-                        "protected_region_validation": (
-                            protected_region_validation
-                        ),
                         "paint_colour_validation": (
                             paint_colour_validation
                         ),
-                        "damage_refinement_validation": (
-                            refinement_validation
-                        ),
-                        "identity_validation_passed": (
-                            identity_validation_passed
-                        ),
-                        "protected_region_validation_passed": (
-                            protected_region_validation_passed
-                        ),
-                        "paint_colour_validation_passed": (
-                            paint_colour_validation_passed
-                        ),
-                        "damage_refinement_validation_passed": (
-                            damage_refinement_validation_passed
-                        ),
-                        "overall_validation_passed": (
-                            overall_validation_passed
-                        ),
                     })
-
-                    print(
-                        "[PROTECTED REGION VALIDATION RESULT]",
-                        {
-                            "diagnostic_id": request_diagnostic_id,
-                            "attempt": attempt_number,
-                            "validation": protected_region_validation,
-                        },
-                        flush=True,
-                    )
-
-                    print(
-                        "[DAMAGE REFINEMENT VALIDATION RESULT]",
-                        {
-                            "diagnostic_id": request_diagnostic_id,
-                            "attempt": attempt_number,
-                            "validation": refinement_validation,
-                        },
-                        flush=True,
-                    )
 
                     print(
                         "[PAINT COLOUR VALIDATION RESULT]",
@@ -8342,26 +7829,12 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                         flush=True,
                     )
 
-                    if overall_validation_passed:
+                    if bool(identity_validation.get("passed")):
                         result_bytes = candidate_bytes
                         result_diagnostics = candidate_diagnostics
                         result_diagnostics.update({
                             "identity_validation": identity_validation,
-                            "identity_validation_passed": (
-                                identity_validation_passed
-                            ),
-                            "protected_region_validation_passed": (
-                                protected_region_validation_passed
-                            ),
-                            "paint_colour_validation_passed": (
-                                paint_colour_validation_passed
-                            ),
-                            "damage_refinement_validation_passed": (
-                                damage_refinement_validation_passed
-                            ),
-                            "overall_validation_passed": (
-                                overall_validation_passed
-                            ),
+                            "identity_validation_passed": True,
                             "generation_attempt_used": attempt_number,
                             "generation_attempts": generation_attempts,
                             "paint_colour_validation": (
@@ -8378,121 +7851,19 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                         )
 
                 if not result_bytes:
-                    last_attempt = (
-                        generation_attempts[-1]
-                        if generation_attempts
-                        else {}
-                    )
-                    last_identity = (
-                        last_attempt.get("identity_validation")
-                        or {}
-                    )
-                    last_protected = (
-                        last_attempt.get(
-                            "protected_region_validation"
-                        )
-                        or {}
-                    )
-                    last_paint = (
-                        last_attempt.get("paint_colour_validation")
-                        or {}
-                    )
-                    last_refinement = (
-                        last_attempt.get(
-                            "damage_refinement_validation"
-                        )
-                        or {}
-                    )
-
-                    plate_failed = not bool(
-                        last_attempt.get(
-                            "protected_region_validation_passed"
-                        )
-                    )
-                    identity_failed = not bool(
-                        last_attempt.get(
-                            "identity_validation_passed"
-                        )
-                    )
-                    paint_failed = not bool(
-                        last_attempt.get(
-                            "paint_colour_validation_passed"
-                        )
-                    )
-                    refinement_failed = not bool(
-                        last_attempt.get(
-                            "damage_refinement_validation_passed"
-                        )
-                    )
-
-                    if plate_failed:
-                        error_code = "protected_region_changed"
-                        message = (
-                            "La regione protetta è stata modificata."
-                        )
-                        action = (
-                            "Verifica la maschera della targa e riprova."
-                        )
-                    elif refinement_failed:
-                        error_code = "damage_refinement_failed"
-                        message = (
-                            "Il risultato non ha superato i controlli "
-                            "su fanale e pieghe."
-                        )
-                        action = (
-                            "Riduci leggermente la severità oppure "
-                            "modifica la zona d'impatto."
-                        )
-                    elif paint_failed:
-                        error_code = "paint_colour_validation_failed"
-                        message = (
-                            "Il risultato non ha preservato correttamente "
-                            "il colore originale."
-                        )
-                        action = "Riprova con la stessa configurazione."
-                    elif identity_failed:
-                        error_code = "vehicle_identity_validation_failed"
-                        message = (
-                            "Il risultato non ha superato i controlli "
-                            "di identità del veicolo."
-                        )
-                        action = (
-                            "Riduci l'area del danno oppure seleziona "
-                            "meno componenti."
-                        )
-                    else:
-                        error_code = "quality_validation_failed"
-                        message = (
-                            "La simulazione non ha superato i controlli "
-                            "di qualità."
-                        )
-                        action = "Modifica la configurazione e riprova."
-
                     raise HTTPException(
                         status_code=422,
                         detail={
-                            "message": message,
-                            "action": action,
-                            "error_code": error_code,
-                            "identity_validation_failed": identity_failed,
-                            "protected_region_validation_failed": (
-                                plate_failed
+                            "message": (
+                                "La simulazione non ha superato i controlli "
+                                "di identità del veicolo dopo due tentativi."
                             ),
-                            "paint_colour_validation_failed": (
-                                paint_failed
+                            "action": (
+                                "Ridurre l'area del danno oppure selezionare "
+                                "meno componenti e riprovare."
                             ),
-                            "damage_refinement_validation_failed": (
-                                refinement_failed
-                            ),
+                            "identity_validation_failed": True,
                             "attempts": generation_attempts,
-                            "last_identity_validation": last_identity,
-                            "last_protected_region_validation": (
-                                last_protected
-                            ),
-                            "last_paint_colour_validation": last_paint,
-                            "last_damage_refinement_validation": (
-                                last_refinement
-                            ),
                             "diagnostic_id": request_diagnostic_id,
                         },
                     )
@@ -8508,7 +7879,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 ).decode("ascii"),
                 "mime_type": "image/jpeg",
                 "prompt_version": (
-                    "damage-v17.0.22a-protect-mask-initialization-hotfix"
+                    "damage-v17.0.20-paint-colour-preservation"
                 ),
                 "result_kind": "full_frame_jpeg",
                 "deformation_type": payload.deformation_type,
@@ -8585,6 +7956,16 @@ def edit_damage_base64(payload: DamageEditBase64Request):
             payload.mask_base64,
             "mask_base64",
             "L",
+        )
+
+        raw_protect_mask = (
+            decode_base64_image(
+                payload.protect_mask_base64,
+                "protect_mask_base64",
+                "L",
+            )
+            if payload.protect_mask_base64
+            else None
         )
 
         source_mask, protect_mask = combine_edit_and_protect_masks(
@@ -8835,7 +8216,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
             "area_percent": area_percent,
             "result_base64": base64.b64encode(result_bytes).decode("ascii"),
             "mime_type": "image/jpeg",
-            "prompt_version": "damage-v17.0.22a-protect-mask-initialization-hotfix",
+            "prompt_version": "damage-v17.0.20-paint-colour-preservation",
             "result_kind": "full_frame_jpeg",
             "full_frame_guard": full_frame_diagnostics,
             "deformation_type": payload.deformation_type,
@@ -9106,7 +8487,7 @@ def start_async_damage_generation(
             "result_path": None,
             "error": None,
             "generation_version": (
-                "damage-v17.0.22a-protect-mask-initialization-hotfix"
+                "damage-v17.0.20-paint-colour-preservation"
             ),
         }
 
@@ -9127,7 +8508,7 @@ def start_async_damage_generation(
         "poll_url": f"/v1/damage/edit-base64/status/{job_id}",
         "delete_url": f"/v1/damage/edit-base64/status/{job_id}",
         "generation_version": (
-            "damage-v17.0.22a-protect-mask-initialization-hotfix"
+            "damage-v17.0.20-paint-colour-preservation"
         ),
         "poll_interval_ms": 3500,
     }
