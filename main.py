@@ -65,13 +65,13 @@ ALLOWED_ORIGINS = [
 ]
 
 print(
-    "=== CAR DAMAGE LAB BACKEND V17.0.21 TAILLIGHT AND CREASE REFINEMENT ===",
+    "=== CAR DAMAGE LAB BACKEND V17.0.21A REFINEMENT ERROR SEPARATION HOTFIX ===",
     flush=True,
 )
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.7.0.21",
+    version="1.7.0.21a",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -4178,7 +4178,7 @@ def root():
     return {
         "service": APP_NAME,
         "status": "ok",
-        "version": "1.7.0.21",
+        "version": "1.7.0.21a",
         "docs": "/docs",
         "health": "/health",
     }
@@ -4188,9 +4188,9 @@ def root():
 def get_backend_version() -> dict[str, object]:
     return {
         "service": APP_NAME,
-        "version": "1.7.0.21",
+        "version": "1.7.0.21a",
         "prompt_version": (
-            "damage-v17.0.21-taillight-and-crease-refinement"
+            "damage-v17.0.21a-refinement-error-separation-hotfix"
         ),
         "staged_identity_validation": True,
         "maximum_generation_attempts": 2,
@@ -4224,6 +4224,9 @@ def get_backend_version() -> dict[str, object]:
         "crease_refinement": True,
         "damage_refinement_ai_validation": True,
         "automatic_geometry_postprocessing": False,
+        "validation_error_separation_hotfix": True,
+        "refinement_does_not_mutate_identity_validation": True,
+        "license_plate_error_only_when_same_license_plate_false": True,
     }
 
 
@@ -4394,7 +4397,7 @@ def _replicate_json_request(
             status_code=500,
             detail={
                 "message": "REPLICATE_API_TOKEN non configurato su Render.",
-                "analysis_version": "vehicle-segmentation-v17.0.21-taillight-and-crease-refinement",
+                "analysis_version": "vehicle-segmentation-v17.0.21a-refinement-error-separation-hotfix",
             },
         )
 
@@ -4437,7 +4440,7 @@ def _replicate_json_request(
                 "http_status": exc.code,
                 "request_url": url,
                 "replicate_detail": error_body[:2000],
-                "analysis_version": "vehicle-segmentation-v17.0.21-taillight-and-crease-refinement",
+                "analysis_version": "vehicle-segmentation-v17.0.21a-refinement-error-separation-hotfix",
             },
         ) from exc
     except Exception as exc:
@@ -4446,7 +4449,7 @@ def _replicate_json_request(
             detail={
                 "message": "Connessione a Replicate non riuscita.",
                 "error": f"{type(exc).__name__}: {str(exc)}"[:1200],
-                "analysis_version": "vehicle-segmentation-v17.0.21-taillight-and-crease-refinement",
+                "analysis_version": "vehicle-segmentation-v17.0.21a-refinement-error-separation-hotfix",
             },
         ) from exc
 
@@ -5341,7 +5344,7 @@ def _create_replicate_prediction(
                 "Limite Replicate ancora attivo dopo diversi tentativi."
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.21-taillight-and-crease-refinement"
+                "vehicle-segmentation-v17.0.21a-refinement-error-separation-hotfix"
             ),
         },
     )
@@ -6393,7 +6396,7 @@ def smart_polygon_component_payload(
         "smooth_polygon": smooth_polygon,
         "feather_radius": feather_radius,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.21-taillight-and-crease-refinement"
+            "vehicle-segmentation-v17.0.21a-refinement-error-separation-hotfix"
         ),
     }
 
@@ -6717,7 +6720,7 @@ def normalize_vehicle_analysis(
         "manual_polygon_required_only_for_selected_components": True,
         "segmentation_strategy": "manual_smart_polygon",
         "analysis_version": (
-            "vehicle-segmentation-v17.0.21-taillight-and-crease-refinement"
+            "vehicle-segmentation-v17.0.21a-refinement-error-separation-hotfix"
         ),
     }
 
@@ -6862,7 +6865,7 @@ Bounding-box rules:
                 "model": configured_model,
                 "primary_error": primary_message[:800],
                 "fallback_error": fallback_message[:800],
-                "analysis_version": "vehicle-segmentation-v17.0.21-taillight-and-crease-refinement",
+                "analysis_version": "vehicle-segmentation-v17.0.21a-refinement-error-separation-hotfix",
             },
         ) from fallback_exc
 
@@ -7017,7 +7020,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     ),
                     "raw_component_count": len(raw_components),
                     "analysis_version": (
-                        "vehicle-segmentation-v17.0.21-taillight-and-crease-refinement"
+                        "vehicle-segmentation-v17.0.21a-refinement-error-separation-hotfix"
                     ),
                 },
             )
@@ -7030,7 +7033,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                 "gpt-4.1-mini",
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.21-taillight-and-crease-refinement"
+                "vehicle-segmentation-v17.0.21a-refinement-error-separation-hotfix"
             ),
             "mask_format": "data:image/png;base64",
             "mask_semantics": "white_component_black_background",
@@ -7078,7 +7081,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     "error_type": type(exc).__name__,
                     "error": str(exc)[:1600],
                     "analysis_version": (
-                        "vehicle-segmentation-v17.0.21-taillight-and-crease-refinement"
+                        "vehicle-segmentation-v17.0.21a-refinement-error-separation-hotfix"
                     ),
                 },
             },
@@ -7120,7 +7123,7 @@ def start_vehicle_component_analysis(
             "result": None,
             "error": None,
             "analysis_version": (
-                "vehicle-segmentation-v17.0.21-taillight-and-crease-refinement"
+                "vehicle-segmentation-v17.0.21a-refinement-error-separation-hotfix"
             ),
         }
 
@@ -7138,7 +7141,7 @@ def start_vehicle_component_analysis(
             f"/v1/vehicle/analyze-components/status/{job_id}"
         ),
         "analysis_version": (
-            "vehicle-segmentation-v17.0.21-taillight-and-crease-refinement"
+            "vehicle-segmentation-v17.0.21a-refinement-error-separation-hotfix"
         ),
     }
 
@@ -7236,7 +7239,7 @@ def snap_vehicle_polygon_points(
         ),
         "snap_radius": payload.snap_radius,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.21-taillight-and-crease-refinement"
+            "vehicle-segmentation-v17.0.21a-refinement-error-separation-hotfix"
         ),
     }
 
@@ -7448,7 +7451,7 @@ def refine_vehicle_component(payload: ComponentRefineRequest):
         "requires_review": diagnostics.get("refinement_status") != "refined",
         "refinement": diagnostics,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.21-taillight-and-crease-refinement"
+            "vehicle-segmentation-v17.0.21a-refinement-error-separation-hotfix"
         ),
     }
 
@@ -7472,7 +7475,7 @@ def analyze_vehicle_components_sync_disabled(
                 "/v1/vehicle/analyze-components/status/{job_id}"
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.21-taillight-and-crease-refinement"
+                "vehicle-segmentation-v17.0.21a-refinement-error-separation-hotfix"
             ),
         },
     )
@@ -7555,7 +7558,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v17.0.21-taillight-and-crease-refinement",
+        "prompt_version": "damage-v17.0.21a-refinement-error-separation-hotfix",
         "result_kind": "full_frame_jpeg",
         "full_frame_guard": full_frame_diagnostics,
     }
@@ -7564,7 +7567,7 @@ async def edit_damage(
 @app.post("/v1/damage/edit-base64")
 def edit_damage_base64(payload: DamageEditBase64Request):
     """
-    V17.0.21 Taillight and Crease Refinement
+    V17.0.21a Refinement Error Separation Hotfix
 
     - con maschera manuale: foto completa + perimetro reale + prompt naturale,
       output diretto del modello e validazione anti-cambio-auto;
@@ -7993,22 +7996,20 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                             for reason in numeric_reasons
                         ]
 
-                    if not bool(
+                    identity_validation_passed = bool(
+                        identity_validation.get("passed")
+                    )
+                    paint_colour_validation_passed = bool(
+                        paint_colour_validation.get("passed")
+                    )
+                    damage_refinement_validation_passed = bool(
                         refinement_validation.get("passed")
-                    ):
-                        identity_validation["passed"] = False
-                        existing_reasons = (
-                            identity_validation.get("failure_reasons")
-                            or []
-                        )
-                        refinement_reasons = (
-                            refinement_validation.get("failure_reasons")
-                            or []
-                        )
-                        identity_validation["failure_reasons"] = (
-                            list(existing_reasons)
-                            + [str(item) for item in refinement_reasons]
-                        )
+                    )
+                    overall_validation_passed = bool(
+                        identity_validation_passed
+                        and paint_colour_validation_passed
+                        and damage_refinement_validation_passed
+                    )
 
                     generation_attempts.append({
                         "attempt": attempt_number,
@@ -8018,6 +8019,18 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                         ),
                         "damage_refinement_validation": (
                             refinement_validation
+                        ),
+                        "identity_validation_passed": (
+                            identity_validation_passed
+                        ),
+                        "paint_colour_validation_passed": (
+                            paint_colour_validation_passed
+                        ),
+                        "damage_refinement_validation_passed": (
+                            damage_refinement_validation_passed
+                        ),
+                        "overall_validation_passed": (
+                            overall_validation_passed
                         ),
                     })
 
@@ -8051,12 +8064,23 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                         flush=True,
                     )
 
-                    if bool(identity_validation.get("passed")):
+                    if overall_validation_passed:
                         result_bytes = candidate_bytes
                         result_diagnostics = candidate_diagnostics
                         result_diagnostics.update({
                             "identity_validation": identity_validation,
-                            "identity_validation_passed": True,
+                            "identity_validation_passed": (
+                                identity_validation_passed
+                            ),
+                            "paint_colour_validation_passed": (
+                                paint_colour_validation_passed
+                            ),
+                            "damage_refinement_validation_passed": (
+                                damage_refinement_validation_passed
+                            ),
+                            "overall_validation_passed": (
+                                overall_validation_passed
+                            ),
                             "generation_attempt_used": attempt_number,
                             "generation_attempts": generation_attempts,
                             "paint_colour_validation": (
@@ -8078,19 +8102,138 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                         )
 
                 if not result_bytes:
+                    last_attempt = (
+                        generation_attempts[-1]
+                        if generation_attempts
+                        else {}
+                    )
+                    last_identity = (
+                        last_attempt.get("identity_validation")
+                        or {}
+                    )
+                    last_paint = (
+                        last_attempt.get("paint_colour_validation")
+                        or {}
+                    )
+                    last_refinement = (
+                        last_attempt.get(
+                            "damage_refinement_validation"
+                        )
+                        or {}
+                    )
+
+                    identity_validation_failed = not bool(
+                        last_attempt.get(
+                            "identity_validation_passed"
+                        )
+                    )
+                    paint_colour_validation_failed = not bool(
+                        last_attempt.get(
+                            "paint_colour_validation_passed"
+                        )
+                    )
+                    damage_refinement_validation_failed = not bool(
+                        last_attempt.get(
+                            "damage_refinement_validation_passed"
+                        )
+                    )
+
+                    same_license_plate = last_identity.get(
+                        "same_license_plate"
+                    )
+                    license_plate_validation_failed = (
+                        same_license_plate is False
+                    )
+
+                    if license_plate_validation_failed:
+                        error_code = "license_plate_changed"
+                        user_message = (
+                            "La targa è stata modificata. "
+                            "Torna alla configurazione e proteggi la targa "
+                            "oppure escludila dalla zona d'impatto."
+                        )
+                        action = "Correggi zona e protezioni."
+                    elif damage_refinement_validation_failed:
+                        error_code = "damage_refinement_failed"
+                        user_message = (
+                            "Il risultato non ha superato i controlli "
+                            "su fanale e pieghe."
+                        )
+                        action = (
+                            "Riduci leggermente la severità oppure "
+                            "modifica la zona d'impatto e riprova."
+                        )
+                    elif paint_colour_validation_failed:
+                        error_code = "paint_colour_validation_failed"
+                        user_message = (
+                            "Il risultato non ha preservato correttamente "
+                            "il colore originale del veicolo."
+                        )
+                        action = "Riprova con la stessa configurazione."
+                    elif identity_validation_failed:
+                        error_code = (
+                            "vehicle_identity_validation_failed"
+                        )
+                        user_message = (
+                            "Il risultato non ha superato i controlli "
+                            "di identità del veicolo."
+                        )
+                        action = (
+                            "Riduci l'area del danno oppure seleziona "
+                            "meno componenti e riprova."
+                        )
+                    else:
+                        error_code = "quality_validation_failed"
+                        user_message = (
+                            "La simulazione non ha superato i controlli "
+                            "di qualità dopo due tentativi."
+                        )
+                        action = "Modifica la configurazione e riprova."
+
+                    print(
+                        "[VALIDATION FAILURE CLASSIFICATION]",
+                        {
+                            "diagnostic_id": request_diagnostic_id,
+                            "error_code": error_code,
+                            "same_license_plate": same_license_plate,
+                            "identity_validation_failed": (
+                                identity_validation_failed
+                            ),
+                            "paint_colour_validation_failed": (
+                                paint_colour_validation_failed
+                            ),
+                            "damage_refinement_validation_failed": (
+                                damage_refinement_validation_failed
+                            ),
+                        },
+                        flush=True,
+                    )
+
                     raise HTTPException(
                         status_code=422,
                         detail={
-                            "message": (
-                                "La simulazione non ha superato i controlli "
-                                "di identità del veicolo dopo due tentativi."
+                            "message": user_message,
+                            "action": action,
+                            "error_code": error_code,
+                            "identity_validation_failed": (
+                                identity_validation_failed
                             ),
-                            "action": (
-                                "Ridurre l'area del danno oppure selezionare "
-                                "meno componenti e riprovare."
+                            "license_plate_validation_failed": (
+                                license_plate_validation_failed
                             ),
-                            "identity_validation_failed": True,
+                            "paint_colour_validation_failed": (
+                                paint_colour_validation_failed
+                            ),
+                            "damage_refinement_validation_failed": (
+                                damage_refinement_validation_failed
+                            ),
+                            "same_license_plate": same_license_plate,
                             "attempts": generation_attempts,
+                            "last_identity_validation": last_identity,
+                            "last_paint_colour_validation": last_paint,
+                            "last_damage_refinement_validation": (
+                                last_refinement
+                            ),
                             "diagnostic_id": request_diagnostic_id,
                         },
                     )
@@ -8106,7 +8249,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 ).decode("ascii"),
                 "mime_type": "image/jpeg",
                 "prompt_version": (
-                    "damage-v17.0.21-taillight-and-crease-refinement"
+                    "damage-v17.0.21a-refinement-error-separation-hotfix"
                 ),
                 "result_kind": "full_frame_jpeg",
                 "deformation_type": payload.deformation_type,
@@ -8136,7 +8279,26 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 "strict_vehicle_identity_prompt": True,
                 "staged_identity_validation": True,
                 "maximum_generation_attempts": 2,
-                "identity_validation_passed": True,
+                "identity_validation_passed": (
+                    result_diagnostics.get(
+                        "identity_validation_passed"
+                    )
+                ),
+                "paint_colour_validation_passed": (
+                    result_diagnostics.get(
+                        "paint_colour_validation_passed"
+                    )
+                ),
+                "damage_refinement_validation_passed": (
+                    result_diagnostics.get(
+                        "damage_refinement_validation_passed"
+                    )
+                ),
+                "overall_validation_passed": (
+                    result_diagnostics.get(
+                        "overall_validation_passed"
+                    )
+                ),
                 "generation_attempt_used": (
                     result_diagnostics.get("generation_attempt_used")
                 ),
@@ -8443,7 +8605,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
             "area_percent": area_percent,
             "result_base64": base64.b64encode(result_bytes).decode("ascii"),
             "mime_type": "image/jpeg",
-            "prompt_version": "damage-v17.0.21-taillight-and-crease-refinement",
+            "prompt_version": "damage-v17.0.21a-refinement-error-separation-hotfix",
             "result_kind": "full_frame_jpeg",
             "full_frame_guard": full_frame_diagnostics,
             "deformation_type": payload.deformation_type,
@@ -8714,7 +8876,7 @@ def start_async_damage_generation(
             "result_path": None,
             "error": None,
             "generation_version": (
-                "damage-v17.0.21-taillight-and-crease-refinement"
+                "damage-v17.0.21a-refinement-error-separation-hotfix"
             ),
         }
 
@@ -8735,7 +8897,7 @@ def start_async_damage_generation(
         "poll_url": f"/v1/damage/edit-base64/status/{job_id}",
         "delete_url": f"/v1/damage/edit-base64/status/{job_id}",
         "generation_version": (
-            "damage-v17.0.21-taillight-and-crease-refinement"
+            "damage-v17.0.21a-refinement-error-separation-hotfix"
         ),
         "poll_interval_ms": 3500,
     }
