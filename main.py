@@ -65,13 +65,13 @@ ALLOWED_ORIGINS = [
 ]
 
 print(
-    "=== CAR DAMAGE LAB BACKEND V17.0.20 PAINT COLOUR PRESERVATION ===",
+    "=== CAR DAMAGE LAB BACKEND V17.0.21 TAILLIGHT AND CREASE REFINEMENT ===",
     flush=True,
 )
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.7.0.20",
+    version="1.7.0.21",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -3385,6 +3385,166 @@ def validate_hybrid_guided_result(
     return output.getvalue(), diagnostics
 
 
+def call_openai_damage_refinement_validation(
+    source: Image.Image,
+    candidate_bytes: bytes,
+    selected_components: list[str],
+) -> dict[str, object]:
+    """
+    Valida geometria del fanale e qualità fisica delle pieghe.
+    Non modifica l'immagine.
+    """
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return {
+            "passed": True,
+            "skipped": True,
+            "reason": "OPENAI_API_KEY missing",
+        }
+
+    try:
+        candidate = Image.open(io.BytesIO(candidate_bytes))
+        candidate.load()
+        candidate = candidate.convert("RGB")
+    except Exception as exc:
+        return {
+            "passed": False,
+            "skipped": False,
+            "reason": "candidate_decode_error",
+            "error": str(exc),
+        }
+
+    if candidate.size != source.size:
+        candidate = candidate.resize(
+            source.size,
+            Image.Resampling.LANCZOS,
+        )
+
+    client = OpenAI(api_key=api_key)
+    model = os.getenv(
+        "OPENAI_REFINEMENT_VALIDATION_MODEL",
+        "gpt-4.1",
+    )
+
+    prompt = f"""
+Compare the ORIGINAL and EDITED vehicle photographs.
+
+Selected components:
+{", ".join(selected_components)}
+
+Return ONLY valid JSON:
+{{
+  "passed": true or false,
+  "tail_light_shape_preserved": true or false,
+  "tail_light_size_preserved": true or false,
+  "tail_light_orientation_preserved": true or false,
+  "tail_light_internal_damage_plausible": true or false,
+  "creases_physically_coherent": true or false,
+  "creases_too_soft_or_wavy": true or false,
+  "creases_too_repetitive": true or false,
+  "panel_transitions_coherent": true or false,
+  "failure_reasons": ["short reason"],
+  "confidence": number from 0 to 1
+}}
+
+TAIL LIGHT:
+- Preserve the exact original outer silhouette, size, curvature,
+  orientation and mounting footprint.
+- Internal cracking, localized shattering and missing lens fragments
+  are allowed.
+- Fail if the lamp is reshaped, compressed, shortened, widened,
+  rounded, rotated, replaced or redesigned.
+
+CREASES:
+- Creases must follow one plausible force path.
+- Sheet metal may have sharper primary ridges and softer secondary buckling.
+- Plastic bumper deformation must be broader and smoother than sheet metal.
+- Fail if surfaces look melted, rubbery, uniformly wavy, repetitive,
+  decorative or disconnected from impact direction.
+- Adjacent panel transitions must remain continuous and plausible.
+""".strip()
+
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            temperature=0,
+            response_format={"type": "json_object"},
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a strict automotive collision-damage "
+                        "quality inspector. Return JSON only."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "text",
+                            "text": "ORIGINAL PHOTOGRAPH:",
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": image_to_data_url(source),
+                                "detail": "high",
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": "EDITED PHOTOGRAPH:",
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": image_to_data_url(candidate),
+                                "detail": "high",
+                            },
+                        },
+                    ],
+                },
+            ],
+        )
+        parsed = extract_json_object(
+            response.choices[0].message.content or "{}"
+        )
+
+        passed = (
+            bool(parsed.get("passed"))
+            and bool(parsed.get("tail_light_shape_preserved"))
+            and bool(parsed.get("tail_light_size_preserved"))
+            and bool(parsed.get("tail_light_orientation_preserved"))
+            and bool(parsed.get("tail_light_internal_damage_plausible"))
+            and bool(parsed.get("creases_physically_coherent"))
+            and not bool(parsed.get("creases_too_soft_or_wavy"))
+            and not bool(parsed.get("creases_too_repetitive"))
+            and bool(parsed.get("panel_transitions_coherent"))
+        )
+        parsed["passed"] = passed
+        parsed["model"] = model
+        parsed["skipped"] = False
+        return parsed
+    except Exception as exc:
+        print(
+            "[REFINEMENT VALIDATION ERROR]",
+            {
+                "type": type(exc).__name__,
+                "error": str(exc),
+                "model": model,
+            },
+            flush=True,
+        )
+        return {
+            "passed": False,
+            "skipped": False,
+            "reason": "refinement_validation_error",
+            "error": str(exc),
+            "model": model,
+        }
+
+
 def validate_paint_colour_consistency(
     source: Image.Image,
     candidate_bytes: bytes,
@@ -3687,8 +3847,11 @@ Strict rules:
   must not become globally darker, duller, desaturated or differently tinted.
 - Compare healthy illuminated paint areas in both photographs, not only the
   darkest folds.
-- A selected tail light may be cracked internally, but its original outer
-  silhouette, size and design must remain recognizable.
+- A selected tail light may be cracked internally, but its exact original
+  outer silhouette, size, curvature, orientation, mounting footprint and
+  internal visual signature must remain recognizable.
+- Fail the result if the lamp becomes shorter, rounder, narrower, larger,
+  smaller, rotated, replaced or visually redesigned.
 - Deformation of selected body panels is allowed.
 - Background changes are not relevant unless they indicate the whole image
   was regenerated.
@@ -3837,6 +4000,11 @@ Requested deformation:
 Rules:
 - create one coherent deformation field across the whole zone;
 - propagate force continuously across adjacent panels;
+- create one dominant force path with a limited number of primary creases;
+- use sharper directional ridges on sheet metal near structural joints;
+- use broader and smoother deformation on plastic bumpers;
+- avoid repetitive ripples, melted surfaces, rubber-like waviness and
+  decorative folds;
 - preserve realistic material differences between metal, plastic, glass and
   lighting;
 - do not create separate isolated dents on each component;
@@ -3881,10 +4049,16 @@ Absolute priorities for this retry:
 3. preserve the exact make and model;
 4. preserve the original paint hue, saturation, brightness and gloss;
 5. do not make the vehicle globally darker or duller; local fold shadows only;
-6. preserve the complete outer geometry of every rear light;
-7. reduce deformation rather than changing vehicle identity;
-8. modify only the selected bodywork inside the supplied mask;
-9. do not regenerate the entire rear of the vehicle.
+6. preserve the exact original outer geometry, size, curvature,
+   orientation and mounting footprint of every rear light;
+7. allow only internal lens cracking or localized shattering without
+   redesigning the lamp;
+8. replace soft repetitive waves with a few physically directed primary
+   creases and realistic secondary buckling;
+9. keep metal folds sharper than plastic-bumper deformation;
+10. reduce deformation rather than changing vehicle identity;
+11. modify only the selected bodywork inside the supplied mask;
+12. do not regenerate the entire rear of the vehicle.
 
 A less severe but identity-correct result is preferable to a dramatic result
 that changes the vehicle.
@@ -4004,7 +4178,7 @@ def root():
     return {
         "service": APP_NAME,
         "status": "ok",
-        "version": "1.7.0.20",
+        "version": "1.7.0.21",
         "docs": "/docs",
         "health": "/health",
     }
@@ -4014,9 +4188,9 @@ def root():
 def get_backend_version() -> dict[str, object]:
     return {
         "service": APP_NAME,
-        "version": "1.7.0.20",
+        "version": "1.7.0.21",
         "prompt_version": (
-            "damage-v17.0.20-paint-colour-preservation"
+            "damage-v17.0.21-taillight-and-crease-refinement"
         ),
         "staged_identity_validation": True,
         "maximum_generation_attempts": 2,
@@ -4046,6 +4220,10 @@ def get_backend_version() -> dict[str, object]:
         "paint_colour_validation_profile": (
             "v17.0.20_paint_colour"
         ),
+        "taillight_refinement": True,
+        "crease_refinement": True,
+        "damage_refinement_ai_validation": True,
+        "automatic_geometry_postprocessing": False,
     }
 
 
@@ -4216,7 +4394,7 @@ def _replicate_json_request(
             status_code=500,
             detail={
                 "message": "REPLICATE_API_TOKEN non configurato su Render.",
-                "analysis_version": "vehicle-segmentation-v17.0.20-paint-colour-preservation",
+                "analysis_version": "vehicle-segmentation-v17.0.21-taillight-and-crease-refinement",
             },
         )
 
@@ -4259,7 +4437,7 @@ def _replicate_json_request(
                 "http_status": exc.code,
                 "request_url": url,
                 "replicate_detail": error_body[:2000],
-                "analysis_version": "vehicle-segmentation-v17.0.20-paint-colour-preservation",
+                "analysis_version": "vehicle-segmentation-v17.0.21-taillight-and-crease-refinement",
             },
         ) from exc
     except Exception as exc:
@@ -4268,7 +4446,7 @@ def _replicate_json_request(
             detail={
                 "message": "Connessione a Replicate non riuscita.",
                 "error": f"{type(exc).__name__}: {str(exc)}"[:1200],
-                "analysis_version": "vehicle-segmentation-v17.0.20-paint-colour-preservation",
+                "analysis_version": "vehicle-segmentation-v17.0.21-taillight-and-crease-refinement",
             },
         ) from exc
 
@@ -5163,7 +5341,7 @@ def _create_replicate_prediction(
                 "Limite Replicate ancora attivo dopo diversi tentativi."
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.20-paint-colour-preservation"
+                "vehicle-segmentation-v17.0.21-taillight-and-crease-refinement"
             ),
         },
     )
@@ -6215,7 +6393,7 @@ def smart_polygon_component_payload(
         "smooth_polygon": smooth_polygon,
         "feather_radius": feather_radius,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.20-paint-colour-preservation"
+            "vehicle-segmentation-v17.0.21-taillight-and-crease-refinement"
         ),
     }
 
@@ -6539,7 +6717,7 @@ def normalize_vehicle_analysis(
         "manual_polygon_required_only_for_selected_components": True,
         "segmentation_strategy": "manual_smart_polygon",
         "analysis_version": (
-            "vehicle-segmentation-v17.0.20-paint-colour-preservation"
+            "vehicle-segmentation-v17.0.21-taillight-and-crease-refinement"
         ),
     }
 
@@ -6684,7 +6862,7 @@ Bounding-box rules:
                 "model": configured_model,
                 "primary_error": primary_message[:800],
                 "fallback_error": fallback_message[:800],
-                "analysis_version": "vehicle-segmentation-v17.0.20-paint-colour-preservation",
+                "analysis_version": "vehicle-segmentation-v17.0.21-taillight-and-crease-refinement",
             },
         ) from fallback_exc
 
@@ -6839,7 +7017,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     ),
                     "raw_component_count": len(raw_components),
                     "analysis_version": (
-                        "vehicle-segmentation-v17.0.20-paint-colour-preservation"
+                        "vehicle-segmentation-v17.0.21-taillight-and-crease-refinement"
                     ),
                 },
             )
@@ -6852,7 +7030,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                 "gpt-4.1-mini",
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.20-paint-colour-preservation"
+                "vehicle-segmentation-v17.0.21-taillight-and-crease-refinement"
             ),
             "mask_format": "data:image/png;base64",
             "mask_semantics": "white_component_black_background",
@@ -6900,7 +7078,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     "error_type": type(exc).__name__,
                     "error": str(exc)[:1600],
                     "analysis_version": (
-                        "vehicle-segmentation-v17.0.20-paint-colour-preservation"
+                        "vehicle-segmentation-v17.0.21-taillight-and-crease-refinement"
                     ),
                 },
             },
@@ -6942,7 +7120,7 @@ def start_vehicle_component_analysis(
             "result": None,
             "error": None,
             "analysis_version": (
-                "vehicle-segmentation-v17.0.20-paint-colour-preservation"
+                "vehicle-segmentation-v17.0.21-taillight-and-crease-refinement"
             ),
         }
 
@@ -6960,7 +7138,7 @@ def start_vehicle_component_analysis(
             f"/v1/vehicle/analyze-components/status/{job_id}"
         ),
         "analysis_version": (
-            "vehicle-segmentation-v17.0.20-paint-colour-preservation"
+            "vehicle-segmentation-v17.0.21-taillight-and-crease-refinement"
         ),
     }
 
@@ -7058,7 +7236,7 @@ def snap_vehicle_polygon_points(
         ),
         "snap_radius": payload.snap_radius,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.20-paint-colour-preservation"
+            "vehicle-segmentation-v17.0.21-taillight-and-crease-refinement"
         ),
     }
 
@@ -7270,7 +7448,7 @@ def refine_vehicle_component(payload: ComponentRefineRequest):
         "requires_review": diagnostics.get("refinement_status") != "refined",
         "refinement": diagnostics,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.20-paint-colour-preservation"
+            "vehicle-segmentation-v17.0.21-taillight-and-crease-refinement"
         ),
     }
 
@@ -7294,7 +7472,7 @@ def analyze_vehicle_components_sync_disabled(
                 "/v1/vehicle/analyze-components/status/{job_id}"
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.20-paint-colour-preservation"
+                "vehicle-segmentation-v17.0.21-taillight-and-crease-refinement"
             ),
         },
     )
@@ -7377,7 +7555,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v17.0.20-paint-colour-preservation",
+        "prompt_version": "damage-v17.0.21-taillight-and-crease-refinement",
         "result_kind": "full_frame_jpeg",
         "full_frame_guard": full_frame_diagnostics,
     }
@@ -7386,7 +7564,7 @@ async def edit_damage(
 @app.post("/v1/damage/edit-base64")
 def edit_damage_base64(payload: DamageEditBase64Request):
     """
-    V17.0.20 Paint Colour Preservation
+    V17.0.21 Taillight and Crease Refinement
 
     - con maschera manuale: foto completa + perimetro reale + prompt naturale,
       output diretto del modello e validazione anti-cambio-auto;
@@ -7755,12 +7933,26 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                         )
                     )
 
+                    refinement_validation = (
+                        call_openai_damage_refinement_validation(
+                            source=source,
+                            candidate_bytes=candidate_bytes,
+                            selected_components=selected_components,
+                        )
+                    )
+
                     candidate_diagnostics.update({
                         "paint_colour_validation": (
                             paint_colour_validation
                         ),
                         "paint_colour_validation_passed": bool(
                             paint_colour_validation.get("passed")
+                        ),
+                        "damage_refinement_validation": (
+                            refinement_validation
+                        ),
+                        "damage_refinement_validation_passed": bool(
+                            refinement_validation.get("passed")
                         ),
                     })
 
@@ -7801,13 +7993,43 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                             for reason in numeric_reasons
                         ]
 
+                    if not bool(
+                        refinement_validation.get("passed")
+                    ):
+                        identity_validation["passed"] = False
+                        existing_reasons = (
+                            identity_validation.get("failure_reasons")
+                            or []
+                        )
+                        refinement_reasons = (
+                            refinement_validation.get("failure_reasons")
+                            or []
+                        )
+                        identity_validation["failure_reasons"] = (
+                            list(existing_reasons)
+                            + [str(item) for item in refinement_reasons]
+                        )
+
                     generation_attempts.append({
                         "attempt": attempt_number,
                         "identity_validation": identity_validation,
                         "paint_colour_validation": (
                             paint_colour_validation
                         ),
+                        "damage_refinement_validation": (
+                            refinement_validation
+                        ),
                     })
+
+                    print(
+                        "[DAMAGE REFINEMENT VALIDATION RESULT]",
+                        {
+                            "diagnostic_id": request_diagnostic_id,
+                            "attempt": attempt_number,
+                            "validation": refinement_validation,
+                        },
+                        flush=True,
+                    )
 
                     print(
                         "[PAINT COLOUR VALIDATION RESULT]",
@@ -7841,6 +8063,11 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                                 paint_colour_validation
                             ),
                             "paint_colour_preservation_applied": True,
+                            "damage_refinement_validation": (
+                                refinement_validation
+                            ),
+                            "taillight_refinement_applied": True,
+                            "crease_refinement_applied": True,
                         })
                         break
 
@@ -7879,7 +8106,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 ).decode("ascii"),
                 "mime_type": "image/jpeg",
                 "prompt_version": (
-                    "damage-v17.0.20-paint-colour-preservation"
+                    "damage-v17.0.21-taillight-and-crease-refinement"
                 ),
                 "result_kind": "full_frame_jpeg",
                 "deformation_type": payload.deformation_type,
@@ -8216,7 +8443,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
             "area_percent": area_percent,
             "result_base64": base64.b64encode(result_bytes).decode("ascii"),
             "mime_type": "image/jpeg",
-            "prompt_version": "damage-v17.0.20-paint-colour-preservation",
+            "prompt_version": "damage-v17.0.21-taillight-and-crease-refinement",
             "result_kind": "full_frame_jpeg",
             "full_frame_guard": full_frame_diagnostics,
             "deformation_type": payload.deformation_type,
@@ -8487,7 +8714,7 @@ def start_async_damage_generation(
             "result_path": None,
             "error": None,
             "generation_version": (
-                "damage-v17.0.20-paint-colour-preservation"
+                "damage-v17.0.21-taillight-and-crease-refinement"
             ),
         }
 
@@ -8508,7 +8735,7 @@ def start_async_damage_generation(
         "poll_url": f"/v1/damage/edit-base64/status/{job_id}",
         "delete_url": f"/v1/damage/edit-base64/status/{job_id}",
         "generation_version": (
-            "damage-v17.0.20-paint-colour-preservation"
+            "damage-v17.0.21-taillight-and-crease-refinement"
         ),
         "poll_interval_ms": 3500,
     }
