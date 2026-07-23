@@ -65,13 +65,13 @@ ALLOWED_ORIGINS = [
 ]
 
 print(
-    "=== CAR DAMAGE LAB BACKEND V17.0.18 ASYNC STAGED GENERATION ===",
+    "=== CAR DAMAGE LAB BACKEND V17.0.19 IMPACT ZONE MODE ===",
     flush=True,
 )
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.7.0.18",
+    version="1.7.0.19",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -97,7 +97,20 @@ class ImageNormalizeRequest(BaseModel):
 
 class DamageEditBase64Request(BaseModel):
     image_base64: str = Field(..., min_length=16)
+
+    # Modalità classica: maschera derivata dai componenti.
     mask_base64: str | None = Field(default=None, min_length=16)
+
+    # V17.0.19: una sola zona continua disegnata dall'utente.
+    impact_zone_mask_base64: str | None = Field(
+        default=None,
+        min_length=16,
+    )
+    simulation_mode: Literal[
+        "component_based",
+        "impact_zone",
+    ] = "component_based"
+
     protect_mask_base64: str | None = None
 
     # Maschere evolute, usate soprattutto in modalità mixed:
@@ -164,6 +177,12 @@ class DamageEditBase64Request(BaseModel):
     # Compatibilità temporanea con vecchie versioni Base44.
     user_instructions: str = Field(default="", max_length=4000)
     protected_components: list[str] = Field(default_factory=list)
+
+    # Elementi protetti nella zona unica. Sono metadati descrittivi;
+    # le eventuali maschere reali restano in protect_mask_base64 o
+    # protected_component_masks_base64.
+    protected_elements: list[str] = Field(default_factory=list)
+
     protected_component_masks_base64: dict[str, str] = Field(
         default_factory=dict
     )
@@ -3535,6 +3554,69 @@ Strict rules:
         }
 
 
+def build_impact_zone_prompt(
+    severity_percent: int,
+    area_percent: int,
+    impact_direction: str,
+    deformation_type: str,
+    selected_components: list[str],
+    protected_elements: list[str],
+) -> str:
+    """
+    Prompt dedicato alla modalità con una sola zona continua.
+
+    I componenti sono solo contesto semantico. Non vengono trattati come
+    maschere o deformazioni separate.
+    """
+    component_context = (
+        ", ".join(selected_components)
+        if selected_components
+        else "not explicitly specified"
+    )
+    protected_context = (
+        ", ".join(protected_elements)
+        if protected_elements
+        else "none"
+    )
+
+    return f"""
+IMPACT ZONE MODE — ONE CONTINUOUS COLLISION REGION
+
+Use the supplied impact-zone mask as one single continuous physical area.
+Do not split the edit into separate component operations.
+
+The selected zone may cross multiple adjacent vehicle parts. Treat all visible
+surfaces inside it as parts of one collision event with one impact origin and
+one force direction.
+
+Contextual components inside or near the zone:
+{component_context}
+
+Protected elements:
+{protected_context}
+
+Requested deformation:
+- severity: {severity_percent} percent;
+- affected extent: {area_percent} percent;
+- direction: {impact_direction};
+- deformation family: {deformation_type}.
+
+Rules:
+- create one coherent deformation field across the whole zone;
+- propagate force continuously across adjacent panels;
+- preserve realistic material differences between metal, plastic, glass and
+  lighting;
+- do not create separate isolated dents on each component;
+- do not redraw the vehicle or replace it with another make or model;
+- do not change the plate, badges, emblems, paint colour or lamp design;
+- protected elements must remain unchanged;
+- do not modify anything outside the supplied impact-zone mask;
+- prefer a less dramatic but continuous deformation over fragmented,
+  disconnected or identity-changing damage;
+- return the complete original photograph.
+""".strip()
+
+
 def build_retry_prompt(
     base_prompt: str,
     validation: dict[str, object],
@@ -3681,7 +3763,7 @@ def root():
     return {
         "service": APP_NAME,
         "status": "ok",
-        "version": "1.7.0.18",
+        "version": "1.7.0.19",
         "docs": "/docs",
         "health": "/health",
     }
@@ -3691,9 +3773,9 @@ def root():
 def get_backend_version() -> dict[str, object]:
     return {
         "service": APP_NAME,
-        "version": "1.7.0.18",
+        "version": "1.7.0.19",
         "prompt_version": (
-            "damage-v17.0.18-async-staged-generation"
+            "damage-v17.0.19-impact-zone-mode"
         ),
         "staged_identity_validation": True,
         "maximum_generation_attempts": 2,
@@ -3709,6 +3791,13 @@ def get_backend_version() -> dict[str, object]:
             "/v1/damage/edit-base64/status/{job_id}"
         ),
         "recommended_poll_interval_ms": 3500,
+        "impact_zone_mode": True,
+        "impact_zone_mask_field": "impact_zone_mask_base64",
+        "simulation_mode_values": [
+            "component_based",
+            "impact_zone",
+        ],
+        "component_mode_preserved": True,
     }
 
 
@@ -3879,7 +3968,7 @@ def _replicate_json_request(
             status_code=500,
             detail={
                 "message": "REPLICATE_API_TOKEN non configurato su Render.",
-                "analysis_version": "vehicle-segmentation-v17.0.18-async-staged-generation",
+                "analysis_version": "vehicle-segmentation-v17.0.19-impact-zone-mode",
             },
         )
 
@@ -3922,7 +4011,7 @@ def _replicate_json_request(
                 "http_status": exc.code,
                 "request_url": url,
                 "replicate_detail": error_body[:2000],
-                "analysis_version": "vehicle-segmentation-v17.0.18-async-staged-generation",
+                "analysis_version": "vehicle-segmentation-v17.0.19-impact-zone-mode",
             },
         ) from exc
     except Exception as exc:
@@ -3931,7 +4020,7 @@ def _replicate_json_request(
             detail={
                 "message": "Connessione a Replicate non riuscita.",
                 "error": f"{type(exc).__name__}: {str(exc)}"[:1200],
-                "analysis_version": "vehicle-segmentation-v17.0.18-async-staged-generation",
+                "analysis_version": "vehicle-segmentation-v17.0.19-impact-zone-mode",
             },
         ) from exc
 
@@ -4826,7 +4915,7 @@ def _create_replicate_prediction(
                 "Limite Replicate ancora attivo dopo diversi tentativi."
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.18-async-staged-generation"
+                "vehicle-segmentation-v17.0.19-impact-zone-mode"
             ),
         },
     )
@@ -5878,7 +5967,7 @@ def smart_polygon_component_payload(
         "smooth_polygon": smooth_polygon,
         "feather_radius": feather_radius,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.18-async-staged-generation"
+            "vehicle-segmentation-v17.0.19-impact-zone-mode"
         ),
     }
 
@@ -6202,7 +6291,7 @@ def normalize_vehicle_analysis(
         "manual_polygon_required_only_for_selected_components": True,
         "segmentation_strategy": "manual_smart_polygon",
         "analysis_version": (
-            "vehicle-segmentation-v17.0.18-async-staged-generation"
+            "vehicle-segmentation-v17.0.19-impact-zone-mode"
         ),
     }
 
@@ -6347,7 +6436,7 @@ Bounding-box rules:
                 "model": configured_model,
                 "primary_error": primary_message[:800],
                 "fallback_error": fallback_message[:800],
-                "analysis_version": "vehicle-segmentation-v17.0.18-async-staged-generation",
+                "analysis_version": "vehicle-segmentation-v17.0.19-impact-zone-mode",
             },
         ) from fallback_exc
 
@@ -6502,7 +6591,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     ),
                     "raw_component_count": len(raw_components),
                     "analysis_version": (
-                        "vehicle-segmentation-v17.0.18-async-staged-generation"
+                        "vehicle-segmentation-v17.0.19-impact-zone-mode"
                     ),
                 },
             )
@@ -6515,7 +6604,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                 "gpt-4.1-mini",
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.18-async-staged-generation"
+                "vehicle-segmentation-v17.0.19-impact-zone-mode"
             ),
             "mask_format": "data:image/png;base64",
             "mask_semantics": "white_component_black_background",
@@ -6563,7 +6652,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     "error_type": type(exc).__name__,
                     "error": str(exc)[:1600],
                     "analysis_version": (
-                        "vehicle-segmentation-v17.0.18-async-staged-generation"
+                        "vehicle-segmentation-v17.0.19-impact-zone-mode"
                     ),
                 },
             },
@@ -6605,7 +6694,7 @@ def start_vehicle_component_analysis(
             "result": None,
             "error": None,
             "analysis_version": (
-                "vehicle-segmentation-v17.0.18-async-staged-generation"
+                "vehicle-segmentation-v17.0.19-impact-zone-mode"
             ),
         }
 
@@ -6623,7 +6712,7 @@ def start_vehicle_component_analysis(
             f"/v1/vehicle/analyze-components/status/{job_id}"
         ),
         "analysis_version": (
-            "vehicle-segmentation-v17.0.18-async-staged-generation"
+            "vehicle-segmentation-v17.0.19-impact-zone-mode"
         ),
     }
 
@@ -6721,7 +6810,7 @@ def snap_vehicle_polygon_points(
         ),
         "snap_radius": payload.snap_radius,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.18-async-staged-generation"
+            "vehicle-segmentation-v17.0.19-impact-zone-mode"
         ),
     }
 
@@ -6933,7 +7022,7 @@ def refine_vehicle_component(payload: ComponentRefineRequest):
         "requires_review": diagnostics.get("refinement_status") != "refined",
         "refinement": diagnostics,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.18-async-staged-generation"
+            "vehicle-segmentation-v17.0.19-impact-zone-mode"
         ),
     }
 
@@ -6957,7 +7046,7 @@ def analyze_vehicle_components_sync_disabled(
                 "/v1/vehicle/analyze-components/status/{job_id}"
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.18-async-staged-generation"
+                "vehicle-segmentation-v17.0.19-impact-zone-mode"
             ),
         },
     )
@@ -7040,7 +7129,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v17.0.18-async-staged-generation",
+        "prompt_version": "damage-v17.0.19-impact-zone-mode",
         "result_kind": "full_frame_jpeg",
         "full_frame_guard": full_frame_diagnostics,
     }
@@ -7049,7 +7138,7 @@ async def edit_damage(
 @app.post("/v1/damage/edit-base64")
 def edit_damage_base64(payload: DamageEditBase64Request):
     """
-    V17.0.18 Async Staged Generation
+    V17.0.19 Impact Zone Mode
 
     - con maschera manuale: foto completa + perimetro reale + prompt naturale,
       output diretto del modello e validazione anti-cambio-auto;
@@ -7064,6 +7153,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         {
             "diagnostic_id": request_diagnostic_id,
             "damage_mode": payload.damage_mode,
+            "simulation_mode": payload.simulation_mode,
             "selected_components": selected_components,
             "protected_components": payload.protected_components,
             "severity_percent": payload.severity_percent,
@@ -7072,8 +7162,14 @@ def edit_damage_base64(payload: DamageEditBase64Request):
             "deformation_type": payload.deformation_type,
             "output_quality": payload.output_quality,
             "has_mask": bool(payload.mask_base64),
+            "has_impact_zone_mask": bool(
+                payload.impact_zone_mask_base64
+            ),
             "image_base64_length": len(payload.image_base64 or ""),
             "mask_base64_length": len(payload.mask_base64 or ""),
+            "impact_zone_mask_base64_length": len(
+                payload.impact_zone_mask_base64 or ""
+            ),
             "user_instructions_length": len(
                 payload.user_instructions or ""
             ),
@@ -7104,12 +7200,16 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         processing_size = source.size
         gc.collect()
 
-        guided_mode = payload.damage_mode in {
-            "simple_guided",
-            "hybrid_guided",
-        } or (
-            payload.damage_mode == "auto"
-            and bool(payload.user_instructions.strip())
+        guided_mode = (
+            payload.simulation_mode == "impact_zone"
+            or payload.damage_mode in {
+                "simple_guided",
+                "hybrid_guided",
+            }
+            or (
+                payload.damage_mode == "auto"
+                and bool(payload.user_instructions.strip())
+            )
         )
 
         job_id = str(uuid.uuid4())
@@ -7124,12 +7224,38 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                     ),
                 )
 
-            has_manual_mask = bool(payload.mask_base64)
+            is_impact_zone_mode = (
+                payload.simulation_mode == "impact_zone"
+            )
+
+            effective_mask_base64 = (
+                payload.impact_zone_mask_base64
+                if is_impact_zone_mode
+                else payload.mask_base64
+            )
+
+            if is_impact_zone_mode and not effective_mask_base64:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "message": (
+                            "impact_zone_mask_base64 è obbligatoria "
+                            "quando simulation_mode='impact_zone'."
+                        ),
+                        "field": "impact_zone_mask_base64",
+                    },
+                )
+
+            has_manual_mask = bool(effective_mask_base64)
 
             if has_manual_mask:
                 raw_manual_mask = decode_base64_image(
-                    payload.mask_base64,
-                    "mask_base64",
+                    effective_mask_base64,
+                    (
+                        "impact_zone_mask_base64"
+                        if is_impact_zone_mode
+                        else "mask_base64"
+                    ),
                     "L",
                 )
                 raw_manual_mask = resize_mask_to_processing_size(
@@ -7143,7 +7269,23 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                         edge_margin_px=1,
                     )
                 )
-                resolved_guided_mode = "hybrid_guided"
+                resolved_guided_mode = (
+                    "impact_zone"
+                    if is_impact_zone_mode
+                    else "hybrid_guided"
+                )
+                mask_diagnostics.update({
+                    "simulation_mode": payload.simulation_mode,
+                    "impact_zone_mode": is_impact_zone_mode,
+                    "mask_geometry_source": (
+                        "single_continuous_impact_zone"
+                        if is_impact_zone_mode
+                        else mask_diagnostics.get(
+                            "mask_geometry_source",
+                            "component_or_manual_perimeter",
+                        )
+                    ),
+                })
             else:
                 # Fallback semplice: resta disponibile, ma è meno protetto.
                 guided_mask = Image.new(
@@ -7192,6 +7334,22 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 severity_percent=severity_percent,
             )
 
+            impact_zone_prompt = (
+                build_impact_zone_prompt(
+                    severity_percent=severity_percent,
+                    area_percent=area_percent,
+                    impact_direction=payload.impact_direction,
+                    deformation_type=payload.deformation_type,
+                    selected_components=selected_components,
+                    protected_elements=(
+                        payload.protected_elements
+                        or payload.protected_components
+                    ),
+                )
+                if is_impact_zone_mode
+                else ""
+            )
+
             strict_identity_prompt = f"""
     STRICT CONSERVATIVE IMAGE EDIT OF THE PROVIDED ORIGINAL PHOTOGRAPH.
 
@@ -7234,6 +7392,8 @@ def edit_damage_base64(payload: DamageEditBase64Request):
     {collision_consequences_prompt}
 
     {balanced_continuity_prompt}
+
+    {impact_zone_prompt}
 
     Final output rules:
     - do not return a crop, isolated component, transparent layer, mask or black
@@ -7294,7 +7454,11 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                             guided_mask=guided_mask,
                             area_percent=area_percent,
                             severity_percent=severity_percent,
-                            selected_components=selected_components,
+                            selected_components=(
+                                ["impact_zone"]
+                                if is_impact_zone_mode
+                                else selected_components
+                            ),
                         )
                         candidate_diagnostics.update(
                             locality_validation
@@ -7396,14 +7560,27 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 ).decode("ascii"),
                 "mime_type": "image/jpeg",
                 "prompt_version": (
-                    "damage-v17.0.18-async-staged-generation"
+                    "damage-v17.0.19-impact-zone-mode"
                 ),
                 "result_kind": "full_frame_jpeg",
                 "deformation_type": payload.deformation_type,
                 "impact_direction": payload.impact_direction,
                 "damage_mode": resolved_guided_mode,
-                "mask_required": False,
+                "simulation_mode": payload.simulation_mode,
+                "impact_zone_mode": is_impact_zone_mode,
+                "impact_zone_prompt_applied": is_impact_zone_mode,
+                "component_masks_used_for_editing": (
+                    not is_impact_zone_mode
+                ),
+                "components_used_as_metadata_only": (
+                    is_impact_zone_mode
+                ),
+                "protected_elements": payload.protected_elements,
+                "mask_required": is_impact_zone_mode,
                 "mask_received": has_manual_mask,
+                "impact_zone_mask_received": (
+                    bool(payload.impact_zone_mask_base64)
+                ),
                 "mask_used_as_api_edit_region": has_manual_mask,
                 "mask_diagnostics": mask_diagnostics,
                 "result_diagnostics": result_diagnostics,
@@ -7720,7 +7897,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
             "area_percent": area_percent,
             "result_base64": base64.b64encode(result_bytes).decode("ascii"),
             "mime_type": "image/jpeg",
-            "prompt_version": "damage-v17.0.18-async-staged-generation",
+            "prompt_version": "damage-v17.0.19-impact-zone-mode",
             "result_kind": "full_frame_jpeg",
             "full_frame_guard": full_frame_diagnostics,
             "deformation_type": payload.deformation_type,
@@ -7991,7 +8168,7 @@ def start_async_damage_generation(
             "result_path": None,
             "error": None,
             "generation_version": (
-                "damage-v17.0.18-async-staged-generation"
+                "damage-v17.0.19-impact-zone-mode"
             ),
         }
 
@@ -8012,7 +8189,7 @@ def start_async_damage_generation(
         "poll_url": f"/v1/damage/edit-base64/status/{job_id}",
         "delete_url": f"/v1/damage/edit-base64/status/{job_id}",
         "generation_version": (
-            "damage-v17.0.18-async-staged-generation"
+            "damage-v17.0.19-impact-zone-mode"
         ),
         "poll_interval_ms": 3500,
     }
