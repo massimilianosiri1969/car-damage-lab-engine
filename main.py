@@ -65,13 +65,13 @@ ALLOWED_ORIGINS = [
 ]
 
 print(
-    "=== CAR DAMAGE LAB BACKEND V17.0.20 PAINT COLOUR PRESERVATION ===",
+    "=== CAR DAMAGE LAB BACKEND V17.0.23 LARGE IMPACT ZONE ACCEPTANCE ===",
     flush=True,
 )
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.7.0.20",
+    version="1.7.0.23",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -2944,14 +2944,22 @@ def validate_deformation_locality(
     area_percent: int,
     severity_percent: int = 0,
     selected_components: list[str] | None = None,
+    simulation_mode: str = "component_based",
 ) -> dict[str, object]:
     """
-    V17.0.16b - Correzione definitiva della soglia per urti multicompomente.
+    V17.0.23 - Accetta zone d'impatto estese e intenzionali.
 
-    Mantiene il controllo originale per uno o due componenti.
-    Per tre o più componenti, la soglia diventa dinamica e non rifiuta
-    risultati plausibili come 0.7154 con severità 75.
+    Nella modalità component_based mantiene la soglia dinamica storica.
+
+    Nella modalità impact_zone non interpreta come errore il fatto che
+    gran parte dei pixel interni alla zona selezionata siano cambiati:
+    l'utente ha esplicitamente richiesto una deformazione continua in
+    quella regione. I controlli già esistenti continuano a verificare
+    che la fotografia fuori dalla maschera non venga alterata in modo
+    eccessivo.
     """
+    mode = str(simulation_mode or "component_based").strip().lower()
+
     components = [
         str(item).strip()
         for item in (selected_components or [])
@@ -2963,6 +2971,7 @@ def validate_deformation_locality(
         "body_panel",
         "bodywork",
         "generic_body_panel",
+        "impact_zone",
     }
     specific_components = [
         item
@@ -3005,6 +3014,11 @@ def validate_deformation_locality(
             "reason": "empty_guided_mask",
         }
 
+    total_pixels = max(1, width * height)
+    selected_image_ratio = (
+        float(selected_pixels) / float(total_pixels)
+    )
+
     difference = np.mean(
         np.abs(
             candidate_array.astype(np.int16)
@@ -3014,17 +3028,106 @@ def validate_deformation_locality(
     )
 
     changed_inside = (difference > 14.0) & mask
-    changed_ratio = float(changed_inside.sum()) / float(selected_pixels)
+    changed_ratio = (
+        float(changed_inside.sum()) / float(selected_pixels)
+    )
 
     requested_area = (
         max(0, min(100, abs(int(area_percent)))) / 100.0
     )
     severity = max(0, min(100, abs(int(severity_percent))))
 
-    # Soglia originale per casi semplici.
+    if mode == "impact_zone":
+        # In una zona d'impatto intenzionale è normale modificare quasi
+        # tutta la superficie selezionata. La soglia cresce con:
+        # - ampiezza della zona;
+        # - numero di componenti coinvolti;
+        # - gravità richiesta.
+        allowed_ratio = 0.94
+
+        if selected_image_ratio >= 0.18:
+            allowed_ratio = max(allowed_ratio, 0.96)
+        if selected_image_ratio >= 0.30:
+            allowed_ratio = max(allowed_ratio, 0.975)
+
+        if component_count >= 3:
+            allowed_ratio = max(allowed_ratio, 0.97)
+        if component_count >= 4:
+            allowed_ratio = max(allowed_ratio, 0.98)
+
+        if severity >= 70:
+            allowed_ratio = max(allowed_ratio, 0.975)
+        if severity >= 85:
+            allowed_ratio = max(allowed_ratio, 0.985)
+
+        allowed_ratio = min(0.99, allowed_ratio)
+
+        if changed_ratio > allowed_ratio:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "message": (
+                        "La zona d'impatto ha modificato quasi ogni pixel "
+                        "selezionato. Riduci soltanto la gravità se il "
+                        "risultato perde coerenza visiva."
+                    ),
+                    "changed_component_ratio": round(
+                        changed_ratio,
+                        4,
+                    ),
+                    "allowed_component_ratio": round(
+                        allowed_ratio,
+                        4,
+                    ),
+                    "selected_image_ratio": round(
+                        selected_image_ratio,
+                        4,
+                    ),
+                    "requested_area_percent": int(area_percent),
+                    "severity_percent": int(severity_percent),
+                    "selected_component_count": component_count,
+                    "selected_components": effective_components,
+                    "simulation_mode": mode,
+                    "validation_profile": (
+                        "v17.0.23_large_impact_zone"
+                    ),
+                },
+            )
+
+        return {
+            "deformation_locality_validation_applied": True,
+            "deformation_locality_validation_passed": True,
+            "large_impact_zone_accepted": (
+                selected_image_ratio >= 0.18
+                or component_count >= 3
+            ),
+            "changed_component_ratio": round(
+                changed_ratio,
+                4,
+            ),
+            "allowed_component_ratio": round(
+                allowed_ratio,
+                4,
+            ),
+            "selected_image_ratio": round(
+                selected_image_ratio,
+                4,
+            ),
+            "requested_area_percent": int(area_percent),
+            "severity_percent": int(severity_percent),
+            "selected_component_count": component_count,
+            "selected_components_for_validation": (
+                effective_components
+            ),
+            "simulation_mode": mode,
+            "validation_profile": (
+                "v17.0.23_large_impact_zone"
+            ),
+        }
+
+    # Comportamento storico per la modalità per componenti.
     allowed_ratio = max(0.35, requested_area + 0.30)
 
-    # Soglie multicompomente.
     if component_count == 2:
         allowed_ratio = max(allowed_ratio, 0.72)
     elif component_count == 3:
@@ -3032,8 +3135,6 @@ def validate_deformation_locality(
     elif component_count >= 4:
         allowed_ratio = max(allowed_ratio, 0.88)
 
-    # Gli urti severi su più componenti producono naturalmente
-    # una variazione ampia all'interno della maschera combinata.
     if severity >= 70 and component_count >= 3:
         allowed_ratio = max(allowed_ratio, 0.90)
     if severity >= 85 and component_count >= 4:
@@ -3047,15 +3148,24 @@ def validate_deformation_locality(
             detail={
                 "message": (
                     "La deformazione supera la soglia di sicurezza anche "
-                    "dopo l'adattamento multicompomente."
+                    "dopo l'adattamento multicomponente."
                 ),
-                "changed_component_ratio": round(changed_ratio, 4),
-                "allowed_component_ratio": round(allowed_ratio, 4),
+                "changed_component_ratio": round(
+                    changed_ratio,
+                    4,
+                ),
+                "allowed_component_ratio": round(
+                    allowed_ratio,
+                    4,
+                ),
                 "requested_area_percent": int(area_percent),
                 "severity_percent": int(severity_percent),
                 "selected_component_count": component_count,
                 "selected_components": effective_components,
-                "validation_profile": "v17.0.16b_multicomponent",
+                "simulation_mode": mode,
+                "validation_profile": (
+                    "v17.0.16b_multicomponent"
+                ),
             },
         )
 
@@ -3064,10 +3174,15 @@ def validate_deformation_locality(
         "deformation_locality_validation_passed": True,
         "changed_component_ratio": round(changed_ratio, 4),
         "allowed_component_ratio": round(allowed_ratio, 4),
+        "selected_image_ratio": round(
+            selected_image_ratio,
+            4,
+        ),
         "requested_area_percent": int(area_percent),
         "severity_percent": int(severity_percent),
         "selected_component_count": component_count,
         "selected_components_for_validation": effective_components,
+        "simulation_mode": mode,
         "validation_profile": "v17.0.16b_multicomponent",
     }
 
@@ -4004,7 +4119,7 @@ def root():
     return {
         "service": APP_NAME,
         "status": "ok",
-        "version": "1.7.0.20",
+        "version": "1.7.0.23",
         "docs": "/docs",
         "health": "/health",
     }
@@ -4014,9 +4129,9 @@ def root():
 def get_backend_version() -> dict[str, object]:
     return {
         "service": APP_NAME,
-        "version": "1.7.0.20",
+        "version": "1.7.0.23",
         "prompt_version": (
-            "damage-v17.0.20-paint-colour-preservation"
+            "damage-v17.0.23-large-impact-zone-acceptance"
         ),
         "staged_identity_validation": True,
         "maximum_generation_attempts": 2,
@@ -4043,6 +4158,13 @@ def get_backend_version() -> dict[str, object]:
         "paint_colour_numeric_validation": True,
         "paint_colour_ai_validation": True,
         "automatic_colour_postprocessing": False,
+        "large_impact_zone_acceptance": True,
+        "impact_zone_dynamic_locality_threshold": True,
+        "impact_zone_uses_real_selected_components": True,
+        "component_mode_locality_threshold_preserved": True,
+        "impact_zone_validation_profile": (
+            "v17.0.23_large_impact_zone"
+        ),
         "paint_colour_validation_profile": (
             "v17.0.20_paint_colour"
         ),
@@ -4216,7 +4338,7 @@ def _replicate_json_request(
             status_code=500,
             detail={
                 "message": "REPLICATE_API_TOKEN non configurato su Render.",
-                "analysis_version": "vehicle-segmentation-v17.0.20-paint-colour-preservation",
+                "analysis_version": "vehicle-segmentation-v17.0.23-large-impact-zone-acceptance",
             },
         )
 
@@ -4259,7 +4381,7 @@ def _replicate_json_request(
                 "http_status": exc.code,
                 "request_url": url,
                 "replicate_detail": error_body[:2000],
-                "analysis_version": "vehicle-segmentation-v17.0.20-paint-colour-preservation",
+                "analysis_version": "vehicle-segmentation-v17.0.23-large-impact-zone-acceptance",
             },
         ) from exc
     except Exception as exc:
@@ -4268,7 +4390,7 @@ def _replicate_json_request(
             detail={
                 "message": "Connessione a Replicate non riuscita.",
                 "error": f"{type(exc).__name__}: {str(exc)}"[:1200],
-                "analysis_version": "vehicle-segmentation-v17.0.20-paint-colour-preservation",
+                "analysis_version": "vehicle-segmentation-v17.0.23-large-impact-zone-acceptance",
             },
         ) from exc
 
@@ -5163,7 +5285,7 @@ def _create_replicate_prediction(
                 "Limite Replicate ancora attivo dopo diversi tentativi."
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.20-paint-colour-preservation"
+                "vehicle-segmentation-v17.0.23-large-impact-zone-acceptance"
             ),
         },
     )
@@ -6215,7 +6337,7 @@ def smart_polygon_component_payload(
         "smooth_polygon": smooth_polygon,
         "feather_radius": feather_radius,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.20-paint-colour-preservation"
+            "vehicle-segmentation-v17.0.23-large-impact-zone-acceptance"
         ),
     }
 
@@ -6539,7 +6661,7 @@ def normalize_vehicle_analysis(
         "manual_polygon_required_only_for_selected_components": True,
         "segmentation_strategy": "manual_smart_polygon",
         "analysis_version": (
-            "vehicle-segmentation-v17.0.20-paint-colour-preservation"
+            "vehicle-segmentation-v17.0.23-large-impact-zone-acceptance"
         ),
     }
 
@@ -6684,7 +6806,7 @@ Bounding-box rules:
                 "model": configured_model,
                 "primary_error": primary_message[:800],
                 "fallback_error": fallback_message[:800],
-                "analysis_version": "vehicle-segmentation-v17.0.20-paint-colour-preservation",
+                "analysis_version": "vehicle-segmentation-v17.0.23-large-impact-zone-acceptance",
             },
         ) from fallback_exc
 
@@ -6839,7 +6961,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     ),
                     "raw_component_count": len(raw_components),
                     "analysis_version": (
-                        "vehicle-segmentation-v17.0.20-paint-colour-preservation"
+                        "vehicle-segmentation-v17.0.23-large-impact-zone-acceptance"
                     ),
                 },
             )
@@ -6852,7 +6974,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                 "gpt-4.1-mini",
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.20-paint-colour-preservation"
+                "vehicle-segmentation-v17.0.23-large-impact-zone-acceptance"
             ),
             "mask_format": "data:image/png;base64",
             "mask_semantics": "white_component_black_background",
@@ -6900,7 +7022,7 @@ def run_async_vehicle_analysis(job_id: str) -> None:
                     "error_type": type(exc).__name__,
                     "error": str(exc)[:1600],
                     "analysis_version": (
-                        "vehicle-segmentation-v17.0.20-paint-colour-preservation"
+                        "vehicle-segmentation-v17.0.23-large-impact-zone-acceptance"
                     ),
                 },
             },
@@ -6942,7 +7064,7 @@ def start_vehicle_component_analysis(
             "result": None,
             "error": None,
             "analysis_version": (
-                "vehicle-segmentation-v17.0.20-paint-colour-preservation"
+                "vehicle-segmentation-v17.0.23-large-impact-zone-acceptance"
             ),
         }
 
@@ -6960,7 +7082,7 @@ def start_vehicle_component_analysis(
             f"/v1/vehicle/analyze-components/status/{job_id}"
         ),
         "analysis_version": (
-            "vehicle-segmentation-v17.0.20-paint-colour-preservation"
+            "vehicle-segmentation-v17.0.23-large-impact-zone-acceptance"
         ),
     }
 
@@ -7058,7 +7180,7 @@ def snap_vehicle_polygon_points(
         ),
         "snap_radius": payload.snap_radius,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.20-paint-colour-preservation"
+            "vehicle-segmentation-v17.0.23-large-impact-zone-acceptance"
         ),
     }
 
@@ -7270,7 +7392,7 @@ def refine_vehicle_component(payload: ComponentRefineRequest):
         "requires_review": diagnostics.get("refinement_status") != "refined",
         "refinement": diagnostics,
         "analysis_version": (
-            "vehicle-segmentation-v17.0.20-paint-colour-preservation"
+            "vehicle-segmentation-v17.0.23-large-impact-zone-acceptance"
         ),
     }
 
@@ -7294,7 +7416,7 @@ def analyze_vehicle_components_sync_disabled(
                 "/v1/vehicle/analyze-components/status/{job_id}"
             ),
             "analysis_version": (
-                "vehicle-segmentation-v17.0.20-paint-colour-preservation"
+                "vehicle-segmentation-v17.0.23-large-impact-zone-acceptance"
             ),
         },
     )
@@ -7377,7 +7499,7 @@ async def edit_damage(
         "area_percent": area_percent,
         "result_base64": base64.b64encode(result_bytes).decode("ascii"),
         "mime_type": "image/jpeg",
-        "prompt_version": "damage-v17.0.20-paint-colour-preservation",
+        "prompt_version": "damage-v17.0.23-large-impact-zone-acceptance",
         "result_kind": "full_frame_jpeg",
         "full_frame_guard": full_frame_diagnostics,
     }
@@ -7386,7 +7508,7 @@ async def edit_damage(
 @app.post("/v1/damage/edit-base64")
 def edit_damage_base64(payload: DamageEditBase64Request):
     """
-    V17.0.20 Paint Colour Preservation
+    V17.0.23 Large Impact Zone Acceptance
 
     - con maschera manuale: foto completa + perimetro reale + prompt naturale,
       output diretto del modello e validazione anti-cambio-auto;
@@ -7702,10 +7824,11 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                             guided_mask=guided_mask,
                             area_percent=area_percent,
                             severity_percent=severity_percent,
-                            selected_components=(
-                                ["impact_zone"]
+                            selected_components=selected_components,
+                            simulation_mode=(
+                                "impact_zone"
                                 if is_impact_zone_mode
-                                else selected_components
+                                else "component_based"
                             ),
                         )
                         candidate_diagnostics.update(
@@ -7879,7 +8002,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 ).decode("ascii"),
                 "mime_type": "image/jpeg",
                 "prompt_version": (
-                    "damage-v17.0.20-paint-colour-preservation"
+                    "damage-v17.0.23-large-impact-zone-acceptance"
                 ),
                 "result_kind": "full_frame_jpeg",
                 "deformation_type": payload.deformation_type,
@@ -8216,7 +8339,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
             "area_percent": area_percent,
             "result_base64": base64.b64encode(result_bytes).decode("ascii"),
             "mime_type": "image/jpeg",
-            "prompt_version": "damage-v17.0.20-paint-colour-preservation",
+            "prompt_version": "damage-v17.0.23-large-impact-zone-acceptance",
             "result_kind": "full_frame_jpeg",
             "full_frame_guard": full_frame_diagnostics,
             "deformation_type": payload.deformation_type,
@@ -8487,7 +8610,7 @@ def start_async_damage_generation(
             "result_path": None,
             "error": None,
             "generation_version": (
-                "damage-v17.0.20-paint-colour-preservation"
+                "damage-v17.0.23-large-impact-zone-acceptance"
             ),
         }
 
@@ -8508,7 +8631,7 @@ def start_async_damage_generation(
         "poll_url": f"/v1/damage/edit-base64/status/{job_id}",
         "delete_url": f"/v1/damage/edit-base64/status/{job_id}",
         "generation_version": (
-            "damage-v17.0.20-paint-colour-preservation"
+            "damage-v17.0.23-large-impact-zone-acceptance"
         ),
         "poll_interval_ms": 3500,
     }
