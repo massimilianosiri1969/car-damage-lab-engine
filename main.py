@@ -111,6 +111,10 @@ class DamageEditBase64Request(BaseModel):
         "impact_zone",
     ] = "component_based"
 
+    # Internal routing flag. Legacy/USB callers keep the default; only the
+    # dedicated /v1/web endpoint sets web_v3 explicitly.
+    paint_validation_profile: Literal["legacy", "web_v3"] = "legacy"
+
     protect_mask_base64: str | None = None
 
     # Maschere evolute, usate soprattutto in modalità mixed:
