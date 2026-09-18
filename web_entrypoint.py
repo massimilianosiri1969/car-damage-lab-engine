@@ -16,9 +16,10 @@ app = core.app
 def web_version():
     return {
         'service': 'Car Damage Lab web adapter',
-        'version': '4.0.0',
+        'version': '5.0.0',
         'paint_colour_validation_profile': PROFILE,
         'paint_profile_routing': 'explicit-request-field',
+        'base44_contract_18_bridge': True,
         'legacy_endpoints_unchanged': True,
         'semantic_identity_required': True,
         'async_start_endpoint': '/v1/web/damage/edit-base64/start',
