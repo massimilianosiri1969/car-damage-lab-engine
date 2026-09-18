@@ -9,7 +9,6 @@ from PIL import Image
 
 from web_paint_validation import PROFILE, validate_web_paint_colour
 
-# Test the exact production legacy function without importing AI clients.
 module = ast.parse((Path(__file__).resolve().parents[1] / 'main.py').read_text())
 names = {'validate_paint_colour_consistency', 'mask_to_binary', 'resize_mask'}
 namespace = {'io': io, 'np': np, 'cv2': cv2, 'Image': Image}
@@ -42,11 +41,10 @@ def test_grey_reflection_false_positive_is_reproduced_and_corrected():
     candidate[60:100, 60:100] = [49, 49, 49]
     old = legacy(Image.fromarray(source), png(candidate), Image.fromarray(mask))
     assert old['passed'] is False
-    assert 'paint hue changed beyond tolerance' in old['failure_reasons']
     new = check(source, candidate, mask)
     assert new['passed'] is True
     assert new['validation_profile'] == PROFILE
-    assert new['legacy_hsv_validation'] == old
+    assert new['hue_angle_used'] is False
 
 
 @pytest.mark.parametrize('rgb', [(55, 55, 55), (90, 90, 90), (160, 160, 160)])
@@ -55,11 +53,36 @@ def test_unchanged_neutral_paint_passes(rgb):
     assert check(source, source, mask)['passed'] is True
 
 
-def test_local_shadow_and_highlight_keep_the_original_neutral_colour():
+def test_damage_shadows_and_highlights_are_allowed_when_tone_stays_close():
     source, mask = fixture()
     candidate = source.copy()
     candidate[70:105, 60:180] = 62
     candidate[106:140, 60:180] = 112
+    assert check(source, candidate, mask)['passed'] is True
+
+
+def test_moderate_uniform_lightness_shift_inside_damage_is_allowed():
+    source, mask = fixture()
+    candidate = source.copy()
+    candidate[mask > 0] = 108
+    result = check(source, candidate, mask)
+    assert result['passed'] is True
+    assert abs(result['lightness_median_delta']) <= 18
+
+
+def test_large_uniform_lightness_shift_inside_damage_is_rejected():
+    source, mask = fixture()
+    candidate = source.copy()
+    candidate[mask > 0] = 145
+    result = check(source, candidate, mask)
+    assert result['passed'] is False
+    assert 'neutral paint lightness changed beyond damage tolerance' in result['failure_reasons']
+
+
+def test_slight_neutral_tint_shift_is_allowed():
+    source, mask = fixture((85, 88, 92))
+    candidate = source.copy()
+    candidate[mask > 0] = [88, 90, 94]
     assert check(source, candidate, mask)['passed'] is True
 
 

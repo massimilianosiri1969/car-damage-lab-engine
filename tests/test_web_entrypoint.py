@@ -25,7 +25,11 @@ def images():
 def test_legacy_routes_and_version_are_preserved():
     with TestClient(web.app) as client:
         assert client.get('/v1/version').json()['version'] == '1.7.0.23'
-        assert client.get('/v1/web/version').json()['paint_colour_validation_profile'] == 'web-neutral-paint-v1'
+        version = client.get('/v1/web/version').json()
+        assert version['version'] == '2.0.0'
+        assert version['paint_colour_validation_profile'] == 'web-paint-tone-v2'
+        assert version['paint_semantic_policy'] == 'numeric-web-validator-authoritative'
+        assert version['legacy_endpoints_unchanged'] is True
         assert client.post('/v1/web/damage/edit-base64/start', json={}).status_code == 422
 
 
@@ -52,9 +56,63 @@ def test_legacy_and_web_tasks_can_run_concurrently_without_cross_talk():
     assert web._web_validation.get() is False
 
 
+def test_web_semantic_identity_ignores_only_paint_subflags(monkeypatch):
+    observed = {
+        'passed': False,
+        'same_make': True, 'same_model': True, 'same_license_plate': True,
+        'same_manufacturer_emblem': True, 'same_model_badges': True,
+        'same_paint_colour': False, 'same_paint_hue': False,
+        'same_paint_saturation': False, 'same_paint_brightness': False,
+        'tail_light_outer_geometry_preserved': True,
+        'vehicle_identity_changed': False, 'skipped': False,
+    }
+    monkeypatch.setattr(web, '_legacy_identity', lambda *args: dict(observed))
+    args = images()
+    result = web._run_web_task(web._identity_dispatch, args[0], args[1], ['hood'])
+    assert result['passed'] is True
+    assert result['same_paint_colour'] is False  # observation retained for audit
+    assert result['paint_tone_deferred_to_numeric_web_validator'] is True
+
+
+@pytest.mark.parametrize('field', [
+    'same_make', 'same_model', 'same_license_plate',
+    'same_manufacturer_emblem', 'same_model_badges',
+    'tail_light_outer_geometry_preserved',
+])
+def test_web_semantic_identity_never_relaxes_non_paint_identity(monkeypatch, field):
+    observed = {
+        'passed': False,
+        'same_make': True, 'same_model': True, 'same_license_plate': True,
+        'same_manufacturer_emblem': True, 'same_model_badges': True,
+        'same_paint_colour': True, 'same_paint_hue': True,
+        'same_paint_saturation': True, 'same_paint_brightness': True,
+        'tail_light_outer_geometry_preserved': True,
+        'vehicle_identity_changed': False, 'skipped': False,
+    }
+    observed[field] = False
+    monkeypatch.setattr(web, '_legacy_identity', lambda *args: dict(observed))
+    args = images()
+    result = web._run_web_task(web._identity_dispatch, args[0], args[1], ['hood'])
+    assert result['passed'] is False
+
+
+def test_web_semantic_identity_never_allows_vehicle_identity_change(monkeypatch):
+    observed = {
+        'passed': False,
+        'same_make': True, 'same_model': True, 'same_license_plate': True,
+        'same_manufacturer_emblem': True, 'same_model_badges': True,
+        'same_paint_colour': True, 'same_paint_hue': True,
+        'same_paint_saturation': True, 'same_paint_brightness': True,
+        'tail_light_outer_geometry_preserved': True,
+        'vehicle_identity_changed': True, 'skipped': False,
+    }
+    monkeypatch.setattr(web, '_legacy_identity', lambda *args: dict(observed))
+    args = images()
+    assert web._run_web_task(web._identity_dispatch, args[0], args[1], ['hood'])['passed'] is False
+
+
 def test_background_queue_uses_web_profile_only_for_new_endpoint(monkeypatch):
     args = images()
-    # A stub returns the result of the actual numeric check. No AI requests.
     def fake_generation(payload):
         return {'paint_colour_validation': web.core.validate_paint_colour_consistency(*args)}
     monkeypatch.setattr(web.core, 'edit_damage_base64', fake_generation)
