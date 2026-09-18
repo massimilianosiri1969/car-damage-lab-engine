@@ -49,3 +49,18 @@ def test_legacy_endpoint_keeps_default_profile(monkeypatch):
     # Direct function check avoids depending on background scheduling internals.
     payload = web.core.DamageEditBase64Request.model_validate(minimal_payload())
     assert payload.paint_validation_profile == 'legacy'
+
+
+def test_base44_contract_v18_is_recognized_without_explicit_profile():
+    payload = web.core.DamageEditBase64Request.model_validate({
+        **minimal_payload(),
+        'contract_version': '18.0',
+    })
+    assert payload.contract_version == '18.0'
+    assert payload.paint_validation_profile == 'legacy'
+
+
+def test_usb_legacy_payload_has_no_base44_contract_marker():
+    payload = web.core.DamageEditBase64Request.model_validate(minimal_payload())
+    assert payload.contract_version is None
+    assert payload.paint_validation_profile == 'legacy'

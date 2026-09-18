@@ -98,6 +98,9 @@ class ImageNormalizeRequest(BaseModel):
 class DamageEditBase64Request(BaseModel):
     image_base64: str = Field(..., min_length=16)
 
+    # Base44 web contract. Windows/USB legacy clients do not send this field.
+    contract_version: str | None = None
+
     # Modalità classica: maschera derivata dai componenti.
     mask_base64: str | None = Field(default=None, min_length=16)
 
@@ -7874,7 +7877,20 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                         )
                     )
 
-                    if payload.paint_validation_profile == "web_v3":
+                    effective_paint_profile = payload.paint_validation_profile
+                    # Compatibility bridge for already-deployed Base44 functions:
+                    # Contract 18.0 is the Base44 web contract and predates the
+                    # explicit paint_validation_profile field. This makes the
+                    # engine select web_v3 even if an older Base44 function calls
+                    # the legacy URL. Windows/USB does not send contract_version
+                    # 18.0 and therefore remains legacy.
+                    if (
+                        effective_paint_profile == "legacy"
+                        and payload.contract_version == "18.0"
+                    ):
+                        effective_paint_profile = "web_v3"
+
+                    if effective_paint_profile == "web_v3":
                         # Explicit request-scoped routing: no ContextVar/thread
                         # propagation and no saturation-based fallback.
                         from web_paint_validation import validate_web_paint_colour
