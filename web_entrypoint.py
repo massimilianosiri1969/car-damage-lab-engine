@@ -1,8 +1,10 @@
-"""Opt-in web adapter; the V17 core and legacy URLs remain unchanged.
+"""Opt-in web adapter; V17 core and legacy/USB URLs remain unchanged.
 
-Only tasks submitted to /v1/web/ use neutral-paint diagnostics. ContextVar
-scopes the validator to each worker, including concurrent legacy/USB requests.
-All semantic identity, plate, protected-mask and locality checks remain in core.
+Web damage simulation uses a paint validator that tolerates local reflection
+changes caused by geometry. Semantic identity remains strict for make, model,
+plate, emblems, badges and vehicle architecture. Paint tone is decided by the
+numeric web validator so the vision model cannot reject a valid dent merely
+because its highlights changed.
 """
 from __future__ import annotations
 from contextvars import ContextVar
@@ -13,6 +15,7 @@ from web_paint_validation import PROFILE, validate_web_paint_colour
 app = core.app
 _web_validation = ContextVar('web_paint_validation', default=False)
 _legacy_colour = core.validate_paint_colour_consistency
+_legacy_identity = core.call_openai_identity_validation
 
 
 def _colour_dispatch(source, candidate_bytes, guided_mask):
@@ -21,8 +24,34 @@ def _colour_dispatch(source, candidate_bytes, guided_mask):
     return _legacy_colour(source, candidate_bytes, guided_mask)
 
 
-# One-time dispatch registration, not a mutable per-request global switch.
+def _identity_dispatch(source, candidate_bytes, selected_components):
+    result = _legacy_identity(source, candidate_bytes, selected_components)
+    if not _web_validation.get() or result.get('skipped') or result.get('reason') == 'candidate_decode_error':
+        return result
+    # On the web route, paint sub-flags are advisory only. The numeric web
+    # validator runs immediately afterwards and is the authoritative paint-tone
+    # gate. All non-paint identity checks remain mandatory.
+    non_paint_ok = all([
+        bool(result.get('same_make')),
+        bool(result.get('same_model')),
+        bool(result.get('same_license_plate')),
+        bool(result.get('same_manufacturer_emblem')),
+        bool(result.get('same_model_badges')),
+        bool(result.get('tail_light_outer_geometry_preserved')),
+        not bool(result.get('vehicle_identity_changed')),
+    ])
+    original_passed = bool(result.get('passed'))
+    result['semantic_identity_passed_without_paint'] = non_paint_ok
+    result['semantic_identity_original_passed'] = original_passed
+    result['paint_tone_deferred_to_numeric_web_validator'] = True
+    result['passed'] = non_paint_ok
+    # Do not falsify the model's observations: retain all original paint flags.
+    return result
+
+
+# Register dispatch once. ContextVar keeps concurrent legacy/USB tasks isolated.
 core.validate_paint_colour_consistency = _colour_dispatch
+core.call_openai_identity_validation = _identity_dispatch
 
 
 def _run_web_task(function, *args, **kwargs):
@@ -44,8 +73,10 @@ class _WebBackgroundTasks:
 @app.get('/v1/web/version')
 def web_version():
     return {
-        'service': 'Car Damage Lab web adapter', 'version': '1.0.0',
+        'service': 'Car Damage Lab web adapter',
+        'version': '2.0.0',
         'paint_colour_validation_profile': PROFILE,
+        'paint_semantic_policy': 'numeric-web-validator-authoritative',
         'legacy_endpoints_unchanged': True,
         'semantic_identity_required': True,
         'async_start_endpoint': '/v1/web/damage/edit-base64/start',
