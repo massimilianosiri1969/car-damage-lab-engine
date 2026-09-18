@@ -111,6 +111,10 @@ class DamageEditBase64Request(BaseModel):
         "impact_zone",
     ] = "component_based"
 
+    # Internal routing flag. Legacy/USB callers keep the default; only the
+    # dedicated /v1/web endpoint sets web_v3 explicitly.
+    paint_validation_profile: Literal["legacy", "web_v3"] = "legacy"
+
     protect_mask_base64: str | None = None
 
     # Maschere evolute, usate soprattutto in modalità mixed:
@@ -7870,13 +7874,35 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                         )
                     )
 
-                    paint_colour_validation = (
-                        validate_paint_colour_consistency(
+                    if payload.paint_validation_profile == "web_v3":
+                        # Explicit request-scoped routing: no ContextVar/thread
+                        # propagation and no saturation-based fallback.
+                        from web_paint_validation import validate_web_paint_colour
+                        paint_colour_validation = validate_web_paint_colour(
+                            source=source,
+                            candidate_bytes=candidate_bytes,
+                            guided_mask=guided_mask,
+                            legacy_validator=validate_paint_colour_consistency,
+                        )
+                        # The vision model remains authoritative for every
+                        # identity element except paint appearance. Paint is
+                        # decided below by the numeric web validator.
+                        identity_validation["passed"] = bool(
+                            identity_validation.get("same_make")
+                            and identity_validation.get("same_model")
+                            and identity_validation.get("same_license_plate")
+                            and identity_validation.get("same_manufacturer_emblem")
+                            and identity_validation.get("same_model_badges")
+                            and identity_validation.get("tail_light_outer_geometry_preserved")
+                            and not identity_validation.get("vehicle_identity_changed")
+                        )
+                        identity_validation["paint_tone_deferred_to_numeric_web_validator"] = True
+                    else:
+                        paint_colour_validation = validate_paint_colour_consistency(
                             source=source,
                             candidate_bytes=candidate_bytes,
                             guided_mask=guided_mask,
                         )
-                    )
 
                     candidate_diagnostics.update({
                         "paint_colour_validation": (
