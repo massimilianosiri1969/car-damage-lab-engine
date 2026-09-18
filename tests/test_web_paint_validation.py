@@ -76,7 +76,7 @@ def test_large_uniform_lightness_shift_inside_damage_is_rejected():
     candidate[mask > 0] = 145
     result = check(source, candidate, mask)
     assert result['passed'] is False
-    assert 'neutral paint lightness changed beyond damage tolerance' in result['failure_reasons']
+    assert 'paint lightness changed beyond damage tolerance' in result['failure_reasons']
 
 
 def test_slight_neutral_tint_shift_is_allowed():
@@ -93,7 +93,7 @@ def test_recolouring_neutral_panel_is_rejected(changed):
     candidate[mask > 0] = changed
     result = check(source, candidate, mask)
     assert result['passed'] is False
-    assert 'neutral paint acquired a different colour cast' in result['failure_reasons']
+    assert 'paint tone changed beyond tolerance' in result['failure_reasons']
 
 
 @pytest.mark.parametrize('level', [8, 235])
@@ -110,17 +110,20 @@ def test_changes_outside_mask_are_still_rejected():
     candidate[mask == 0] = [150, 150, 150]
     result = check(source, candidate, mask)
     assert result['passed'] is False
-    assert 'neutral paint outside the editable zone changed' in result['failure_reasons']
+    assert 'image tone outside the editable zone changed too much' in result['failure_reasons']
 
 
 @pytest.mark.parametrize('rgb', [(180, 30, 30), (30, 160, 30), (30, 30, 180)])
-def test_chromatic_panels_keep_exact_legacy_behaviour(rgb):
+def test_chromatic_panels_are_checked_by_web_lab_validator(rgb):
     source, mask = fixture(rgb)
     candidate = source.copy()
     candidate[mask > 0] = [90, 90, 90]
     old = legacy(Image.fromarray(source), png(candidate), Image.fromarray(mask))
     assert old['passed'] is False
-    assert check(source, candidate, mask) == old
+    new = check(source, candidate, mask)
+    assert new['passed'] is False
+    assert new['validation_profile'] == PROFILE
+    assert new['paint_comparison'] == 'corresponding-pixel-lab-drift'
 
 
 def test_jpeg_reencoding_does_not_change_neutral_identity():

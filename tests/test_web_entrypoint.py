@@ -27,7 +27,7 @@ def test_legacy_routes_and_version_are_preserved():
         assert client.get('/v1/version').json()['version'] == '1.7.0.23'
         version = client.get('/v1/web/version').json()
         assert version['version'] == '2.0.0'
-        assert version['paint_colour_validation_profile'] == 'web-paint-tone-v2'
+        assert version['paint_colour_validation_profile'] == 'web-paint-tone-v3'
         assert version['paint_semantic_policy'] == 'numeric-web-validator-authoritative'
         assert version['legacy_endpoints_unchanged'] is True
         assert client.post('/v1/web/damage/edit-base64/start', json={}).status_code == 422
