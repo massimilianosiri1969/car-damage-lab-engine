@@ -9,7 +9,7 @@ services:
       - key: MOCK_MODE
         value: "true"
       - key: OPENAI_IMAGE_MODEL
-        value: gpt-image-2
+        value: gpt-image-2.5-sunburst-2026-09-08
       - key: ALLOWED_ORIGINS
         value: "*"
       - key: OPENAI_API_KEY
