@@ -4032,7 +4032,7 @@ def call_openai_image_edit(
 
     try:
         response = client.images.edit(
-            model=os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-2"),
+            model=os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-2.5-sunburst-2026-09-08"),
             image=source_file,
             mask=mask_file,
             prompt=prompt,
@@ -4058,7 +4058,7 @@ def call_openai_image_edit(
                 "request_id": request_id,
                 "model": os.getenv(
                     "OPENAI_IMAGE_MODEL",
-                    "gpt-image-2",
+                    "gpt-image-2.5-sunburst-2026-09-08",
                 ),
                 "quality": quality,
                 "source_size": list(source.size),
@@ -4188,7 +4188,7 @@ def health():
             if os.getenv("MOCK_MODE", "false").lower() == "true"
             else "ai"
         ),
-        "model": os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-2"),
+        "model": os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-2.5-sunburst-2026-09-08"),
         "memory_optimized": True,
         "max_processing_side": MAX_PROCESSING_SIDE,
         "heic_support_enabled": HEIC_SUPPORT_ENABLED,
