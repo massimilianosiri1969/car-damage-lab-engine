@@ -139,6 +139,10 @@ class DamageEditBase64Request(BaseModel):
         "mixed",
     ] = "auto"
 
+    # Laboratorio faro: percorso semantico diretto, completamente separato
+    # dalla pipeline di deformazione carrozzeria.
+    semantic_direct_edit: bool = False
+
     deformation_type: Literal[
         "dent",
         "crease",
@@ -4013,6 +4017,74 @@ that changes the vehicle.
 """.strip()
 
 
+def call_openai_semantic_edit(
+    source: Image.Image,
+    prompt: str,
+    quality: Literal["low", "medium", "high", "auto"],
+) -> bytes:
+    """Image edit diretto: fotografia originale + prompt, senza mask/compositing."""
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise HTTPException(
+            status_code=503,
+            detail="OPENAI_API_KEY non configurata.",
+        )
+
+    client = OpenAI(api_key=api_key)
+    source_file = pil_to_file(source, "source.png")
+    try:
+        response = client.images.edit(
+            model=os.getenv(
+                "OPENAI_IMAGE_MODEL",
+                "gpt-image-2.5-sunburst-2026-09-08",
+            ),
+            image=source_file,
+            prompt=prompt,
+            quality=quality,
+            size="auto",
+            output_format="jpeg",
+            output_compression=92,
+            n=1,
+        )
+        if not response.data or not response.data[0].b64_json:
+            raise RuntimeError("OpenAI ha risposto senza dati immagine")
+        return base64.b64decode(response.data[0].b64_json)
+    except Exception as exc:
+        request_id = getattr(exc, "request_id", None)
+        print(
+            "[OPENAI SEMANTIC EDIT ERROR]",
+            {
+                "type": type(exc).__name__,
+                "error": str(exc),
+                "request_id": request_id,
+                "model": os.getenv(
+                    "OPENAI_IMAGE_MODEL",
+                    "gpt-image-2.5-sunburst-2026-09-08",
+                ),
+                "quality": quality,
+                "source_size": list(source.size),
+                "prompt_length": len(prompt),
+            },
+            flush=True,
+        )
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": "Errore editing semantico OpenAI",
+                "type": type(exc).__name__,
+                "error": str(exc),
+                "request_id": request_id,
+            },
+        ) from exc
+    finally:
+        try:
+            source_file.close()
+        except Exception:
+            pass
+        gc.collect()
+
+
 def call_openai_image_edit(
     source: Image.Image,
     api_mask: Image.Image,
@@ -7590,6 +7662,54 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         )
 
         job_id = str(uuid.uuid4())
+
+        # Percorso SEMANTICO DIRETTO dedicato al laboratorio faro.
+        # È intenzionalmente prima di guided/bodywork/component_only:
+        # nessuna mask, nessun build_prompt, nessun compositing, nessuna logica
+        # di deformazione. Replica foto originale + singola istruzione.
+        if payload.semantic_direct_edit:
+            prompt = payload.user_instructions.strip()
+            if not prompt:
+                raise HTTPException(
+                    status_code=422,
+                    detail="semantic_direct_edit richiede user_instructions.",
+                )
+            if os.getenv("MOCK_MODE", "false").lower() == "true":
+                output = io.BytesIO()
+                source.save(output, format="JPEG", quality=95, subsampling=0)
+                result_bytes = output.getvalue()
+            else:
+                result_bytes = call_openai_semantic_edit(
+                    source,
+                    prompt,
+                    payload.output_quality,
+                )
+
+            # Verifica soltanto che il modello abbia restituito un'immagine
+            # leggibile. Nessuna ricomposizione o trasformazione del risultato.
+            try:
+                candidate = Image.open(io.BytesIO(result_bytes))
+                candidate.load()
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=502,
+                    detail="Editing semantico: immagine risultante non valida.",
+                ) from exc
+
+            return {
+                "job_id": job_id,
+                "status": "completed",
+                "mode": "semantic_direct_edit",
+                "severity_percent": severity_percent,
+                "area_percent": area_percent,
+                "result_base64": base64.b64encode(result_bytes).decode("ascii"),
+                "mime_type": "image/jpeg",
+                "prompt_version": "semantic-direct-headlight-v1",
+                "result_kind": "full_frame_jpeg",
+                "semantic_direct_edit": True,
+                "post_composite_applied": False,
+                "bodywork_pipeline_used": False,
+            }
 
         if guided_mode:
             if not payload.user_instructions.strip():
