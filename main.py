@@ -8092,6 +8092,15 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                         "paint_colour_validation": (
                             paint_colour_validation
                         ),
+                        # Diagnostic-only snapshot. It is never returned as an
+                        # accepted simulation; it lets Regression Lab inspect
+                        # exactly what the identity gate rejected.
+                        "rejected_candidate_base64": (
+                            base64.b64encode(candidate_bytes).decode("ascii")
+                            if not bool(identity_validation.get("passed"))
+                            else None
+                        ),
+                        "rejected_candidate_mime_type": "image/jpeg",
                     })
 
                     print(
