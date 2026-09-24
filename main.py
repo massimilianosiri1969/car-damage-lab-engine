@@ -7217,6 +7217,7 @@ def get_vehicle_component_analysis_status(job_id: str):
         "status": job.get("status"),
         "progress_stage": job.get("progress_stage"),
         "progress_percent": job.get("progress_percent", 0),
+        "diagnostic_stage": job.get("diagnostic_stage") or job.get("progress_stage"),
         "created_at": job.get("created_at"),
         "updated_at": job.get("updated_at"),
         "analysis_version": job.get("analysis_version"),
@@ -7227,6 +7228,11 @@ def get_vehicle_component_analysis_status(job_id: str):
 
     if job.get("status") == "failed":
         response["error"] = job.get("error")
+        response["diagnostic_stage"] = (
+            job.get("diagnostic_stage")
+            or job.get("progress_stage")
+            or "unknown"
+        )
         # Diagnostic fallback: expose the newest pre-validation candidate when
         # a validator failed before it could attach candidate bytes to detail.
         diagnostic_path = job.get("diagnostic_candidate_path")
