@@ -3983,6 +3983,32 @@ Rules:
 """.strip()
 
 
+def build_sideswipe_confinement_prompt(
+    deformation_type: str,
+    impact_direction: str,
+) -> str:
+    """Extra physical constraints for directional sideswipes."""
+    if deformation_type != "sideswipe":
+        return ""
+    return f"""
+SIDESWIPE PHYSICS — STRICT LOCAL DIRECTIONAL CONTACT
+
+This is a glancing contact, not a broad collision and not a global body deformation.
+Impact direction: {impact_direction}.
+
+- Create ONE continuous, narrow contact corridor inside the supplied editable mask.
+- The deformation must follow the requested direction progressively along that corridor.
+- Use a shallow primary trough / dragged crease with smooth entry and exit transitions.
+- Do NOT create multiple parallel dents, repeated double folds, or disconnected impact pockets.
+- Do NOT reinterpret, redraw, rotate, resize, relight or restyle the rest of the vehicle.
+- Do NOT propagate deformation across the whole mask merely because the mask is large.
+- Outside the actual contact corridor, preserve original pixels/appearance as closely as possible.
+- Prefer a smaller, physically coherent sideswipe over a dramatic widespread deformation.
+- A wide rounded vehicle bumper/contact surface produces a broad smooth pressure transition,
+  not two isolated sharp parallel impressions without separate physical contact points.
+""".strip()
+
+
 def build_retry_prompt(
     base_prompt: str,
     validation: dict[str, object],
@@ -7864,6 +7890,11 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 else ""
             )
 
+            sideswipe_confinement_prompt = build_sideswipe_confinement_prompt(
+                payload.deformation_type,
+                payload.impact_direction,
+            )
+
             strict_identity_prompt = f"""
     STRICT CONSERVATIVE IMAGE EDIT OF THE PROVIDED ORIGINAL PHOTOGRAPH.
 
@@ -7908,6 +7939,8 @@ def edit_damage_base64(payload: DamageEditBase64Request):
     {balanced_continuity_prompt}
 
     {impact_zone_prompt}
+
+    {sideswipe_confinement_prompt}
 
     Final output rules:
     - do not return a crop, isolated component, transparent layer, mask or black
