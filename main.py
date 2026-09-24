@@ -64,7 +64,7 @@ ALLOWED_ORIGINS = [
     if item.strip()
 ]
 
-DEPLOY_REVISION = "impact-zone-geometric-confinement-v3.2-protected-identity-authority"
+DEPLOY_REVISION = "impact-zone-geometric-confinement-v3.3-identity-detection"
 
 print(
     f"=== CAR DAMAGE LAB BACKEND V17.0.24 {DEPLOY_REVISION} ===",
@@ -547,6 +547,9 @@ VEHICLE_COMPONENT_CATALOG = {
     "side_window": "Vetro laterale",
     "roof": "Tetto",
     "side_mirror": "Specchietto",
+    "license_plate": "Targa",
+    "manufacturer_emblem": "Stemma costruttore",
+    "model_badge": "Scritta modello",
 }
 
 
@@ -569,6 +572,9 @@ VEHICLE_COMPONENT_CATEGORIES = {
     "side_mirror": "mirror",
     "wheel": "wheel",
     "grille": "trim",
+    "license_plate": "identity",
+    "manufacturer_emblem": "identity",
+    "model_badge": "identity",
 }
 
 SEGMENTATION_POLYGON_SCALE = 1000
