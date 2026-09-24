@@ -64,7 +64,7 @@ ALLOWED_ORIGINS = [
     if item.strip()
 ]
 
-DEPLOY_REVISION = "impact-zone-geometric-confinement-v3.7-deterministic-plate-authority"
+DEPLOY_REVISION = "impact-zone-geometric-confinement-v3.8-structural-geometry-gates"
 
 print(
     f"=== CAR DAMAGE LAB BACKEND V17.0.24 {DEPLOY_REVISION} ===",
@@ -3875,6 +3875,11 @@ Return ONLY valid JSON in this exact structure:
   "same_paint_brightness": true or false,
   "vehicle_globally_darker": true or false,
   "tail_light_outer_geometry_preserved": true or false,
+  "wheel_and_tyre_geometry_preserved": true or false,
+  "wheel_arch_opening_preserved": true or false,
+  "rigid_handles_and_trim_preserved": true or false,
+  "panel_gaps_and_seams_preserved": true or false,
+  "sideswipe_deformation_physically_coherent": true or false,
   "vehicle_identity_changed": true or false,
   "failure_reasons": ["short reason"],
   "confidence": number from 0 to 1
@@ -3891,6 +3896,19 @@ Strict rules:
   darkest folds.
 - A selected tail light may be cracked internally, but its original outer
   silhouette, size and design must remain recognizable.
+- Wheels and tyres must keep their original circular geometry, size, position
+  and perspective unless wheel/suspension damage was explicitly requested.
+- Preserve the wheel-arch opening as a coherent structural opening; surrounding
+  sheet metal may dent, but must not melt into, overlap or redraw the tyre/wheel.
+- Preserve rigid handles, mouldings, bezels, reflectors and trim as recognizable
+  original parts unless their damage was explicitly requested.
+- Preserve panel gaps and seams. Adjacent parts must not visually fuse, overlap
+  or become glued together. In particular, bumper/tailgate and bumper/body seams
+  must remain visibly separated and topologically coherent.
+- For a sideswipe, prefer one dragged longitudinal deformation with broad smooth
+  pressure transitions. Reject starburst/radial crumpling, sharp converging fold
+  knots, multiple disconnected pockets or a concentrated point-impact appearance
+  unless explicitly requested.
 - Deformation of selected body panels is allowed.
 - Background changes are not relevant unless they indicate the whole image
   was regenerated.
@@ -3957,6 +3975,11 @@ Strict rules:
             bool(parsed.get("same_paint_brightness")),
             not bool(parsed.get("vehicle_globally_darker")),
             bool(parsed.get("tail_light_outer_geometry_preserved")),
+            bool(parsed.get("wheel_and_tyre_geometry_preserved")),
+            bool(parsed.get("wheel_arch_opening_preserved")),
+            bool(parsed.get("rigid_handles_and_trim_preserved")),
+            bool(parsed.get("panel_gaps_and_seams_preserved")),
+            bool(parsed.get("sideswipe_deformation_physically_coherent")),
         ]
 
         passed = (
@@ -4086,6 +4109,14 @@ Impact direction: {impact_direction}.
 - Prefer a smaller, physically coherent sideswipe over a dramatic widespread deformation.
 - A wide rounded vehicle bumper/contact surface produces a broad smooth pressure transition,
   not two isolated sharp parallel impressions without separate physical contact points.
+- Do NOT create starburst, radial or flower-like crumpling around the wheel arch.
+- Keep the wheel and tyre perfectly coherent and circular; never melt sheet metal into them.
+- Preserve the original wheel-arch opening and its continuous rim topology.
+- Preserve door handles, rigid mouldings and trim as the same physical parts.
+- Preserve every original panel gap/seam. Never fuse adjacent panels or glue the bumper to
+  the tailgate/body. The bumper upper edge must remain a distinct separated seam even when
+  the surrounding bodywork is deformed.
+- Prefer broad shallow dragged curvature over sharp converging crease nodes.
 """.strip()
 
 
