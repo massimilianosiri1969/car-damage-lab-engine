@@ -64,7 +64,7 @@ ALLOWED_ORIGINS = [
     if item.strip()
 ]
 
-DEPLOY_REVISION = "impact-zone-geometric-confinement-v2-identity-restore"
+DEPLOY_REVISION = "impact-zone-geometric-confinement-v3-protect-mask"
 
 print(
     f"=== CAR DAMAGE LAB BACKEND V17.0.24 {DEPLOY_REVISION} ===",
@@ -3364,6 +3364,7 @@ def geometrically_confine_candidate(
     source: Image.Image,
     candidate_bytes: bytes,
     edit_mask: Image.Image,
+    protect_mask: Image.Image | None = None,
     feather_px: int = 10,
 ) -> bytes:
     """Hard spatial guard: candidate may affect only edit_mask (+ soft inner edge)."""
@@ -3376,6 +3377,13 @@ def geometrically_confine_candidate(
 
     mask = resize_mask(edit_mask.convert("L"), source_rgb.size)
     mask_array = mask_to_binary(mask)
+    # Protected identity pixels are physically removed from the editable region.
+    # This is stronger than a prompt: the original source wins there.
+    if protect_mask is not None:
+        protected = mask_to_binary(
+            resize_mask(protect_mask.convert("L"), source_rgb.size)
+        )
+        mask_array = cv2.bitwise_and(mask_array, cv2.bitwise_not(protected))
     # Feather stays inside the authorized region: outside pixels remain exactly source.
     if feather_px > 0:
         k = max(3, int(feather_px) * 2 + 1)
@@ -8060,6 +8068,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                             source=source,
                             candidate_bytes=generated_bytes,
                             edit_mask=guided_mask,
+                            protect_mask=protect_mask,
                             feather_px=10,
                         )
                         candidate_bytes, candidate_diagnostics = (
