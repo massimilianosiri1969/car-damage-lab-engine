@@ -3360,6 +3360,40 @@ def prepare_hybrid_guided_api_mask(
     return guided_mask, api_mask, diagnostics
 
 
+def geometrically_confine_candidate(
+    source: Image.Image,
+    candidate_bytes: bytes,
+    edit_mask: Image.Image,
+    feather_px: int = 10,
+) -> bytes:
+    """Hard spatial guard: candidate may affect only edit_mask (+ soft inner edge)."""
+    source_rgb = source.convert("RGB")
+    candidate = Image.open(io.BytesIO(candidate_bytes))
+    candidate.load()
+    candidate_rgb = candidate.convert("RGB")
+    if candidate_rgb.size != source_rgb.size:
+        candidate_rgb = candidate_rgb.resize(source_rgb.size, Image.Resampling.LANCZOS)
+
+    mask = resize_mask(edit_mask.convert("L"), source_rgb.size)
+    mask_array = mask_to_binary(mask)
+    # Feather stays inside the authorized region: outside pixels remain exactly source.
+    if feather_px > 0:
+        k = max(3, int(feather_px) * 2 + 1)
+        if k % 2 == 0:
+            k += 1
+        soft = cv2.GaussianBlur(mask_array, (k, k), 0)
+        soft[mask_array == 0] = 0
+    else:
+        soft = mask_array
+    alpha = (soft.astype(np.float32) / 255.0)[..., None]
+    src = np.asarray(source_rgb, dtype=np.float32)
+    cand = np.asarray(candidate_rgb, dtype=np.float32)
+    merged = np.clip(cand * alpha + src * (1.0 - alpha), 0, 255).astype(np.uint8)
+    out = io.BytesIO()
+    Image.fromarray(merged, mode="RGB").save(out, format="JPEG", quality=97, subsampling=0)
+    return out.getvalue()
+
+
 def validate_hybrid_guided_result(
     source: Image.Image,
     candidate_bytes: bytes,
@@ -8014,13 +8048,24 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                     diagnostic_candidate_path.write_bytes(generated_bytes)
 
                     if has_manual_mask:
+                        # Impact-zone output is now spatially guaranteed, not merely
+                        # requested in the prompt. Outside guided_mask comes from the
+                        # original photograph pixel-for-pixel (apart from JPEG encoding).
+                        spatially_confined_bytes = geometrically_confine_candidate(
+                            source=source,
+                            candidate_bytes=generated_bytes,
+                            edit_mask=guided_mask,
+                            feather_px=10,
+                        )
                         candidate_bytes, candidate_diagnostics = (
                             validate_hybrid_guided_result(
                                 source=source,
-                                candidate_bytes=generated_bytes,
+                                candidate_bytes=spatially_confined_bytes,
                                 guided_mask=guided_mask,
                             )
                         )
+                        candidate_diagnostics["geometric_confinement_applied"] = True
+                        candidate_diagnostics["geometric_confinement_feather_px"] = 10
 
                         locality_validation = validate_deformation_locality(
                             source=source,
