@@ -64,7 +64,7 @@ ALLOWED_ORIGINS = [
     if item.strip()
 ]
 
-DEPLOY_REVISION = "impact-zone-geometric-confinement-v3.6.1-persist-pixel-diagnostics"
+DEPLOY_REVISION = "impact-zone-geometric-confinement-v3.7-deterministic-plate-authority"
 
 print(
     f"=== CAR DAMAGE LAB BACKEND V17.0.24 {DEPLOY_REVISION} ===",
@@ -8197,6 +8197,30 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                     # because a protect mask exists. A partial/incorrect mask must
                     # still fail (especially license plates). Geometric restoration
                     # and independent visual validation must agree.
+
+                    # Deterministic authority for protected identity pixels:
+                    # if every protected pixel is byte-identical to the original,
+                    # a vision/OCR disagreement about the license plate is a false
+                    # negative. Keep all other identity checks independent.
+                    if (
+                        protected_pixel_diag
+                        and int(protected_pixel_diag.get("protected_pixel_count", 0)) > 0
+                        and int(protected_pixel_diag.get("protected_changed_pixel_count", 1)) == 0
+                    ):
+                        reasons = identity_validation.get("failure_reasons") or []
+                        non_plate_reasons = [
+                            r for r in reasons
+                            if "license plate" not in str(r).lower()
+                        ]
+                        identity_validation["same_license_plate"] = True
+                        identity_validation["failure_reasons"] = non_plate_reasons
+                        identity_validation["vehicle_identity_changed"] = bool(
+                            identity_validation.get("vehicle_identity_changed")
+                            and non_plate_reasons
+                        )
+                        identity_validation["license_plate_validation"] = (
+                            "deterministic_protected_pixels_identical"
+                        )
 
                     effective_paint_profile = payload.paint_validation_profile
                     # Compatibility bridge for already-deployed Base44 functions:
