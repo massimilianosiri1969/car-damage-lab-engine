@@ -64,7 +64,7 @@ ALLOWED_ORIGINS = [
     if item.strip()
 ]
 
-DEPLOY_REVISION = "impact-zone-geometric-confinement-v3-protect-mask"
+DEPLOY_REVISION = "impact-zone-geometric-confinement-v3.1-protect-mask-fix"
 
 print(
     f"=== CAR DAMAGE LAB BACKEND V17.0.24 {DEPLOY_REVISION} ===",
@@ -7903,6 +7903,24 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                     "mask_geometry_source": "full_frame_fallback",
                 }
                 resolved_guided_mode = "simple_guided"
+
+            # Decode the aggregate protection mask in the guided/impact-zone
+            # path as well. Previously protect_mask only existed in the historical
+            # component-based branch, causing an UnboundLocalError in v3.
+            protect_mask = (
+                decode_base64_image(
+                    payload.protect_mask_base64,
+                    "protect_mask_base64",
+                    "L",
+                )
+                if payload.protect_mask_base64
+                else None
+            )
+            if protect_mask is not None:
+                protect_mask = resize_mask_to_processing_size(
+                    protect_mask,
+                    source.size,
+                )
 
             protected_components_prompt = (
                 build_strict_protected_components_prompt(
