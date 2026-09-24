@@ -64,7 +64,7 @@ ALLOWED_ORIGINS = [
     if item.strip()
 ]
 
-DEPLOY_REVISION = "impact-zone-geometric-confinement-v3.8-structural-geometry-gates"
+DEPLOY_REVISION = "impact-zone-geometric-confinement-v3.9-seam-continuity-gate"
 
 print(
     f"=== CAR DAMAGE LAB BACKEND V17.0.24 {DEPLOY_REVISION} ===",
@@ -3880,6 +3880,8 @@ Return ONLY valid JSON in this exact structure:
   "rigid_handles_and_trim_preserved": true or false,
   "panel_gaps_and_seams_preserved": true or false,
   "sideswipe_deformation_physically_coherent": true or false,
+  "no_compositing_seam_or_pasted_patch": true or false,
+  "continuous_exposure_and_reflections": true or false,
   "vehicle_identity_changed": true or false,
   "failure_reasons": ["short reason"],
   "confidence": number from 0 to 1
@@ -3909,6 +3911,12 @@ Strict rules:
   pressure transitions. Reject starburst/radial crumpling, sharp converging fold
   knots, multiple disconnected pockets or a concentrated point-impact appearance
   unless explicitly requested.
+- Reject any visible compositing boundary: vertical/horizontal straight seam,
+  pasted-patch edge, rectangular transition, abrupt texture boundary or sudden
+  exposure/colour step that follows an edit-mask boundary rather than real geometry.
+- Paint brightness, colour and reflections must transition continuously across the
+  edited-region boundary. A straight dark/light split through the same physical
+  panel is invalid unless a real panel seam or lighting occlusion explains it.
 - Deformation of selected body panels is allowed.
 - Background changes are not relevant unless they indicate the whole image
   was regenerated.
@@ -3980,6 +3988,8 @@ Strict rules:
             bool(parsed.get("rigid_handles_and_trim_preserved")),
             bool(parsed.get("panel_gaps_and_seams_preserved")),
             bool(parsed.get("sideswipe_deformation_physically_coherent")),
+            bool(parsed.get("no_compositing_seam_or_pasted_patch")),
+            bool(parsed.get("continuous_exposure_and_reflections")),
         ]
 
         passed = (
@@ -4117,6 +4127,10 @@ Impact direction: {impact_direction}.
   the tailgate/body. The bumper upper edge must remain a distinct separated seam even when
   the surrounding bodywork is deformed.
 - Prefer broad shallow dragged curvature over sharp converging crease nodes.
+- The editable-mask boundary must NEVER become visible as a straight vertical/horizontal
+  line, pasted patch, exposure step or colour split. Continue original paint texture,
+  illumination and reflections smoothly across that boundary while keeping protected
+  identity pixels exact.
 """.strip()
 
 
