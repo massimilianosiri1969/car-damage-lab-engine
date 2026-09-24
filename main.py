@@ -7223,6 +7223,12 @@ def get_vehicle_component_analysis_status(job_id: str):
         response["error"] = job.get("error")
         # Diagnostic fallback: expose the newest pre-validation candidate when
         # a validator failed before it could attach candidate bytes to detail.
+        diagnostic_path = job.get("diagnostic_candidate_path")
+        if diagnostic_path and Path(diagnostic_path).exists():
+            response["diagnostic_rejected_candidate_base64"] = (
+                base64.b64encode(Path(diagnostic_path).read_bytes()).decode("ascii")
+            )
+            response["diagnostic_rejected_candidate_mime_type"] = "image/jpeg"
         diagnostic_id = None
         error_value = job.get("error")
         if isinstance(error_value, dict):
@@ -8767,6 +8773,25 @@ def run_async_damage_generation(
         )
 
     except HTTPException as exc:
+        # A validator can fail before generation_attempts is assembled. Recover
+        # the latest candidate persisted immediately after OpenAI generation.
+        diagnostic_id = None
+        if isinstance(exc.detail, dict):
+            diagnostic_id = exc.detail.get("diagnostic_id")
+        if not diagnostic_id:
+            # The synchronous edit owns its diagnostic id; if the exception did
+            # not carry it (e.g. locality validation), use the newest candidate
+            # created during this job execution window.
+            candidates = sorted(
+                DAMAGE_JOB_DIR.glob("diag-*-attempt-*.jpg"),
+                key=lambda p: p.stat().st_mtime,
+            )
+            latest = candidates[-1] if candidates else None
+        else:
+            matches = sorted(
+                DAMAGE_JOB_DIR.glob(f"diag-{diagnostic_id}-attempt-*.jpg")
+            )
+            latest = matches[-1] if matches else None
         set_damage_job(
             job_id,
             status="failed",
@@ -8776,6 +8801,7 @@ def run_async_damage_generation(
                 "http_status": exc.status_code,
                 "detail": exc.detail,
             },
+            diagnostic_candidate_path=str(latest) if latest else None,
         )
         print(
             "[ASYNC DAMAGE HTTP ERROR]",
