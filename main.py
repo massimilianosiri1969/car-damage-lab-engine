@@ -8993,6 +8993,7 @@ def start_async_damage_generation(
             "generation_version": (
                 "damage-v17.0.23-large-impact-zone-acceptance"
             ),
+            "engine_revision": DEPLOY_REVISION,
         }
 
     # Copia serializzabile: evita di tenere riferimenti mutabili al request.
@@ -9040,6 +9041,7 @@ def get_async_damage_generation_status(job_id: str):
         "created_at": job.get("created_at"),
         "updated_at": job.get("updated_at"),
         "generation_version": job.get("generation_version"),
+        "engine_revision": job.get("engine_revision") or DEPLOY_REVISION,
     }
 
     if job.get("status") == "succeeded":
