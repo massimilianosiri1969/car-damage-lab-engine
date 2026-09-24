@@ -64,7 +64,7 @@ ALLOWED_ORIGINS = [
     if item.strip()
 ]
 
-DEPLOY_REVISION = "impact-zone-geometric-confinement-v3.4-strict-plate-integrity"
+DEPLOY_REVISION = "impact-zone-geometric-confinement-v3.5-lossless-protected-identity"
 
 print(
     f"=== CAR DAMAGE LAB BACKEND V17.0.24 {DEPLOY_REVISION} ===",
@@ -3403,8 +3403,16 @@ def geometrically_confine_candidate(
     src = np.asarray(source_rgb, dtype=np.float32)
     cand = np.asarray(candidate_rgb, dtype=np.float32)
     merged = np.clip(cand * alpha + src * (1.0 - alpha), 0, 255).astype(np.uint8)
+    # Preserve protected identity pixels once more AFTER blending. They must
+    # not be affected by alpha math at all.
+    if protect_mask is not None:
+        protected_bool = protected > 0
+        merged[protected_bool] = np.asarray(source_rgb, dtype=np.uint8)[protected_bool]
+
     out = io.BytesIO()
-    Image.fromarray(merged, mode="RGB").save(out, format="JPEG", quality=97, subsampling=0)
+    # PNG is intentional inside the validation pipeline: JPEG re-encoding can
+    # alter tiny license-plate glyphs enough to trigger OCR/vision mismatches.
+    Image.fromarray(merged, mode="RGB").save(out, format="PNG", optimize=False)
     return out.getvalue()
 
 
