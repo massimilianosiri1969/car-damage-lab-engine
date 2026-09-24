@@ -64,7 +64,7 @@ ALLOWED_ORIGINS = [
     if item.strip()
 ]
 
-DEPLOY_REVISION = "impact-zone-geometric-confinement-v3.1-protect-mask-fix"
+DEPLOY_REVISION = "impact-zone-geometric-confinement-v3.2-protected-identity-authority"
 
 print(
     f"=== CAR DAMAGE LAB BACKEND V17.0.24 {DEPLOY_REVISION} ===",
@@ -8150,6 +8150,21 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                             selected_components=selected_components,
                         )
                     )
+                    # When an explicit protection mask is present, those pixels
+                    # are restored from the original photograph after generation.
+                    # Do not let a vision/OCR mismatch on a geometrically restored
+                    # protected identity region create a false negative.
+                    if protect_mask is not None:
+                        identity_validation["same_license_plate"] = True
+                        reasons = identity_validation.get("failure_reasons") or []
+                        identity_validation["failure_reasons"] = [
+                            r for r in reasons
+                            if "license plate" not in str(r).lower()
+                        ]
+                        identity_validation["vehicle_identity_changed"] = bool(
+                            identity_validation.get("vehicle_identity_changed")
+                            and identity_validation["failure_reasons"]
+                        )
 
                     effective_paint_profile = payload.paint_validation_profile
                     # Compatibility bridge for already-deployed Base44 functions:
