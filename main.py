@@ -7195,6 +7195,23 @@ def get_vehicle_component_analysis_status(job_id: str):
 
     if job.get("status") == "failed":
         response["error"] = job.get("error")
+        # Diagnostic fallback: expose the newest pre-validation candidate when
+        # a validator failed before it could attach candidate bytes to detail.
+        diagnostic_id = None
+        error_value = job.get("error")
+        if isinstance(error_value, dict):
+            detail_value = error_value.get("detail")
+            if isinstance(detail_value, dict):
+                diagnostic_id = detail_value.get("diagnostic_id")
+        if diagnostic_id:
+            matches = sorted(
+                DAMAGE_JOB_DIR.glob(f"diag-{diagnostic_id}-attempt-*.jpg")
+            )
+            if matches:
+                response["diagnostic_rejected_candidate_base64"] = (
+                    base64.b64encode(matches[-1].read_bytes()).decode("ascii")
+                )
+                response["diagnostic_rejected_candidate_mime_type"] = "image/jpeg"
 
     return response
 
