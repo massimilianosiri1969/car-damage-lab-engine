@@ -7936,6 +7936,15 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                         payload.output_quality,
                     )
 
+                    # Persist every generated candidate immediately, before any
+                    # locality/identity/paint validator can reject it. This is
+                    # diagnostic-only and never makes a rejected image user-visible.
+                    diagnostic_candidate_path = (
+                        DAMAGE_JOB_DIR
+                        / f"diag-{request_diagnostic_id}-attempt-{attempt_number}.jpg"
+                    )
+                    diagnostic_candidate_path.write_bytes(generated_bytes)
+
                     if has_manual_mask:
                         candidate_bytes, candidate_diagnostics = (
                             validate_hybrid_guided_result(
@@ -8088,6 +8097,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
 
                     generation_attempts.append({
                         "attempt": attempt_number,
+                        "diagnostic_candidate_path": str(diagnostic_candidate_path),
                         "identity_validation": identity_validation,
                         "paint_colour_validation": (
                             paint_colour_validation
