@@ -64,7 +64,7 @@ ALLOWED_ORIGINS = [
     if item.strip()
 ]
 
-DEPLOY_REVISION = "impact-zone-geometric-confinement-v3.5-lossless-protected-identity"
+DEPLOY_REVISION = "impact-zone-geometric-confinement-v3.6-deterministic-protected-pixels"
 
 print(
     f"=== CAR DAMAGE LAB BACKEND V17.0.24 {DEPLOY_REVISION} ===",
@@ -3409,11 +3409,29 @@ def geometrically_confine_candidate(
         protected_bool = protected > 0
         merged[protected_bool] = np.asarray(source_rgb, dtype=np.uint8)[protected_bool]
 
+    # Deterministic verification of protected pixels before encoding.
+    protected_identity_diagnostics = None
+    if protect_mask is not None:
+        protected_bool = protected > 0
+        src_u8 = np.asarray(source_rgb, dtype=np.uint8)
+        changed = np.any(merged[protected_bool] != src_u8[protected_bool], axis=1)
+        protected_identity_diagnostics = {
+            "protected_pixel_count": int(protected_bool.sum()),
+            "protected_changed_pixel_count": int(changed.sum()),
+            "protected_changed_ratio": (
+                float(changed.sum()) / float(protected_bool.sum())
+                if int(protected_bool.sum()) else 0.0
+            ),
+        }
+
     out = io.BytesIO()
     # PNG is intentional inside the validation pipeline: JPEG re-encoding can
     # alter tiny license-plate glyphs enough to trigger OCR/vision mismatches.
     Image.fromarray(merged, mode="RGB").save(out, format="PNG", optimize=False)
-    return out.getvalue()
+    data = out.getvalue()
+    if protected_identity_diagnostics is not None:
+        setattr(geometrically_confine_candidate, "_last_protected_diagnostics", protected_identity_diagnostics)
+    return data
 
 
 def validate_hybrid_guided_result(
@@ -8112,6 +8130,13 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                         )
                         candidate_diagnostics["geometric_confinement_applied"] = True
                         candidate_diagnostics["geometric_confinement_feather_px"] = 10
+                        protected_pixel_diag = getattr(
+                            geometrically_confine_candidate,
+                            "_last_protected_diagnostics",
+                            None,
+                        )
+                        if protected_pixel_diag:
+                            candidate_diagnostics.update(protected_pixel_diag)
 
                         locality_validation = validate_deformation_locality(
                             source=source,
