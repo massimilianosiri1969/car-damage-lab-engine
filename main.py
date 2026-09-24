@@ -64,7 +64,7 @@ ALLOWED_ORIGINS = [
     if item.strip()
 ]
 
-DEPLOY_REVISION = "impact-zone-geometric-confinement-v3.6-deterministic-protected-pixels"
+DEPLOY_REVISION = "impact-zone-geometric-confinement-v3.6.1-persist-pixel-diagnostics"
 
 print(
     f"=== CAR DAMAGE LAB BACKEND V17.0.24 {DEPLOY_REVISION} ===",
@@ -8293,6 +8293,11 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                         "identity_validation": identity_validation,
                         "paint_colour_validation": (
                             paint_colour_validation
+                        ),
+                        "protected_identity_pixels": (
+                            protected_pixel_diag
+                            if has_manual_mask
+                            else None
                         ),
                         # Diagnostic-only snapshot. It is never returned as an
                         # accepted simulation; it lets Regression Lab inspect
