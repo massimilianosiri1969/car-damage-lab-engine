@@ -64,12 +64,12 @@ ALLOWED_ORIGINS = [
     if item.strip()
 ]
 
+DEPLOY_REVISION = "sideswipe-physical-v1-diagnostic-candidate-v2"
+
 print(
     f"=== CAR DAMAGE LAB BACKEND V17.0.24 {DEPLOY_REVISION} ===",
     flush=True,
 )
-
-DEPLOY_REVISION = "sideswipe-physical-v1-diagnostic-candidate-v2"
 
 app = FastAPI(
     title=APP_NAME,
