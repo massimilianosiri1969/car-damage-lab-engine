@@ -64,7 +64,7 @@ ALLOWED_ORIGINS = [
     if item.strip()
 ]
 
-DEPLOY_REVISION = "impact-zone-geometric-confinement-v1"
+DEPLOY_REVISION = "impact-zone-geometric-confinement-v2-identity-restore"
 
 print(
     f"=== CAR DAMAGE LAB BACKEND V17.0.24 {DEPLOY_REVISION} ===",
@@ -8051,6 +8051,11 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                         # Impact-zone output is now spatially guaranteed, not merely
                         # requested in the prompt. Outside guided_mask comes from the
                         # original photograph pixel-for-pixel (apart from JPEG encoding).
+                        # The API edit mask may include a small technical
+                        # expansion, but the final result is confined to the
+                        # user's actual guided_mask. This also restores identity
+                        # elements (e.g. a plate) whenever they lie outside the
+                        # requested impact zone.
                         spatially_confined_bytes = geometrically_confine_candidate(
                             source=source,
                             candidate_bytes=generated_bytes,
