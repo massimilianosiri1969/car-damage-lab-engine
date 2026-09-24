@@ -65,13 +65,15 @@ ALLOWED_ORIGINS = [
 ]
 
 print(
-    "=== CAR DAMAGE LAB BACKEND V17.0.23 LARGE IMPACT ZONE ACCEPTANCE ===",
+    f"=== CAR DAMAGE LAB BACKEND V17.0.24 {DEPLOY_REVISION} ===",
     flush=True,
 )
 
+DEPLOY_REVISION = "sideswipe-physical-v1-diagnostic-candidate-v2"
+
 app = FastAPI(
     title=APP_NAME,
-    version="1.7.0.23",
+    version="1.7.0.24",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
