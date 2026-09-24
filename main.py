@@ -3998,9 +3998,13 @@ SIDESWIPE PHYSICS — STRICT LOCAL DIRECTIONAL CONTACT
 This is a glancing contact, not a broad collision and not a global body deformation.
 Impact direction: {impact_direction}.
 
-- Create ONE continuous, narrow contact corridor inside the supplied editable mask.
+- Treat the supplied editable mask as a MAXIMUM boundary, never as an area that must be filled.
+- Create ONE continuous, very narrow contact corridor occupying at most about one third of the
+  mask thickness perpendicular to travel. Keep generous untouched margins inside the mask.
 - The deformation must follow the requested direction progressively along that corridor.
 - Use a shallow primary trough / dragged crease with smooth entry and exit transitions.
+- Keep the vehicle silhouette, panel boundaries and all pixels outside that narrow corridor
+  visually unchanged; do not alter background, glass, lamps, wheels or unrelated body panels.
 - Do NOT create multiple parallel dents, repeated double folds, or disconnected impact pockets.
 - Do NOT reinterpret, redraw, rotate, resize, relight or restyle the rest of the vehicle.
 - Do NOT propagate deformation across the whole mask merely because the mask is large.
