@@ -64,7 +64,7 @@ ALLOWED_ORIGINS = [
     if item.strip()
 ]
 
-DEPLOY_REVISION = "sideswipe-physical-v1-diagnostic-candidate-v2"
+DEPLOY_REVISION = "impact-zone-geometric-confinement-v1"
 
 print(
     f"=== CAR DAMAGE LAB BACKEND V17.0.24 {DEPLOY_REVISION} ===",
