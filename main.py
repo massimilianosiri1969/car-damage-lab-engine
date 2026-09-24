@@ -8748,11 +8748,22 @@ def run_async_damage_generation(
     job_id: str,
     payload_data: dict[str, object],
 ) -> None:
+    job_started_epoch = time.time()
+    current_stage = "initializing"
     try:
+        current_stage = "validating_payload"
         set_damage_job(
             job_id,
             status="processing",
-            progress_stage="generating_first_attempt",
+            progress_stage=current_stage,
+            progress_percent=5,
+            diagnostic_started_epoch=job_started_epoch,
+        )
+
+        current_stage = "generating_and_validating"
+        set_damage_job(
+            job_id,
+            progress_stage=current_stage,
             progress_percent=10,
         )
 
@@ -8762,9 +8773,10 @@ def run_async_damage_generation(
         # generazione, validazione identità e secondo tentativo conservativo.
         result = edit_damage_base64(payload)
 
+        current_stage = "saving_result"
         set_damage_job(
             job_id,
-            progress_stage="saving_result",
+            progress_stage=current_stage,
             progress_percent=95,
         )
         result_path = _write_damage_job_result(job_id, result)
@@ -8785,11 +8797,13 @@ def run_async_damage_generation(
         if isinstance(exc.detail, dict):
             diagnostic_id = exc.detail.get("diagnostic_id")
         if not diagnostic_id:
-            # The synchronous edit owns its diagnostic id; if the exception did
-            # not carry it (e.g. locality validation), use the newest candidate
-            # created during this job execution window.
+            # Only accept candidates created during THIS async job. This avoids
+            # accidentally attaching an older user's diagnostic image.
             candidates = sorted(
-                DAMAGE_JOB_DIR.glob("diag-*-attempt-*.jpg"),
+                (
+                    p for p in DAMAGE_JOB_DIR.glob("diag-*-attempt-*.jpg")
+                    if p.stat().st_mtime >= job_started_epoch
+                ),
                 key=lambda p: p.stat().st_mtime,
             )
             latest = candidates[-1] if candidates else None
@@ -8806,7 +8820,10 @@ def run_async_damage_generation(
             error={
                 "http_status": exc.status_code,
                 "detail": exc.detail,
+                "diagnostic_stage": current_stage,
+                "exception_type": type(exc).__name__,
             },
+            diagnostic_stage=current_stage,
             diagnostic_candidate_path=str(latest) if latest else None,
         )
         print(
@@ -8835,7 +8852,10 @@ def run_async_damage_generation(
                     "error_type": type(exc).__name__,
                     "error": str(exc)[:1800],
                 },
+                "diagnostic_stage": current_stage,
+                "exception_type": type(exc).__name__,
             },
+            diagnostic_stage=current_stage,
         )
         print(
             "[ASYNC DAMAGE UNHANDLED ERROR]",
