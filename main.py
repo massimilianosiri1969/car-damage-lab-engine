@@ -64,7 +64,7 @@ ALLOWED_ORIGINS = [
     if item.strip()
 ]
 
-DEPLOY_REVISION = "mockup-direct-v1-minimal"
+DEPLOY_REVISION = "provider-bakeoff-v1-gemini-direct"
 
 print(
     f"=== CAR DAMAGE LAB BACKEND V17.0.24 {DEPLOY_REVISION} ===",
@@ -4168,6 +4168,47 @@ that changes the vehicle.
 """.strip()
 
 
+def call_gemini_semantic_edit(source: Image.Image, prompt: str) -> bytes:
+    """Gemini native full-frame image editing via generateContent REST."""
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        raise HTTPException(status_code=503, detail={"message": "GEMINI_API_KEY non configurata.", "provider": "gemini"})
+    model = os.getenv("GEMINI_IMAGE_MODEL", "gemini-3.1-flash-image")
+    buf = io.BytesIO()
+    source.convert("RGB").save(buf, format="JPEG", quality=96, subsampling=0)
+    image_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    body = json.dumps({
+        "contents": [{"parts": [
+            {"text": prompt},
+            {"inline_data": {"mime_type": "image/jpeg", "data": image_b64}}
+        ]}],
+        "generationConfig": {"responseModalities": ["IMAGE"]}
+    }).encode("utf-8")
+    url = "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent"
+    req = urllib.request.Request(
+        url, data=body,
+        headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=180) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail={
+            "message": "Errore editing immagine Gemini",
+            "provider": "gemini", "model": model, "error": str(exc)[:1000]
+        }) from exc
+    for candidate in payload.get("candidates", []):
+        for part in (candidate.get("content") or {}).get("parts", []):
+            inline = part.get("inlineData") or part.get("inline_data")
+            if inline and inline.get("data"):
+                return base64.b64decode(inline["data"])
+    raise HTTPException(status_code=502, detail={
+        "message": "Gemini non ha restituito un'immagine.",
+        "provider": "gemini", "model": model
+    })
+
+
 def call_openai_semantic_edit(
     source: Image.Image,
     prompt: str,
@@ -7878,11 +7919,14 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 source.save(output, format="JPEG", quality=95, subsampling=0)
                 result_bytes = output.getvalue()
             else:
-                result_bytes = call_openai_semantic_edit(
-                    source,
-                    prompt,
-                    payload.output_quality,
-                )
+                if payload.semantic_direct_sideswipe:
+                    result_bytes = call_gemini_semantic_edit(source, prompt)
+                else:
+                    result_bytes = call_openai_semantic_edit(
+                        source,
+                        prompt,
+                        payload.output_quality,
+                    )
 
             # Verifica soltanto che il modello abbia restituito un'immagine
             # leggibile. Nessuna ricomposizione o trasformazione del risultato.
