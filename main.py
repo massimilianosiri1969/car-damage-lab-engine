@@ -64,7 +64,7 @@ ALLOWED_ORIGINS = [
     if item.strip()
 ]
 
-DEPLOY_REVISION = "impact-zone-geometric-confinement-v4.0-seam-numeric-gate"
+DEPLOY_REVISION = "impact-zone-geometric-confinement-v3.8-structural-geometry-gates"
 
 print(
     f"=== CAR DAMAGE LAB BACKEND V17.0.24 {DEPLOY_REVISION} ===",
@@ -3432,41 +3432,6 @@ def geometrically_confine_candidate(
     if protected_identity_diagnostics is not None:
         setattr(geometrically_confine_candidate, "_last_protected_diagnostics", protected_identity_diagnostics)
     return data
-
-
-def measure_mask_boundary_seam(
-    source: Image.Image,
-    candidate_bytes: bytes,
-    edit_mask: Image.Image,
-) -> dict[str, object]:
-    """Numeric detector for artificial tone/exposure steps along edit boundary."""
-    src = np.asarray(source.convert("RGB"), dtype=np.float32)
-    cand_img = Image.open(io.BytesIO(candidate_bytes)).convert("RGB")
-    if cand_img.size != source.size:
-        cand_img = cand_img.resize(source.size, Image.Resampling.LANCZOS)
-    cand = np.asarray(cand_img, dtype=np.float32)
-    mask = mask_to_binary(resize_mask(edit_mask.convert("L"), source.size))
-    kernel = np.ones((5, 5), np.uint8)
-    inner = cv2.subtract(mask, cv2.erode(mask, kernel, iterations=1)) > 0
-    outer = cv2.subtract(cv2.dilate(mask, kernel, iterations=1), mask) > 0
-    if not inner.any() or not outer.any():
-        return {"boundary_seam_score": 0.0, "boundary_seam_passed": True}
-    # Compare edit-induced luminance shift immediately inside vs outside boundary.
-    src_y = src.mean(axis=2); cand_y = cand.mean(axis=2)
-    delta = cand_y - src_y
-    inner_delta = float(np.median(delta[inner]))
-    outer_delta = float(np.median(delta[outer]))
-    score = abs(inner_delta - outer_delta)
-    # Local robust high-percentile catches narrow pasted edges missed by median.
-    edge = cv2.dilate((inner | outer).astype(np.uint8), kernel, iterations=1) > 0
-    abs_delta = np.abs(delta)
-    p95 = float(np.percentile(abs_delta[edge], 95)) if edge.any() else 0.0
-    passed = score <= 7.0 and p95 <= 28.0
-    return {
-        "boundary_seam_score": round(score, 3),
-        "boundary_seam_p95": round(p95, 3),
-        "boundary_seam_passed": bool(passed),
-    }
 
 
 def validate_hybrid_guided_result(
@@ -8201,11 +8166,6 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                             protect_mask=protect_mask,
                             feather_px=10,
                         )
-                        seam_diagnostics = measure_mask_boundary_seam(
-                            source=source,
-                            candidate_bytes=spatially_confined_bytes,
-                            edit_mask=guided_mask,
-                        )
                         candidate_bytes, candidate_diagnostics = (
                             validate_hybrid_guided_result(
                                 source=source,
@@ -8213,16 +8173,6 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                                 guided_mask=guided_mask,
                             )
                         )
-                        candidate_diagnostics.update(seam_diagnostics)
-                        if not seam_diagnostics.get("boundary_seam_passed", True):
-                            raise HTTPException(
-                                status_code=422,
-                                detail={
-                                    "message": "Risultato respinto: giunzione artificiale visibile sul bordo della zona modificata.",
-                                    "failure_code": "COMPOSITING_SEAM",
-                                    **seam_diagnostics,
-                                },
-                            )
                         candidate_diagnostics["geometric_confinement_applied"] = True
                         candidate_diagnostics["geometric_confinement_feather_px"] = 10
                         protected_pixel_diag = getattr(
