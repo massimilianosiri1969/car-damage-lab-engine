@@ -64,7 +64,7 @@ ALLOWED_ORIGINS = [
     if item.strip()
 ]
 
-DEPLOY_REVISION = "impact-zone-geometric-confinement-v3.8-structural-geometry-gates"
+DEPLOY_REVISION = "impact-zone-geometric-confinement-v3.8.1-inner-edge-blend"
 
 print(
     f"=== CAR DAMAGE LAB BACKEND V17.0.24 {DEPLOY_REVISION} ===",
@@ -3392,10 +3392,22 @@ def geometrically_confine_candidate(
         mask_array = cv2.bitwise_and(mask_array, cv2.bitwise_not(protected))
     # Feather stays inside the authorized region: outside pixels remain exactly source.
     if feather_px > 0:
-        k = max(3, int(feather_px) * 2 + 1)
-        if k % 2 == 0:
-            k += 1
-        soft = cv2.GaussianBlur(mask_array, (k, k), 0)
+        # Feather only an INNER boundary band. The old full-mask Gaussian blur
+        # could create a broad tone/exposure patch that made the mask visible.
+        radius = max(2, int(feather_px))
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (radius * 2 + 1, radius * 2 + 1),
+        )
+        eroded = cv2.erode(mask_array, kernel, iterations=1)
+        inner_band = cv2.subtract(mask_array, eroded)
+        distance = cv2.distanceTransform(mask_array, cv2.DIST_L2, 5)
+        ramp = np.clip(distance / float(radius), 0.0, 1.0)
+        soft = np.where(
+            inner_band > 0,
+            np.round(ramp * 255.0),
+            mask_array,
+        ).astype(np.uint8)
         soft[mask_array == 0] = 0
     else:
         soft = mask_array
