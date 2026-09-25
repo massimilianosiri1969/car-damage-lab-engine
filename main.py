@@ -64,7 +64,7 @@ ALLOWED_ORIGINS = [
     if item.strip()
 ]
 
-DEPLOY_REVISION = "semantic-direct-sideswipe-v1"
+DEPLOY_REVISION = "semantic-direct-sideswipe-v2-simple-physical"
 
 print(
     f"=== CAR DAMAGE LAB BACKEND V17.0.24 {DEPLOY_REVISION} ===",
@@ -7861,28 +7861,24 @@ def edit_damage_base64(payload: DamageEditBase64Request):
 Edit the ORIGINAL full photograph directly. Do not crop, composite, paste or
 rebuild the vehicle.
 
-Create a realistic automotive SIDESWIPE on the bodywork corresponding to the
-user-selected impact zone. Severity {severity_percent}/100, affected extent
-{area_percent}/100, direction {payload.impact_direction}.
+Create a realistic SIDESWIPE collision deformation on the left rear bodywork
+of this exact car. Severity {severity_percent}/100.
 
-The impact zone is LOCATION GUIDANCE, not permission to redraw the image.
-Produce one continuous dragged deformation with broad smooth pressure
-transitions and realistic stretched/creased sheet metal. Avoid starburst folds,
-radial crumpling, repeated parallel dents and point-impact knots.
+Imagine the rounded bumper/corner of another real car sliding along the Fiat:
+the sheet metal is pushed inward and dragged longitudinally. Make the damage
+look photographic and physically plausible: one broad dent with a few natural
+stretched creases and scrape marks following the direction of travel. Avoid
+soft inflated/plastic bulges, starbursts, flower-like folds and repeated dents.
 
-ABSOLUTE PRESERVATION:
-- same exact Fiat Panda, same camera, perspective and background;
-- preserve the ORIGINAL license plate exactly, character-for-character;
-- preserve FIAT emblem, model badges, lights, windows, wheels, tyres, handles,
-  mouldings and trim unless explicitly damaged;
-- preserve panel gaps and bumper/tailgate separation;
-- preserve original paint colour, exposure, gloss and reflections outside the
-  physical deformation;
-- no straight mask boundary, pasted patch, colour split or exposure seam;
-- do not regenerate the whole rear or whole vehicle.
+Keep the rest of the photograph exactly the same: same car, camera, background,
+paint colour, lighting and reflections. Keep lights, glass, wheels, tyres,
+handles, trim, FIAT emblem, badges, panel gaps and bumper geometry unchanged.
+Do not redraw the rear of the car and do not create any pasted or differently
+coloured region.
 
-The final image must look like one untouched real photograph of the same car
-after a plausible glancing collision.
+The license plate will be restored separately after generation; do not use it
+as part of the damage. The result must look like an authentic photograph of
+this same car after one glancing sideswipe.
 """.strip()
             else:
                 prompt = payload.user_instructions.strip()
