@@ -64,7 +64,7 @@ ALLOWED_ORIGINS = [
     if item.strip()
 ]
 
-DEPLOY_REVISION = "gemini-pro-direct-v2-official-interactions"
+DEPLOY_REVISION = "openai-responses-sunburst-v1-chatgpt-like"
 
 print(
     f"=== CAR DAMAGE LAB BACKEND V17.0.24 {DEPLOY_REVISION} ===",
@@ -4210,6 +4210,52 @@ def call_gemini_semantic_edit(source: Image.Image, prompt: str) -> bytes:
         "provider":"gemini","model":model
     })
 
+def call_openai_responses_image_edit(source: Image.Image, prompt: str) -> tuple[bytes, str | None]:
+    """ChatGPT-like orchestration: mainline model + Responses image_generation tool."""
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=503, detail="OPENAI_API_KEY non configurata.")
+    client = OpenAI(api_key=api_key)
+    buf = io.BytesIO()
+    source.convert("RGB").save(buf, format="JPEG", quality=98, subsampling=0)
+    data_url = "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+    try:
+        response = client.responses.create(
+            model=os.getenv("OPENAI_RESPONSES_IMAGE_ORCHESTRATOR", "gpt-5.6"),
+            input=[{
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": prompt},
+                    {"type": "input_image", "image_url": data_url, "detail": "high"},
+                ],
+            }],
+            tools=[{
+                "type": "image_generation",
+                "model": "gpt-image-2.5-sunburst",
+                "action": "edit",
+                "quality": "max",
+                "size": "auto",
+                "output_format": "jpeg",
+                "output_compression": 96,
+            }],
+            tool_choice={"type": "image_generation"},
+        )
+        for item in response.output:
+            if getattr(item, "type", None) == "image_generation_call":
+                result = getattr(item, "result", None)
+                if result:
+                    return base64.b64decode(result), getattr(item, "revised_prompt", None)
+        raise RuntimeError("Responses API non ha restituito image_generation_call.")
+    except Exception as exc:
+        request_id = getattr(exc, "request_id", None)
+        raise HTTPException(status_code=502, detail={
+            "message": "Errore Responses API image edit",
+            "type": type(exc).__name__,
+            "error": str(exc)[:1200],
+            "request_id": request_id,
+        }) from exc
+
+
 def call_openai_semantic_edit(
     source: Image.Image,
     prompt: str,
@@ -7920,9 +7966,12 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 result_bytes = output.getvalue()
             else:
                 if payload.semantic_direct_sideswipe:
-                    result_bytes = call_gemini_semantic_edit(source, prompt)
-                    semantic_provider = "gemini"
-                    semantic_model = "gemini-3-pro-image"
+                    result_bytes, revised_prompt = call_openai_responses_image_edit(
+                        source,
+                        prompt,
+                    )
+                    semantic_provider = "openai-responses"
+                    semantic_model = "gpt-5.6 + gpt-image-2.5-sunburst"
                 else:
                     result_bytes = call_openai_semantic_edit(
                         source,
@@ -7965,6 +8014,11 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 "bodywork_pipeline_used": False,
                 "image_provider": semantic_provider,
                 "image_model": semantic_model,
+                "revised_prompt": (
+                    revised_prompt
+                    if payload.semantic_direct_sideswipe
+                    else None
+                ),
             }
 
         if guided_mode:
