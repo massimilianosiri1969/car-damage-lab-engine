@@ -64,7 +64,7 @@ ALLOWED_ORIGINS = [
     if item.strip()
 ]
 
-DEPLOY_REVISION = "openai-responses-sunburst-v1-chatgpt-like"
+DEPLOY_REVISION = "openai-images-sunburst-v2-high-fidelity"
 
 print(
     f"=== CAR DAMAGE LAB BACKEND V17.0.24 {DEPLOY_REVISION} ===",
@@ -4256,6 +4256,43 @@ def call_openai_responses_image_edit(source: Image.Image, prompt: str) -> tuple[
         }) from exc
 
 
+def call_openai_semantic_edit_high_fidelity(source: Image.Image, prompt: str) -> bytes:
+    """Single-image precision edit using Images API with maximum input fidelity."""
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=503, detail="OPENAI_API_KEY non configurata.")
+    client = OpenAI(api_key=api_key)
+    source_file = pil_to_file(source, "source.png")
+    try:
+        response = client.images.edit(
+            model="gpt-image-2.5-sunburst",
+            image=source_file,
+            prompt=prompt,
+            input_fidelity="high",
+            quality="high",
+            size="auto",
+            output_format="jpeg",
+            output_compression=96,
+            n=1,
+        )
+        if not response.data or not response.data[0].b64_json:
+            raise RuntimeError("OpenAI ha risposto senza dati immagine")
+        return base64.b64decode(response.data[0].b64_json)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail={
+            "message":"Errore OpenAI high-fidelity image edit",
+            "type":type(exc).__name__,
+            "error":str(exc)[:1200],
+            "request_id":getattr(exc, "request_id", None),
+        }) from exc
+    finally:
+        try:
+            source_file.close()
+        except Exception:
+            pass
+        gc.collect()
+
+
 def call_openai_semantic_edit(
     source: Image.Image,
     prompt: str,
@@ -7966,12 +8003,20 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 result_bytes = output.getvalue()
             else:
                 if payload.semantic_direct_sideswipe:
-                    result_bytes, revised_prompt = call_openai_responses_image_edit(
-                        source,
-                        prompt,
+                    fidelity_prompt = (
+                        "Edit only the left rear bodywork to add realistic sideswipe "
+                        "collision damage. Preserve the exact original vehicle, license "
+                        "plate characters CJ 158KL, FIAT badge, lights, wheels, panel "
+                        "geometry, camera angle, background, paint color, lighting and "
+                        "reflections. Do not change anything else."
                     )
-                    semantic_provider = "openai-responses"
-                    semantic_model = "gpt-5.6 + gpt-image-2.5-sunburst"
+                    result_bytes = call_openai_semantic_edit_high_fidelity(
+                        source,
+                        fidelity_prompt,
+                    )
+                    revised_prompt = None
+                    semantic_provider = "openai-images"
+                    semantic_model = "gpt-image-2.5-sunburst"
                 else:
                     result_bytes = call_openai_semantic_edit(
                         source,
