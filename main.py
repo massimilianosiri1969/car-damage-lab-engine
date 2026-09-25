@@ -64,7 +64,7 @@ ALLOWED_ORIGINS = [
     if item.strip()
 ]
 
-DEPLOY_REVISION = "openai-images-sunburst-v3-source-authority-max-png"
+DEPLOY_REVISION = "chatgpt-image-latest-v1-source-authority-test"
 
 print(
     f"=== CAR DAMAGE LAB BACKEND V17.0.24 {DEPLOY_REVISION} ===",
@@ -4265,10 +4265,10 @@ def call_openai_semantic_edit_high_fidelity(source: Image.Image, prompt: str) ->
     source_file = pil_to_file(source, "source.png")
     try:
         response = client.images.edit(
-            model="gpt-image-2.5-sunburst",
+            model="chatgpt-image-latest",
             image=source_file,
             prompt=prompt,
-            quality="max",
+            quality="high",
             size="auto",
             output_format="png",
             n=1,
@@ -8002,11 +8002,10 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 if payload.semantic_direct_sideswipe:
                     fidelity_prompt = (
                         "Edit only the left rear bodywork to add realistic sideswipe "
-                        "collision damage. Preserve the exact original vehicle and the "
-                        "original license plate exactly as shown in the source photograph. "
-                        "Preserve the FIAT badge, lights, wheels, panel geometry, camera "
-                        "angle, background, paint color, lighting and reflections. "
-                        "Do not change anything else."
+                        "collision damage. Preserve the exact original vehicle, license "
+                        "plate characters CJ 158KL, FIAT badge, lights, wheels, panel "
+                        "geometry, camera angle, background, paint color, lighting and "
+                        "reflections. Do not change anything else."
                     )
                     result_bytes = call_openai_semantic_edit_high_fidelity(
                         source,
@@ -8014,7 +8013,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                     )
                     revised_prompt = None
                     semantic_provider = "openai-images"
-                    semantic_model = "gpt-image-2.5-sunburst"
+                    semantic_model = "chatgpt-image-latest"
                 else:
                     result_bytes = call_openai_semantic_edit(
                         source,
