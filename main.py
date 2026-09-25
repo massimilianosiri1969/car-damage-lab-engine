@@ -64,7 +64,7 @@ ALLOWED_ORIGINS = [
     if item.strip()
 ]
 
-DEPLOY_REVISION = "v18-source-authoritative-damage-residual-transfer"
+DEPLOY_REVISION = "v19-damage-evidence-support-no-mask-edge"
 
 print(
     f"=== CAR DAMAGE LAB BACKEND V17.0.24 {DEPLOY_REVISION} ===",
@@ -3372,11 +3372,11 @@ def transfer_damage_delta_to_original(
     impact_mask: Image.Image,
     protect_mask: Image.Image | None = None,
 ) -> tuple[bytes, dict[str, object]]:
-    """V18: transfer only meaningful local damage residuals onto untouched source.
+    """V19: mask is localization only; final alpha comes from damage evidence.
 
-    The AI candidate is never used as the final photograph. We derive a local
-    residual (texture/shape contrast) inside the user's impact zone, suppress
-    broad colour/exposure drift, then apply only that residual to the original.
+    Candidate global colour/exposure drift is removed. Damage evidence is detected
+    near the requested zone, then allowed to form its own soft support independent
+    of the user's polygon edge. Outside that evidence support, source pixels win.
     """
     src_img = source.convert("RGB")
     cand_img = Image.open(io.BytesIO(candidate_bytes)).convert("RGB")
@@ -3384,52 +3384,67 @@ def transfer_damage_delta_to_original(
         cand_img = cand_img.resize(src_img.size, Image.Resampling.LANCZOS)
     src = np.asarray(src_img, dtype=np.float32)
     cand = np.asarray(cand_img, dtype=np.float32)
-    mask = mask_to_binary(resize_mask(impact_mask.convert("L"), src_img.size))
+    guide = mask_to_binary(resize_mask(impact_mask.convert("L"), src_img.size))
+    if not (guide > 0).any():
+        raise HTTPException(status_code=422, detail="Zona d'impatto vuota.")
     if protect_mask is not None:
         protected = mask_to_binary(resize_mask(protect_mask.convert("L"), src_img.size))
-        mask = cv2.bitwise_and(mask, cv2.bitwise_not(protected))
     else:
-        protected = np.zeros_like(mask)
-    inside = mask > 0
-    if not inside.any():
-        raise HTTPException(status_code=422, detail="Zona d'impatto vuota.")
+        protected = np.zeros_like(guide)
 
-    # Remove low-frequency provider drift (colour/exposure/whole-panel redraw).
+    # Localization halo: user polygon guides where to search, but is never an alpha edge.
+    halo = cv2.dilate(
+        guide,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (81, 81)),
+        iterations=1,
+    ) > 0
+
     residual = cand - src
-    low = cv2.GaussianBlur(residual, (0, 0), sigmaX=18, sigmaY=18)
-    detail = residual - low
+    # Remove broad provider colour/exposure changes.
+    low = cv2.GaussianBlur(residual, (0, 0), sigmaX=28, sigmaY=28)
+    local = residual - low
+    mag = np.mean(np.abs(local), axis=2)
 
-    # Keep only residuals large enough to represent physical damage/paint transfer.
-    magnitude = np.mean(np.abs(detail), axis=2)
-    signal = ((magnitude >= 5.0) & inside).astype(np.uint8) * 255
+    # Evidence must be locally significant; adaptive threshold prevents whole-panel tint.
+    vals = mag[(guide > 0) & (protected == 0)]
+    threshold = max(7.0, float(np.percentile(vals, 58))) if vals.size else 9.0
+    evidence = ((mag >= threshold) & halo & (protected == 0)).astype(np.uint8) * 255
+    evidence = cv2.morphologyEx(evidence, cv2.MORPH_CLOSE, np.ones((13,13),np.uint8))
+    evidence = cv2.morphologyEx(evidence, cv2.MORPH_OPEN, np.ones((3,3),np.uint8))
 
-    # Build a damage-shaped alpha from the residual itself, not from the polygon edge.
-    signal = cv2.morphologyEx(signal, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
-    signal = cv2.morphologyEx(signal, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-    signal = cv2.GaussianBlur(signal, (0, 0), sigmaX=5, sigmaY=5).astype(np.float32) / 255.0
-    signal[~inside] = 0.0
-    signal[protected > 0] = 0.0
+    # Grow from actual damage, not polygon. Wide smooth falloff prevents visible seams.
+    support = cv2.dilate(
+        evidence,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (41,41)),
+        iterations=1,
+    )
+    alpha = cv2.GaussianBlur(support, (0,0), sigmaX=14, sigmaY=14).astype(np.float32)/255.0
+    alpha[protected > 0] = 0.0
+    alpha3 = (alpha * 0.88)[:, :, None]
 
-    # Conservative residual transfer: source remains authoritative everywhere.
-    strength = 0.82
-    alpha = (signal * strength)[:, :, None]
-    transferred = src + detail * alpha
-    transferred = np.clip(transferred, 0, 255).astype(np.uint8)
-    transferred[protected > 0] = src.astype(np.uint8)[protected > 0]
-    transferred[~inside] = src.astype(np.uint8)[~inside]
+    # Transfer local damage only; original remains authoritative.
+    out_arr = np.clip(src + local * alpha3, 0, 255).astype(np.uint8)
+    out_arr[protected > 0] = src.astype(np.uint8)[protected > 0]
+
+    # Exact source outside evidence support: support is damage-derived, never guide-derived.
+    active = alpha > 0.015
+    out_arr[~active] = src.astype(np.uint8)[~active]
 
     out = io.BytesIO()
-    Image.fromarray(transferred, mode="RGB").save(out, format="PNG", optimize=False)
-    changed = np.mean(np.abs(transferred.astype(np.int16)-src.astype(np.int16)), axis=2) > 3
+    Image.fromarray(out_arr, mode="RGB").save(out, format="PNG", optimize=False)
+    changed = np.mean(np.abs(out_arr.astype(np.int16)-src.astype(np.int16)),axis=2)>3
+    boundary = cv2.morphologyEx((active.astype(np.uint8)*255),cv2.MORPH_GRADIENT,np.ones((5,5),np.uint8))>0
     return out.getvalue(), {
-        "pipeline": "v18_damage_residual_transfer",
-        "source_authoritative": True,
-        "candidate_used_as_final": False,
-        "changed_pixel_ratio_inside": round(float(changed[inside].mean()), 4),
-        "changed_pixels_outside": int(changed[~inside].sum()),
-        "protected_changed_pixels": int(changed[protected > 0].sum()) if (protected > 0).any() else 0,
+        "pipeline":"v19_damage_evidence_support",
+        "source_authoritative":True,
+        "candidate_used_as_final":False,
+        "user_mask_used_as_final_alpha":False,
+        "damage_evidence_threshold":round(threshold,3),
+        "changed_pixels_outside_damage_support":int(changed[~active].sum()),
+        "protected_changed_pixels":int(changed[protected>0].sum()) if (protected>0).any() else 0,
+        "active_damage_ratio":round(float(active.mean()),4),
+        "boundary_changed_pixels":int(changed[boundary].sum()) if boundary.any() else 0,
     }
-
 
 def geometrically_confine_candidate(
     source: Image.Image,
@@ -8067,10 +8082,11 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 if payload.semantic_direct_sideswipe:
                     fidelity_prompt = (
                         "Edit only the left rear bodywork to add realistic sideswipe "
-                        "collision damage. Preserve the exact original vehicle, license "
-                        "plate characters CJ 158KL, FIAT badge, lights, wheels, panel "
-                        "geometry, camera angle, background, paint color, lighting and "
-                        "reflections. Do not change anything else."
+                        "collision damage. Treat the source photograph as authoritative: "
+                        "preserve the original license plate exactly as photographed, "
+                        "the FIAT badge, lights, wheels, vehicle proportions, camera, "
+                        "background, paint colour, lighting and reflections. Do not "
+                        "change anything except the physical collision damage."
                     )
                     generated_damage = call_openai_semantic_edit_high_fidelity(
                         source,
