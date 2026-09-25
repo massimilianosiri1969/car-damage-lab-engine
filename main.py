@@ -64,7 +64,7 @@ ALLOWED_ORIGINS = [
     if item.strip()
 ]
 
-DEPLOY_REVISION = "provider-bakeoff-v1-gemini-direct"
+DEPLOY_REVISION = "provider-bakeoff-v1.1-provider-proof"
 
 print(
     f"=== CAR DAMAGE LAB BACKEND V17.0.24 {DEPLOY_REVISION} ===",
@@ -7921,11 +7921,21 @@ def edit_damage_base64(payload: DamageEditBase64Request):
             else:
                 if payload.semantic_direct_sideswipe:
                     result_bytes = call_gemini_semantic_edit(source, prompt)
+                    semantic_provider = "gemini"
+                    semantic_model = os.getenv(
+                        "GEMINI_IMAGE_MODEL",
+                        "gemini-3.1-flash-image",
+                    )
                 else:
                     result_bytes = call_openai_semantic_edit(
                         source,
                         prompt,
                         payload.output_quality,
+                    )
+                    semantic_provider = "openai"
+                    semantic_model = os.getenv(
+                        "OPENAI_IMAGE_MODEL",
+                        "gpt-image-2.5-sunburst-2026-09-08",
                     )
 
             # Verifica soltanto che il modello abbia restituito un'immagine
@@ -7956,6 +7966,8 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 "semantic_direct_edit": True,
                 "post_composite_applied": False,
                 "bodywork_pipeline_used": False,
+                "image_provider": semantic_provider,
+                "image_model": semantic_model,
             }
 
         if guided_mode:
