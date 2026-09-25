@@ -64,7 +64,7 @@ ALLOWED_ORIGINS = [
     if item.strip()
 ]
 
-DEPLOY_REVISION = "impact-zone-geometric-confinement-v3.8-structural-geometry-gates"
+DEPLOY_REVISION = "impact-zone-geometric-confinement-v3.8.2-full-plate-localization"
 
 print(
     f"=== CAR DAMAGE LAB BACKEND V17.0.24 {DEPLOY_REVISION} ===",
@@ -6933,6 +6933,10 @@ Return ONLY a valid JSON object with this exact structure:
 Bounding-box rules:
 - Coordinates are normalized to the complete image: top-left is 0,0 and bottom-right is 1000,1000.
 - Draw the smallest practical box containing only the visible portion of the requested physical component.
+- SPECIAL CASE license_plate: the bounding box MUST contain the complete physical registration plate,
+  including BOTH blue side bands, every character from the first to the last, and the complete white
+  plate rectangle. Never box only the most legible characters and never crop the leftmost letters.
+  Add a small safety margin around the physical plate, but do not include the surrounding tailgate.
 - Follow the true location of panel seams, lamps, glass, wheels, bumpers and mirrors.
 - Do not include floor, workshop equipment, shadows, another vehicle or empty background.
 - Do not merge adjacent components into one box.
