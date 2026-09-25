@@ -64,7 +64,7 @@ ALLOWED_ORIGINS = [
     if item.strip()
 ]
 
-DEPLOY_REVISION = "chatgpt-image-latest-v1-source-authority-test"
+DEPLOY_REVISION = "v18-source-authoritative-damage-residual-transfer"
 
 print(
     f"=== CAR DAMAGE LAB BACKEND V17.0.24 {DEPLOY_REVISION} ===",
@@ -3366,6 +3366,71 @@ def prepare_hybrid_guided_api_mask(
     return guided_mask, api_mask, diagnostics
 
 
+def transfer_damage_delta_to_original(
+    source: Image.Image,
+    candidate_bytes: bytes,
+    impact_mask: Image.Image,
+    protect_mask: Image.Image | None = None,
+) -> tuple[bytes, dict[str, object]]:
+    """V18: transfer only meaningful local damage residuals onto untouched source.
+
+    The AI candidate is never used as the final photograph. We derive a local
+    residual (texture/shape contrast) inside the user's impact zone, suppress
+    broad colour/exposure drift, then apply only that residual to the original.
+    """
+    src_img = source.convert("RGB")
+    cand_img = Image.open(io.BytesIO(candidate_bytes)).convert("RGB")
+    if cand_img.size != src_img.size:
+        cand_img = cand_img.resize(src_img.size, Image.Resampling.LANCZOS)
+    src = np.asarray(src_img, dtype=np.float32)
+    cand = np.asarray(cand_img, dtype=np.float32)
+    mask = mask_to_binary(resize_mask(impact_mask.convert("L"), src_img.size))
+    if protect_mask is not None:
+        protected = mask_to_binary(resize_mask(protect_mask.convert("L"), src_img.size))
+        mask = cv2.bitwise_and(mask, cv2.bitwise_not(protected))
+    else:
+        protected = np.zeros_like(mask)
+    inside = mask > 0
+    if not inside.any():
+        raise HTTPException(status_code=422, detail="Zona d'impatto vuota.")
+
+    # Remove low-frequency provider drift (colour/exposure/whole-panel redraw).
+    residual = cand - src
+    low = cv2.GaussianBlur(residual, (0, 0), sigmaX=18, sigmaY=18)
+    detail = residual - low
+
+    # Keep only residuals large enough to represent physical damage/paint transfer.
+    magnitude = np.mean(np.abs(detail), axis=2)
+    signal = ((magnitude >= 5.0) & inside).astype(np.uint8) * 255
+
+    # Build a damage-shaped alpha from the residual itself, not from the polygon edge.
+    signal = cv2.morphologyEx(signal, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+    signal = cv2.morphologyEx(signal, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    signal = cv2.GaussianBlur(signal, (0, 0), sigmaX=5, sigmaY=5).astype(np.float32) / 255.0
+    signal[~inside] = 0.0
+    signal[protected > 0] = 0.0
+
+    # Conservative residual transfer: source remains authoritative everywhere.
+    strength = 0.82
+    alpha = (signal * strength)[:, :, None]
+    transferred = src + detail * alpha
+    transferred = np.clip(transferred, 0, 255).astype(np.uint8)
+    transferred[protected > 0] = src.astype(np.uint8)[protected > 0]
+    transferred[~inside] = src.astype(np.uint8)[~inside]
+
+    out = io.BytesIO()
+    Image.fromarray(transferred, mode="RGB").save(out, format="PNG", optimize=False)
+    changed = np.mean(np.abs(transferred.astype(np.int16)-src.astype(np.int16)), axis=2) > 3
+    return out.getvalue(), {
+        "pipeline": "v18_damage_residual_transfer",
+        "source_authoritative": True,
+        "candidate_used_as_final": False,
+        "changed_pixel_ratio_inside": round(float(changed[inside].mean()), 4),
+        "changed_pixels_outside": int(changed[~inside].sum()),
+        "protected_changed_pixels": int(changed[protected > 0].sum()) if (protected > 0).any() else 0,
+    }
+
+
 def geometrically_confine_candidate(
     source: Image.Image,
     candidate_bytes: bytes,
@@ -4265,7 +4330,7 @@ def call_openai_semantic_edit_high_fidelity(source: Image.Image, prompt: str) ->
     source_file = pil_to_file(source, "source.png")
     try:
         response = client.images.edit(
-            model="chatgpt-image-latest",
+            model="gpt-image-2.5-sunburst",
             image=source_file,
             prompt=prompt,
             quality="high",
@@ -8007,13 +8072,37 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                         "geometry, camera angle, background, paint color, lighting and "
                         "reflections. Do not change anything else."
                     )
-                    result_bytes = call_openai_semantic_edit_high_fidelity(
+                    generated_damage = call_openai_semantic_edit_high_fidelity(
                         source,
                         fidelity_prompt,
                     )
+                    # V18: AI proposes damage; original photograph remains authoritative.
+                    if payload.impact_zone_mask_base64:
+                        v18_mask = decode_base64_image(
+                            payload.impact_zone_mask_base64,
+                            "impact_zone_mask_base64",
+                            "L",
+                        )
+                    elif payload.mask_base64:
+                        v18_mask = decode_base64_image(
+                            payload.mask_base64,
+                            "mask_base64",
+                            "L",
+                        )
+                    else:
+                        raise HTTPException(
+                            status_code=422,
+                            detail="V18 richiede la zona d'impatto.",
+                        )
+                    result_bytes, v18_diagnostics = transfer_damage_delta_to_original(
+                        source=source,
+                        candidate_bytes=generated_damage,
+                        impact_mask=v18_mask,
+                        protect_mask=protect_mask,
+                    )
                     revised_prompt = None
-                    semantic_provider = "openai-images"
-                    semantic_model = "chatgpt-image-latest"
+                    semantic_provider = "openai-images-v18-residual-transfer"
+                    semantic_model = "gpt-image-2.5-sunburst"
                 else:
                     result_bytes = call_openai_semantic_edit(
                         source,
@@ -8058,6 +8147,11 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 "image_model": semantic_model,
                 "revised_prompt": (
                     revised_prompt
+                    if payload.semantic_direct_sideswipe
+                    else None
+                ),
+                "v18_diagnostics": (
+                    v18_diagnostics
                     if payload.semantic_direct_sideswipe
                     else None
                 ),
