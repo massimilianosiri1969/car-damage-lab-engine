@@ -64,7 +64,7 @@ ALLOWED_ORIGINS = [
     if item.strip()
 ]
 
-DEPLOY_REVISION = "provider-bakeoff-v1.1-provider-proof"
+DEPLOY_REVISION = "gemini-pro-direct-v2-official-interactions"
 
 print(
     f"=== CAR DAMAGE LAB BACKEND V17.0.24 {DEPLOY_REVISION} ===",
@@ -4169,45 +4169,46 @@ that changes the vehicle.
 
 
 def call_gemini_semantic_edit(source: Image.Image, prompt: str) -> bytes:
-    """Gemini native full-frame image editing via generateContent REST."""
+    """Gemini 3 Pro Image via the current Interactions image-editing API."""
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
     if not api_key:
-        raise HTTPException(status_code=503, detail={"message": "GEMINI_API_KEY non configurata.", "provider": "gemini"})
-    model = os.getenv("GEMINI_IMAGE_MODEL", "gemini-3.1-flash-image")
+        raise HTTPException(status_code=503, detail={"message":"GEMINI_API_KEY non configurata.","provider":"gemini"})
+    model = "gemini-3-pro-image"
     buf = io.BytesIO()
-    source.convert("RGB").save(buf, format="JPEG", quality=96, subsampling=0)
+    source.convert("RGB").save(buf, format="JPEG", quality=98, subsampling=0)
     image_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
     body = json.dumps({
-        "contents": [{"parts": [
-            {"text": prompt},
-            {"inline_data": {"mime_type": "image/jpeg", "data": image_b64}}
-        ]}],
-        "generationConfig": {"responseModalities": ["IMAGE"]}
+        "model": model,
+        "input": [
+            {"type": "text", "text": prompt},
+            {"type": "image", "mime_type": "image/jpeg", "data": image_b64}
+        ],
+        "response_format": {"type": "image", "mime_type": "image/jpeg", "image_size": "2K"}
     }).encode("utf-8")
-    url = "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent"
     req = urllib.request.Request(
-        url, data=body,
-        headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
+        "https://generativelanguage.googleapis.com/v1beta/interactions",
+        data=body,
+        headers={"Content-Type":"application/json","x-goog-api-key":api_key},
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=180) as response:
+        with urllib.request.urlopen(req, timeout=240) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except Exception as exc:
         raise HTTPException(status_code=502, detail={
-            "message": "Errore editing immagine Gemini",
-            "provider": "gemini", "model": model, "error": str(exc)[:1000]
+            "message":"Errore Gemini 3 Pro Image Interactions API",
+            "provider":"gemini","model":model,"error":str(exc)[:1200]
         }) from exc
-    for candidate in payload.get("candidates", []):
-        for part in (candidate.get("content") or {}).get("parts", []):
-            inline = part.get("inlineData") or part.get("inline_data")
-            if inline and inline.get("data"):
-                return base64.b64decode(inline["data"])
+    output_image = payload.get("output_image") or {}
+    if output_image.get("data"):
+        return base64.b64decode(output_image["data"])
+    for item in payload.get("outputs", []) + payload.get("output", []):
+        if isinstance(item, dict) and item.get("type") == "image" and item.get("data"):
+            return base64.b64decode(item["data"])
     raise HTTPException(status_code=502, detail={
-        "message": "Gemini non ha restituito un'immagine.",
-        "provider": "gemini", "model": model
+        "message":"Gemini 3 Pro Image non ha restituito output_image.",
+        "provider":"gemini","model":model
     })
-
 
 def call_openai_semantic_edit(
     source: Image.Image,
@@ -7901,11 +7902,10 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 # MOCKUP-DIRECT V1: deliberately minimal. No technical constraints,
                 # no mask language, no identity instructions, no repair/compositing.
                 prompt = (
-                    "Modifica questa fotografia simulando un urto laterale da "
-                    "strisciamento sulla zona posteriore sinistra dell'auto. "
-                    "La deformazione deve essere realistica, come prodotta dal "
-                    "paraurti arrotondato di un'altra automobile. Mantieni "
-                    "invariato tutto il resto della fotografia."
+                    "Using the provided photograph, change only the left rear "
+                    "bodywork of the car to show realistic damage caused by the "
+                    "rounded bumper of another car sideswiping it. Keep everything "
+                    "else in the photograph exactly the same."
                 )
             else:
                 prompt = payload.user_instructions.strip()
@@ -7922,10 +7922,7 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                 if payload.semantic_direct_sideswipe:
                     result_bytes = call_gemini_semantic_edit(source, prompt)
                     semantic_provider = "gemini"
-                    semantic_model = os.getenv(
-                        "GEMINI_IMAGE_MODEL",
-                        "gemini-3.1-flash-image",
-                    )
+                    semantic_model = "gemini-3-pro-image"
                 else:
                     result_bytes = call_openai_semantic_edit(
                         source,
