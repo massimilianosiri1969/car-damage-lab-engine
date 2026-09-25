@@ -64,7 +64,7 @@ ALLOWED_ORIGINS = [
     if item.strip()
 ]
 
-DEPLOY_REVISION = "semantic-direct-sideswipe-v2-simple-physical"
+DEPLOY_REVISION = "mockup-direct-v1-minimal"
 
 print(
     f"=== CAR DAMAGE LAB BACKEND V17.0.24 {DEPLOY_REVISION} ===",
@@ -7857,29 +7857,15 @@ def edit_damage_base64(payload: DamageEditBase64Request):
             and payload.deformation_type == "sideswipe"
         ):
             if payload.semantic_direct_sideswipe:
-                prompt = f"""
-Edit the ORIGINAL full photograph directly. Do not crop, composite, paste or
-rebuild the vehicle.
-
-Create a realistic SIDESWIPE collision deformation on the left rear bodywork
-of this exact car. Severity {severity_percent}/100.
-
-Imagine the rounded bumper/corner of another real car sliding along the Fiat:
-the sheet metal is pushed inward and dragged longitudinally. Make the damage
-look photographic and physically plausible: one broad dent with a few natural
-stretched creases and scrape marks following the direction of travel. Avoid
-soft inflated/plastic bulges, starbursts, flower-like folds and repeated dents.
-
-Keep the rest of the photograph exactly the same: same car, camera, background,
-paint colour, lighting and reflections. Keep lights, glass, wheels, tyres,
-handles, trim, FIAT emblem, badges, panel gaps and bumper geometry unchanged.
-Do not redraw the rear of the car and do not create any pasted or differently
-coloured region.
-
-The license plate will be restored separately after generation; do not use it
-as part of the damage. The result must look like an authentic photograph of
-this same car after one glancing sideswipe.
-""".strip()
+                # MOCKUP-DIRECT V1: deliberately minimal. No technical constraints,
+                # no mask language, no identity instructions, no repair/compositing.
+                prompt = (
+                    "Modifica questa fotografia simulando un urto laterale da "
+                    "strisciamento sulla zona posteriore sinistra dell'auto. "
+                    "La deformazione deve essere realistica, come prodotta dal "
+                    "paraurti arrotondato di un'altra automobile. Mantieni "
+                    "invariato tutto il resto della fotografia."
+                )
             else:
                 prompt = payload.user_instructions.strip()
             if not prompt:
