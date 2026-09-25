@@ -64,7 +64,7 @@ ALLOWED_ORIGINS = [
     if item.strip()
 ]
 
-DEPLOY_REVISION = "impact-zone-geometric-confinement-v3.8.2-full-plate-localization"
+DEPLOY_REVISION = "semantic-direct-sideswipe-v1"
 
 print(
     f"=== CAR DAMAGE LAB BACKEND V17.0.24 {DEPLOY_REVISION} ===",
@@ -141,9 +141,9 @@ class DamageEditBase64Request(BaseModel):
         "mixed",
     ] = "auto"
 
-    # Laboratorio faro: percorso semantico diretto, completamente separato
-    # dalla pipeline di deformazione carrozzeria.
+    # Percorso semantico diretto: foto full-frame, nessun compositing.
     semantic_direct_edit: bool = False
+    semantic_direct_sideswipe: bool = False
 
     deformation_type: Literal[
         "dent",
@@ -7851,8 +7851,41 @@ def edit_damage_base64(payload: DamageEditBase64Request):
         # È intenzionalmente prima di guided/bodywork/component_only:
         # nessuna mask, nessun build_prompt, nessun compositing, nessuna logica
         # di deformazione. Replica foto originale + singola istruzione.
-        if payload.semantic_direct_edit:
-            prompt = payload.user_instructions.strip()
+        if payload.semantic_direct_edit or (
+            payload.semantic_direct_sideswipe
+            and payload.simulation_mode == "impact_zone"
+            and payload.deformation_type == "sideswipe"
+        ):
+            if payload.semantic_direct_sideswipe:
+                prompt = f"""
+Edit the ORIGINAL full photograph directly. Do not crop, composite, paste or
+rebuild the vehicle.
+
+Create a realistic automotive SIDESWIPE on the bodywork corresponding to the
+user-selected impact zone. Severity {severity_percent}/100, affected extent
+{area_percent}/100, direction {payload.impact_direction}.
+
+The impact zone is LOCATION GUIDANCE, not permission to redraw the image.
+Produce one continuous dragged deformation with broad smooth pressure
+transitions and realistic stretched/creased sheet metal. Avoid starburst folds,
+radial crumpling, repeated parallel dents and point-impact knots.
+
+ABSOLUTE PRESERVATION:
+- same exact Fiat Panda, same camera, perspective and background;
+- preserve the ORIGINAL license plate exactly, character-for-character;
+- preserve FIAT emblem, model badges, lights, windows, wheels, tyres, handles,
+  mouldings and trim unless explicitly damaged;
+- preserve panel gaps and bumper/tailgate separation;
+- preserve original paint colour, exposure, gloss and reflections outside the
+  physical deformation;
+- no straight mask boundary, pasted patch, colour split or exposure seam;
+- do not regenerate the whole rear or whole vehicle.
+
+The final image must look like one untouched real photograph of the same car
+after a plausible glancing collision.
+""".strip()
+            else:
+                prompt = payload.user_instructions.strip()
             if not prompt:
                 raise HTTPException(
                     status_code=422,
@@ -7883,7 +7916,11 @@ def edit_damage_base64(payload: DamageEditBase64Request):
             return {
                 "job_id": job_id,
                 "status": "completed",
-                "mode": "semantic_direct_edit",
+                "mode": (
+                    "semantic_direct_sideswipe"
+                    if payload.semantic_direct_sideswipe
+                    else "semantic_direct_edit"
+                ),
                 "severity_percent": severity_percent,
                 "area_percent": area_percent,
                 "result_base64": base64.b64encode(result_bytes).decode("ascii"),
