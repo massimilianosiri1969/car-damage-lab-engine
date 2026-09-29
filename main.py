@@ -64,7 +64,7 @@ ALLOWED_ORIGINS = [
     if item.strip()
 ]
 
-DEPLOY_REVISION = "v19-damage-evidence-support-no-mask-edge"
+DEPLOY_REVISION = "v20-semantic-impact-envelope-real-benchmark"
 
 print(
     f"=== CAR DAMAGE LAB BACKEND V17.0.24 {DEPLOY_REVISION} ===",
@@ -73,7 +73,7 @@ print(
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.7.0.24",
+    version="1.7.0.25",
     description=(
         "API sperimentale per modificare gravità e superficie di un danno "
         "automotive usando una fotografia e una maschera."
@@ -436,11 +436,37 @@ def area_transition_feather_px(
 
 
 def area_transition_expansion_px(area_percent: int) -> int:
-    """
-    V17.0.6 - Nessuna espansione esterna alla maschera manuale.
-    """
+    """Legacy component mode: no automatic expansion."""
     _ = clamp_percentage(area_percent)
     return 0
+
+
+def build_semantic_impact_envelope(
+    impact_mask: Image.Image,
+    target_size: tuple[int, int],
+) -> Image.Image:
+    """
+    V20 - The user's painted zone is the semantic ORIGIN of impact,
+    not a hard inpainting/compositing border.
+    """
+    mask = resize_mask(impact_mask.convert("L"), target_size)
+    binary = mask_to_binary(mask)
+    ys, xs = np.where(binary > 0)
+
+    if len(xs) == 0 or len(ys) == 0:
+        raise HTTPException(status_code=422, detail="La zona d'impatto è vuota.")
+
+    width = int(xs.max() - xs.min() + 1)
+    height = int(ys.max() - ys.min() + 1)
+    reference = max(12, min(width, height))
+    radius = max(10, min(64, int(round(reference * 0.18))))
+    kernel_size = radius * 2 + 1
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (kernel_size, kernel_size),
+    )
+    expanded = cv2.dilate(binary, kernel, iterations=1)
+    return Image.fromarray(expanded, mode="L")
 
 
 def alter_damage_area(mask: Image.Image, area_percent: int) -> Image.Image:
@@ -4165,7 +4191,14 @@ Rules:
 - compare undamaged illuminated paint areas and keep them visually identical;
 - do not change the plate, badges, emblems or lamp design;
 - protected elements must remain unchanged;
-- do not modify anything outside the supplied impact-zone mask;
+- IMPORTANT: the supplied impact-zone mask indicates where the collision
+  originates; it is NOT a visible cut line and NOT a hard inpainting border;
+- the physical deformation may transition slightly beyond that indication when
+  necessary to preserve continuous sheet-metal curvature, paint reflections,
+  panel topology and natural illumination;
+- keep unrelated vehicle regions and the background unchanged;
+- never create a straight vertical/horizontal boundary, rectangular patch,
+  colour step or exposure step following the user's painted selection;
 - prefer a less dramatic but continuous deformation over fragmented,
   disconnected or identity-changing damage;
 - return the complete original photograph.
@@ -8358,10 +8391,12 @@ def edit_damage_base64(payload: DamageEditBase64Request):
     - propagate the metal deformation according to the requested impact direction;
     - make it physically consistent with existing adjacent damage when requested;
     - preserve every explicitly protected component;
-    - when a manual perimeter is supplied, use it as the real editable component
-      region and keep the rest of the photograph unchanged;
-    - do not let the deformation cross the selected panel boundary into a
-      protected component;
+    - when an impact-zone perimeter is supplied, treat it as the semantic origin
+      of the collision, not as a hard visual edit boundary;
+    - allow a smooth physical transition around that origin when required for
+      continuous metal curvature, reflections and paint, while leaving unrelated
+      regions unchanged;
+    - protected components remain strict exclusions and must not be altered;
     - preserve original panel gaps around protected components;
     - return the complete edited original photograph with the same dimensions;
 
@@ -8441,12 +8476,24 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                         # user's actual guided_mask. This also restores identity
                         # elements (e.g. a plate) whenever they lie outside the
                         # requested impact zone.
+                        composite_mask = (
+                            build_semantic_impact_envelope(
+                                guided_mask,
+                                source.size,
+                            )
+                            if is_impact_zone_mode
+                            else guided_mask
+                        )
+                        composite_feather_px = (
+                            28 if is_impact_zone_mode else 10
+                        )
+
                         spatially_confined_bytes = geometrically_confine_candidate(
                             source=source,
                             candidate_bytes=generated_bytes,
-                            edit_mask=guided_mask,
+                            edit_mask=composite_mask,
                             protect_mask=protect_mask,
-                            feather_px=10,
+                            feather_px=composite_feather_px,
                         )
                         candidate_bytes, candidate_diagnostics = (
                             validate_hybrid_guided_result(
@@ -8456,7 +8503,11 @@ def edit_damage_base64(payload: DamageEditBase64Request):
                             )
                         )
                         candidate_diagnostics["geometric_confinement_applied"] = True
-                        candidate_diagnostics["geometric_confinement_feather_px"] = 10
+                        candidate_diagnostics["geometric_confinement_feather_px"] = composite_feather_px
+                        candidate_diagnostics["semantic_impact_origin"] = bool(
+                            is_impact_zone_mode
+                        )
+                        candidate_diagnostics["hard_user_mask_boundary"] = False
                         protected_pixel_diag = getattr(
                             geometrically_confine_candidate,
                             "_last_protected_diagnostics",
